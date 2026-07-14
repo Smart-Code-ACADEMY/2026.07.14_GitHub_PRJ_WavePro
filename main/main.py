@@ -4,41 +4,42 @@ Music Library App
 =================
 A single-file, modern, dark-mode (Apple-style) music library application.
 
-Features:
-- Add a root folder that contains one subfolder per category.
-- All audio files inside those subfolders are loaded automatically.
-- Each song shows its category (= the name of the folder it currently
-  lives in). Renaming a category folder on disk updates the category
-  everywhere automatically.
-- Changing a song's category via the dropdown PHYSICALLY MOVES the file
-  into the target folder. This is protected by a green/red "lock" button:
-  green = locked (nothing can happen by accident), click to unlock (turns
-  red), then change the category. After the move completes, the lock
-  automatically turns green again.
-- The move itself is crash-safe: the file is first copied to the target
-  folder, the copy is verified (size match), only THEN is the original
-  removed. Nothing is ever overwritten - name conflicts get a unique
-  suffix instead.
-- Star rating (0-5) per song, protected by a second lock (green/red) the
-  same way. The rating is written DIRECTLY into the audio file's own
-  metadata (ID3 / Vorbis comments / MP4 atoms depending on format), so it
-  survives being moved anywhere, even outside the app.
-- Built-in music player: play/pause, next/previous, seek, volume, repeat
-  (off/all/one), category filter, search, double-click to play, "play all".
-- Dark, modern, Apple-style UI.
+Highlights of this version:
+- Songs load in the BACKGROUND, one by one, with a progress window that
+  shows count, percentage and estimated time remaining. The UI never freezes.
+- A local on-disk CACHE remembers every song's tags and rating, so opening a
+  huge library again is basically instant - only NEW or CHANGED files are
+  actually re-read from disk.
+- Only what is inside the category subfolders is scanned (nothing else).
+- The library stays dynamically up to date: adding/removing files is detected
+  and can be reviewed via "View changes". Moving/renaming a file (inside or
+  outside the app) is recognized as a MOVE, never as delete + add.
+- Filtering by category, by minimum star rating, and by search text no longer
+  rebuilds the table, so your filter selection is NEVER lost and stays fast.
+- Category = the current name of the subfolder a file lives in. Renaming a
+  folder updates the category everywhere automatically.
+- Changing a category via the dropdown physically MOVES the file (crash-safe:
+  copy -> verify -> only then delete original; never overwrites anything).
+- Rating (0-5) is written DIRECTLY into the audio file, so it survives moving.
+- Green/red lock buttons guard both category changes and rating changes, so
+  nothing happens by accident. After a change, the lock auto-returns to green.
+- Unrated songs show 5 visible GRAY outline stars; ratings are YELLOW.
+- Full player: play/pause, next/previous, seek, volume, repeat (off/all/one).
 
-Run with:
+Run:
     pip install PySide6 mutagen
     python music_app.py
 
-This is intentionally a SINGLE FILE so it can easily be frozen into a
-standalone .exe later (e.g. with PyInstaller):
+Build a standalone .exe later:
     pyinstaller --onefile --windowed music_app.py
 """
 
+import hashlib
+import json
 import os
-import sys
 import shutil
+import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -51,14 +52,17 @@ from mutagen.flac import FLAC
 from mutagen.oggvorbis import OggVorbis
 from mutagen.mp4 import MP4
 
-from PySide6.QtCore import QFileSystemWatcher, QObject, QSettings, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import (
+    QFileSystemWatcher, QObject, QSettings, QStandardPaths, Qt, QThread,
+    QTimer, QUrl, Signal,
+)
 from PySide6.QtGui import QFont
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QFileDialog, QFrame,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPushButton, QSlider, QTableWidget,
-    QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
+    QMainWindow, QMessageBox, QProgressBar, QPushButton, QSlider,
+    QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 ORG_NAME = "LocalMusicApps"
@@ -215,7 +219,7 @@ def _safe_int(v) -> int:
 
 
 # ============================================================================
-# Library: Song data class, folder scanning, crash-safe move
+# Library: Song data class, fast folder listing, crash-safe move
 # ============================================================================
 @dataclass
 class Song:
@@ -246,36 +250,50 @@ def list_categories(root: Path) -> List[str]:
     )
 
 
-def scan_library(root: Path) -> List[Song]:
-    """Scans every subfolder of root and returns all songs found."""
-    songs: List[Song] = []
+def fast_list_files(root: Path) -> Dict[str, Tuple[str, int, float]]:
+    """
+    Cheaply lists every audio file under root's subfolders WITHOUT reading
+    any tags - just path -> (category, size, mtime). Fast even for huge
+    libraries because it only touches filesystem metadata.
+    """
+    result: Dict[str, Tuple[str, int, float]] = {}
     if not root.is_dir():
-        return songs
-
-    for folder in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        return result
+    for folder in root.iterdir():
         if not folder.is_dir() or folder.name.startswith("."):
             continue
         category = folder.name
-        for file in sorted(folder.iterdir(), key=lambda p: p.name.lower()):
+        for file in folder.iterdir():
             if not file.is_file():
                 continue
             if file.suffix.lower() not in SUPPORTED_EXTENSIONS:
                 continue
-            title, artist = read_display_tags(file)
-            rating = read_rating(file)
-            duration = read_duration_seconds(file)
-            songs.append(
-                Song(path=file, category=category, title=title, artist=artist,
-                     rating=rating, duration=duration)
-            )
+            try:
+                st = file.stat()
+            except OSError:
+                continue
+            result[str(file)] = (category, st.st_size, st.st_mtime)
+    return result
+
+
+def scan_library(root: Path) -> List[Song]:
+    """Full synchronous scan (tags included). Simple fallback / used in tests."""
+    songs: List[Song] = []
+    for path_str, (category, _size, _mtime) in fast_list_files(root).items():
+        file = Path(path_str)
+        title, artist = read_display_tags(file)
+        rating = read_rating(file)
+        duration = read_duration_seconds(file)
+        songs.append(Song(path=file, category=category, title=title, artist=artist,
+                           rating=rating, duration=duration))
     return songs
 
 
-def safe_move_song(song: Song, root: Path, target_category: str) -> Path:
+def safe_move_song(song: "Song", root: Path, target_category: str) -> Path:
     """
     Physically moves the file into the target category folder.
-    Safety measures:
-      - The original is NEVER deleted before the copy has been verified.
+    Safety:
+      - Original is NEVER deleted before the copy is verified (size match).
       - On a name conflict, a unique name is used - nothing is overwritten.
     Returns the new path, or raises SafeMoveError.
     """
@@ -301,19 +319,11 @@ def safe_move_song(song: Song, root: Path, target_category: str) -> Path:
     tmp_dest = dest.with_name(dest.name + ".part")
 
     try:
-        # 1) Copy to a temporary name (the original stays untouched)
         shutil.copy2(src, tmp_dest)
-
-        # 2) Verify (file size must match)
         if os.path.getsize(tmp_dest) != os.path.getsize(src):
             raise SafeMoveError("Verification failed (size mismatch)")
-
-        # 3) Only now rename to the final name
         os.replace(tmp_dest, dest)
-
-        # 4) Only after a verified copy, remove the original
         os.remove(src)
-
     except Exception as e:
         if tmp_dest.exists():
             try:
@@ -323,6 +333,166 @@ def safe_move_song(song: Song, root: Path, target_category: str) -> Path:
         raise SafeMoveError(str(e))
 
     return dest
+
+
+# ============================================================================
+# On-disk cache (so a huge library only needs to be tag-read once)
+# ============================================================================
+def get_cache_path(root: Path) -> Path:
+    base = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+    if not base:
+        base = str(Path.home() / ".music_library_app")
+    base_path = Path(base)
+    try:
+        base_path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        base_path = Path.home()
+    h = hashlib.md5(str(root.resolve()).encode("utf-8")).hexdigest()
+    return base_path / f"music_library_cache_{h}.json"
+
+
+def load_cache(root: Path) -> Dict[str, dict]:
+    path = get_cache_path(root)
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_cache(root: Path, cache: Dict[str, dict]):
+    path = get_cache_path(root)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except Exception:
+        pass
+
+
+# ============================================================================
+# Background scan worker: reuses the cache, only truly reads tags for new or
+# changed files (one at a time), and tells a genuine add/remove apart from a
+# simple move/rename.
+# ============================================================================
+class ScanWorker(QThread):
+    totalDetermined = Signal(int)
+    progressUpdate = Signal(int, int, object, str)   # processed, total, eta_seconds|None, filename
+    batchReady = Signal(list)                         # list[Song] - cached/moved, no tag reading needed
+    songReady = Signal(object)                        # Song - slow path, emitted one by one
+    rowsRemoved = Signal(list)                         # list[str] ids that no longer exist
+    scanFinished = Signal(list, list, int)             # added_titles, removed_titles, moved_count
+    scanError = Signal(str)
+
+    def __init__(self, root: Path, previous_cache: Dict[str, dict], parent=None):
+        super().__init__(parent)
+        self.root = root
+        self.previous_cache = previous_cache or {}
+        self.new_cache: Dict[str, dict] = {}
+
+    def run(self):
+        try:
+            current = fast_list_files(self.root)
+        except Exception as e:
+            self.scanError.emit(str(e))
+            return
+
+        old_cache = self.previous_cache
+        old_paths = set(old_cache.keys())
+        new_paths = set(current.keys())
+        common = old_paths & new_paths
+
+        unchanged_paths: List[str] = []
+        changed_paths: List[str] = []
+        for p in common:
+            _cat, size, mtime = current[p]
+            rec = old_cache.get(p, {})
+            if rec.get("size") == size and rec.get("mtime") is not None and abs(rec["mtime"] - mtime) < 1.0:
+                unchanged_paths.append(p)
+            else:
+                changed_paths.append(p)
+
+        added_paths = list(new_paths - old_paths)
+        missing_paths = list(old_paths - new_paths)
+
+        # Match added vs missing by FILE SIZE to detect moves/renames so they
+        # are never mistaken for delete + add.
+        missing_by_size: Dict[int, List[str]] = {}
+        for p in missing_paths:
+            rec = old_cache.get(p, {})
+            missing_by_size.setdefault(rec.get("size"), []).append(p)
+
+        moved_pairs: List[Tuple[str, str]] = []
+        truly_added: List[str] = []
+        for p in added_paths:
+            _cat, size, _mtime = current[p]
+            candidates = missing_by_size.get(size)
+            if candidates:
+                old_p = candidates.pop()
+                if not candidates:
+                    del missing_by_size[size]
+                moved_pairs.append((old_p, p))
+            else:
+                truly_added.append(p)
+
+        truly_missing = [p for lst in missing_by_size.values() for p in lst]
+
+        new_cache: Dict[str, dict] = {}
+        batch_songs: List[Song] = []
+
+        for p in unchanged_paths:
+            cat, size, mtime = current[p]
+            rec = old_cache[p]
+            song = Song(path=Path(p), category=cat, title=rec.get("title", Path(p).stem),
+                        artist=rec.get("artist", ""), rating=rec.get("rating", 0),
+                        duration=rec.get("duration", 0.0), id=rec.get("id") or uuid.uuid4().hex)
+            new_cache[p] = {**rec, "size": size, "mtime": mtime, "id": song.id}
+            batch_songs.append(song)
+
+        for old_p, new_p in moved_pairs:
+            cat, size, mtime = current[new_p]
+            rec = old_cache.get(old_p, {})
+            song = Song(path=Path(new_p), category=cat, title=rec.get("title", Path(new_p).stem),
+                        artist=rec.get("artist", ""), rating=rec.get("rating", 0),
+                        duration=rec.get("duration", 0.0), id=rec.get("id") or uuid.uuid4().hex)
+            new_cache[new_p] = {**rec, "size": size, "mtime": mtime, "id": song.id}
+            batch_songs.append(song)
+
+        if batch_songs:
+            self.batchReady.emit(batch_songs)
+
+        slow_paths = truly_added + changed_paths
+        total = len(slow_paths)
+        self.totalDetermined.emit(total)
+
+        start_time = time.monotonic()
+        for i, p in enumerate(slow_paths, start=1):
+            cat, size, mtime = current[p]
+            path_obj = Path(p)
+            title, artist = read_display_tags(path_obj)
+            rating = read_rating(path_obj)
+            duration = read_duration_seconds(path_obj)
+            old_id = old_cache.get(p, {}).get("id")
+            song = Song(path=path_obj, category=cat, title=title, artist=artist,
+                        rating=rating, duration=duration, id=old_id or uuid.uuid4().hex)
+            new_cache[p] = {"size": size, "mtime": mtime, "title": title, "artist": artist,
+                            "rating": rating, "duration": duration, "id": song.id}
+            elapsed = time.monotonic() - start_time
+            rate = i / elapsed if elapsed > 0 else 0
+            eta = (total - i) / rate if rate > 0 else None
+            self.progressUpdate.emit(i, total, eta, path_obj.name)
+            self.songReady.emit(song)
+
+        removed_ids = [old_cache[p]["id"] for p in truly_missing if "id" in old_cache.get(p, {})]
+        if removed_ids:
+            self.rowsRemoved.emit(removed_ids)
+
+        added_titles = [new_cache.get(p, {}).get("title", Path(p).stem) for p in truly_added]
+        removed_titles = [old_cache[p].get("title", Path(p).stem) for p in truly_missing]
+
+        self.new_cache = new_cache
+        self.scanFinished.emit(added_titles, removed_titles, len(moved_pairs))
 
 
 # ============================================================================
@@ -446,8 +616,6 @@ class PlayerController(QObject):
             self._load_current(autoplay=True)
 
     def notify_song_path_changed(self, song: Song, new_path: Path):
-        """Called when a song has been physically moved, so the player keeps
-        the source in sync if it is currently loaded/playing."""
         song.path = new_path
         if self.current_song() is song:
             was_playing = self.is_playing()
@@ -488,9 +656,9 @@ class LockButton(QToolButton):
         self._tooltip_locked = tooltip_locked
         self._tooltip_unlocked = tooltip_unlocked
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(30, 30)
+        self.setFixedSize(22, 22)
         f = QFont()
-        f.setPointSize(13)
+        f.setPointSize(10)
         self.setFont(f)
         self.clicked.connect(self._on_click)
         self._refresh()
@@ -515,7 +683,7 @@ class LockButton(QToolButton):
             self.setToolTip(self._tooltip_locked)
             self.setStyleSheet(
                 "QToolButton { background: rgba(48,209,88,0.15); border: 1px solid #30D158;"
-                " border-radius: 8px; color: #30D158; }"
+                " border-radius: 6px; color: #30D158; }"
                 "QToolButton:hover { background: rgba(48,209,88,0.28); }"
             )
         else:
@@ -523,15 +691,22 @@ class LockButton(QToolButton):
             self.setToolTip(self._tooltip_unlocked)
             self.setStyleSheet(
                 "QToolButton { background: rgba(255,69,58,0.15); border: 1px solid #FF453A;"
-                " border-radius: 8px; color: #FF453A; }"
+                " border-radius: 6px; color: #FF453A; }"
                 "QToolButton:hover { background: rgba(255,69,58,0.28); }"
             )
 
 
 class StarRatingWidget(QWidget):
-    """5 clickable stars. Locked (not editable) by default."""
+    """
+    5 stars. Unrated -> 5 clearly visible GRAY outline stars.
+    Rated -> filled stars in YELLOW (the rest stay gray).
+    Editable only while unlocked (set_editable).
+    """
 
     ratingChanged = Signal(int)
+
+    COLOR_FILLED = "#FFD60A"   # yellow
+    COLOR_EMPTY = "#6e6e73"    # clearly visible gray
 
     def __init__(self, rating: int = 0, parent=None):
         super().__init__(parent)
@@ -577,14 +752,56 @@ class StarRatingWidget(QWidget):
         for i, btn in enumerate(self._buttons):
             filled = i < self._rating
             char = "\u2605" if filled else "\u2606"  # filled / empty star
+            color = self.COLOR_FILLED if filled else self.COLOR_EMPTY
             btn.setText(char)
-            color = "#FFD60A" if filled else "#5A5A5E"
-            if not self._enabled_for_edit:
-                color = "#3A3A3C" if not filled else "#8A7A2A"
             btn.setStyleSheet(
                 f"QPushButton {{ border: none; background: transparent; color: {color}; font-size: 17px; }}"
+                f"QPushButton:disabled {{ color: {color}; }}"
             )
             btn.setEnabled(self._enabled_for_edit)
+
+
+# ============================================================================
+# Loading window (count / percentage / ETA)
+# ============================================================================
+class LoadingDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Importing Music")
+        self.setModal(False)
+        self.setFixedSize(460, 170)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+
+        self.title_label = QLabel("Importing songs...")
+        self.title_label.setObjectName("sectionTitle")
+        layout.addWidget(self.title_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setTextVisible(True)
+        layout.addWidget(self.progress_bar)
+
+        self.detail_label = QLabel("")
+        self.detail_label.setObjectName("subtleLabel")
+        self.detail_label.setWordWrap(True)
+        layout.addWidget(self.detail_label)
+
+        self.eta_label = QLabel("")
+        self.eta_label.setObjectName("subtleLabel")
+        layout.addWidget(self.eta_label)
+
+        layout.addStretch()
+
+    def update_progress(self, processed: int, total: int, eta_seconds: Optional[float], current_name: str):
+        pct = int(processed / total * 100) if total else 100
+        self.progress_bar.setValue(pct)
+        self.detail_label.setText(f"{processed} / {total} songs  ({pct}%)\n{current_name}")
+        if eta_seconds is not None:
+            self.eta_label.setText(f"Estimated time remaining: {format_time(int(eta_seconds * 1000))}")
+        else:
+            self.eta_label.setText("Estimating time remaining...")
 
 
 # ============================================================================
@@ -596,229 +813,83 @@ DARK_QSS = """
     outline: none;
 }
 
-QMainWindow, QWidget#centralWidget {
-    background-color: #1c1c1e;
-}
+QMainWindow, QWidget#centralWidget { background-color: #1c1c1e; }
+QWidget { color: #f2f2f7; background-color: transparent; }
+QDialog { background-color: #1c1c1e; }
 
-QWidget {
-    color: #f2f2f7;
-    background-color: transparent;
-}
+QLabel#sectionTitle { font-size: 20px; font-weight: 600; color: #ffffff; padding: 4px 0px; }
+QLabel#subtleLabel { color: #8e8e93; font-size: 12px; }
+QLabel#pathLabel { color: #0a84ff; font-size: 12px; padding: 2px 8px; background: rgba(10,132,255,0.1); border-radius: 6px; }
+QLabel#statusLabel { color: #8e8e93; font-size: 12px; padding: 2px 8px; }
 
-QLabel#sectionTitle {
-    font-size: 20px;
-    font-weight: 600;
-    color: #ffffff;
-    padding: 4px 0px;
-}
-
-QLabel#subtleLabel {
-    color: #8e8e93;
-    font-size: 12px;
-}
-
-QLabel#pathLabel {
-    color: #0a84ff;
-    font-size: 12px;
-    padding: 2px 8px;
-    background: rgba(10,132,255,0.1);
-    border-radius: 6px;
-}
-
-QToolBar, #topBar {
-    background-color: #1c1c1e;
-    border: none;
-    padding: 10px;
-    spacing: 8px;
-}
+QToolBar, #topBar { background-color: #1c1c1e; border: none; padding: 10px; spacing: 8px; }
 
 QPushButton {
-    background-color: #2c2c2e;
-    border: 1px solid #3a3a3c;
-    border-radius: 10px;
-    padding: 8px 16px;
-    color: #f2f2f7;
-    font-size: 13px;
-    font-weight: 500;
+    background-color: #2c2c2e; border: 1px solid #3a3a3c; border-radius: 10px;
+    padding: 8px 16px; color: #f2f2f7; font-size: 13px; font-weight: 500;
 }
-QPushButton:hover {
-    background-color: #3a3a3c;
-    border: 1px solid #48484a;
-}
-QPushButton:pressed {
-    background-color: #232325;
-}
-QPushButton:disabled {
-    color: #5a5a5e;
-    border: 1px solid #2c2c2e;
-}
+QPushButton:hover { background-color: #3a3a3c; border: 1px solid #48484a; }
+QPushButton:pressed { background-color: #232325; }
+QPushButton:disabled { color: #5a5a5e; border: 1px solid #2c2c2e; }
 
-QPushButton#accentButton {
-    background-color: #0a84ff;
-    border: 1px solid #0a84ff;
-    color: white;
-    font-weight: 600;
-}
-QPushButton#accentButton:hover {
-    background-color: #3399ff;
-}
+QPushButton#accentButton { background-color: #0a84ff; border: 1px solid #0a84ff; color: white; font-weight: 600; }
+QPushButton#accentButton:hover { background-color: #3399ff; }
 
-QPushButton#transportButton {
-    background-color: transparent;
-    border: none;
-    border-radius: 22px;
-    font-size: 18px;
-    padding: 6px;
-}
-QPushButton#transportButton:hover {
-    background-color: #2c2c2e;
-}
+QPushButton#transportButton { background-color: transparent; border: none; border-radius: 22px; font-size: 18px; padding: 6px; }
+QPushButton#transportButton:hover { background-color: #2c2c2e; }
 
-QPushButton#playPauseButton {
-    background-color: #ffffff;
-    border-radius: 24px;
-    color: #1c1c1e;
-    font-size: 18px;
-    min-width: 48px;
-    min-height: 48px;
-}
-QPushButton#playPauseButton:hover {
-    background-color: #e5e5ea;
-}
+QPushButton#playPauseButton { background-color: #ffffff; border-radius: 24px; color: #1c1c1e; font-size: 18px; min-width: 48px; min-height: 48px; }
+QPushButton#playPauseButton:hover { background-color: #e5e5ea; }
 
 QTableWidget {
-    background-color: #1c1c1e;
-    alternate-background-color: #202022;
-    border: none;
-    gridline-color: transparent;
-    selection-background-color: rgba(10,132,255,0.25);
-    selection-color: #ffffff;
+    background-color: #1c1c1e; alternate-background-color: #202022; border: none;
+    gridline-color: transparent; selection-background-color: rgba(10,132,255,0.25); selection-color: #ffffff;
 }
-QTableWidget::item {
-    padding: 6px;
-    border-bottom: 1px solid #2c2c2e;
-}
+QTableWidget::item { padding: 6px; border-bottom: 1px solid #2c2c2e; }
 QHeaderView::section {
-    background-color: #1c1c1e;
-    color: #8e8e93;
-    border: none;
-    border-bottom: 1px solid #2c2c2e;
-    padding: 8px 6px;
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
+    background-color: #1c1c1e; color: #8e8e93; border: none; border-bottom: 1px solid #2c2c2e;
+    padding: 8px 6px; font-size: 11px; font-weight: 600; text-transform: uppercase;
 }
-QTableWidget::item:selected {
-    background-color: rgba(10,132,255,0.22);
-}
+QTableWidget::item:selected { background-color: rgba(10,132,255,0.22); }
 
 QComboBox {
-    background-color: #2c2c2e;
-    border: 1px solid #3a3a3c;
-    border-radius: 8px;
-    padding: 4px 10px;
-    min-width: 110px;
-    color: #f2f2f7;
+    background-color: #2c2c2e; border: 1px solid #3a3a3c; border-radius: 8px;
+    padding: 4px 10px; min-width: 110px; color: #f2f2f7;
 }
-QComboBox:disabled {
-    color: #5a5a5e;
-    background-color: #232325;
-}
-QComboBox::drop-down {
-    border: none;
-    width: 20px;
-}
+QComboBox:disabled { color: #5a5a5e; background-color: #232325; }
+QComboBox::drop-down { border: none; width: 20px; }
 QComboBox QAbstractItemView {
-    background-color: #2c2c2e;
-    border: 1px solid #3a3a3c;
-    selection-background-color: #0a84ff;
-    color: #f2f2f7;
-    outline: none;
+    background-color: #2c2c2e; border: 1px solid #3a3a3c; selection-background-color: #0a84ff; color: #f2f2f7; outline: none;
 }
 
-QListWidget {
-    background-color: #232325;
-    border: 1px solid #2c2c2e;
-    border-radius: 10px;
-    padding: 4px;
-}
-QListWidget::item {
-    padding: 6px 8px;
-    border-radius: 6px;
-}
-QListWidget::item:selected {
-    background-color: rgba(10,132,255,0.25);
-}
+QListWidget { background-color: #232325; border: 1px solid #2c2c2e; border-radius: 10px; padding: 4px; }
+QListWidget::item { padding: 6px 8px; border-radius: 6px; }
+QListWidget::item:selected { background-color: rgba(10,132,255,0.25); }
 
-QScrollBar:vertical {
-    background: transparent;
-    width: 10px;
-    margin: 0px;
-}
-QScrollBar::handle:vertical {
-    background: #48484a;
-    border-radius: 5px;
-    min-height: 24px;
-}
-QScrollBar::handle:vertical:hover {
-    background: #5a5a5e;
-}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-    height: 0px;
-}
+QScrollBar:vertical { background: transparent; width: 10px; margin: 0px; }
+QScrollBar::handle:vertical { background: #48484a; border-radius: 5px; min-height: 24px; }
+QScrollBar::handle:vertical:hover { background: #5a5a5e; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
 
-QSlider::groove:horizontal {
-    height: 4px;
-    background: #3a3a3c;
-    border-radius: 2px;
-}
-QSlider::sub-page:horizontal {
-    background: #0a84ff;
-    border-radius: 2px;
-}
-QSlider::handle:horizontal {
-    background: #ffffff;
-    width: 12px;
-    height: 12px;
-    margin: -4px 0;
-    border-radius: 6px;
-}
-QSlider::handle:horizontal:hover {
-    background: #e5e5ea;
-}
+QSlider::groove:horizontal { height: 4px; background: #3a3a3c; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #0a84ff; border-radius: 2px; }
+QSlider::handle:horizontal { background: #ffffff; width: 12px; height: 12px; margin: -4px 0; border-radius: 6px; }
+QSlider::handle:horizontal:hover { background: #e5e5ea; }
 
-QLineEdit {
-    background-color: #2c2c2e;
-    border: 1px solid #3a3a3c;
-    border-radius: 8px;
-    padding: 6px 10px;
-    color: #f2f2f7;
-}
-QLineEdit:focus {
-    border: 1px solid #0a84ff;
-}
+QLineEdit { background-color: #2c2c2e; border: 1px solid #3a3a3c; border-radius: 8px; padding: 6px 10px; color: #f2f2f7; }
+QLineEdit:focus { border: 1px solid #0a84ff; }
 
-QFrame#playerBar {
-    background-color: #232325;
-    border-top: 1px solid #2c2c2e;
+QProgressBar {
+    background-color: #2c2c2e; border: 1px solid #3a3a3c; border-radius: 8px;
+    text-align: center; color: #f2f2f7; height: 18px;
 }
+QProgressBar::chunk { background-color: #0a84ff; border-radius: 8px; }
 
-QFrame#sidebar {
-    background-color: #1c1c1e;
-    border-right: 1px solid #2c2c2e;
-}
+QFrame#playerBar { background-color: #232325; border-top: 1px solid #2c2c2e; }
+QFrame#sidebar { background-color: #1c1c1e; border-right: 1px solid #2c2c2e; }
 
-QToolTip {
-    background-color: #3a3a3c;
-    color: #f2f2f7;
-    border: 1px solid #48484a;
-    padding: 4px 8px;
-    border-radius: 6px;
-}
-
-QMessageBox {
-    background-color: #2c2c2e;
-}
+QToolTip { background-color: #3a3a3c; color: #f2f2f7; border: 1px solid #48484a; padding: 4px 8px; border-radius: 6px; }
+QMessageBox { background-color: #2c2c2e; }
 """
 
 
@@ -848,16 +919,27 @@ class MainWindow(QMainWindow):
 
         self.settings = QSettings(ORG_NAME, APP_NAME)
         self.root_path: Optional[Path] = None
-        self.songs: List[Song] = []
+        self.cache: Dict[str, dict] = {}
+        self.songs_by_id: Dict[str, Song] = {}
+        self.row_items: Dict[str, QTableWidgetItem] = {}
         self.checked_categories: set = set()  # empty = show all
+        self.min_rating_filter: int = 0
+        self._last_known_categories: List[str] = []
+        self._currently_highlighted_id: Optional[str] = None
+
+        self.scan_worker: Optional[ScanWorker] = None
+        self.pending_rescan = False
+        self.loading_dialog: Optional[LoadingDialog] = None
+        self.last_added_titles: List[str] = []
+        self.last_removed_titles: List[str] = []
 
         self.player = PlayerController(self)
         self.watcher = QFileSystemWatcher(self)
         self.watcher.directoryChanged.connect(self._on_dir_changed)
         self._rescan_timer = QTimer(self)
         self._rescan_timer.setSingleShot(True)
-        self._rescan_timer.setInterval(400)
-        self._rescan_timer.timeout.connect(self.rescan_library)
+        self._rescan_timer.setInterval(500)
+        self._rescan_timer.timeout.connect(self._start_scan)
 
         self._build_ui()
         self._connect_player_signals()
@@ -905,16 +987,25 @@ class MainWindow(QMainWindow):
         self.path_label.setObjectName("pathLabel")
         layout.addWidget(self.path_label)
 
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("statusLabel")
+        layout.addWidget(self.status_label)
+
+        self.changes_button = QPushButton("View changes")
+        self.changes_button.setEnabled(False)
+        self.changes_button.clicked.connect(self._show_changes_dialog)
+        layout.addWidget(self.changes_button)
+
         layout.addStretch()
 
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Search by title or artist...")
         self.search_box.setFixedWidth(260)
-        self.search_box.textChanged.connect(self._rebuild_table)
+        self.search_box.textChanged.connect(self._apply_filters)
         layout.addWidget(self.search_box)
 
         refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self.rescan_library)
+        refresh_btn.clicked.connect(self._start_scan)
         layout.addWidget(refresh_btn)
 
         add_btn = QPushButton("Add Music Folder")
@@ -927,7 +1018,7 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self) -> QWidget:
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(220)
+        sidebar.setFixedWidth(230)
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(8)
@@ -941,10 +1032,24 @@ class MainWindow(QMainWindow):
         self.category_list.itemChanged.connect(self._on_category_filter_changed)
         layout.addWidget(self.category_list, stretch=1)
 
-        hint = QLabel("Nothing checked = all categories are shown and played.")
+        hint = QLabel("Nothing checked = all categories are shown. Your filter selection is kept.")
         hint.setObjectName("subtleLabel")
         hint.setWordWrap(True)
         layout.addWidget(hint)
+
+        rating_label = QLabel("Minimum rating (filter)")
+        rating_label.setObjectName("subtleLabel")
+        layout.addWidget(rating_label)
+
+        self.rating_filter_widget = StarRatingWidget(0)
+        self.rating_filter_widget.set_editable(True)
+        self.rating_filter_widget.ratingChanged.connect(self._on_rating_filter_changed)
+        layout.addWidget(self.rating_filter_widget)
+
+        rating_hint = QLabel("Click a star for a minimum. Click the same star again to show all ratings.")
+        rating_hint.setObjectName("subtleLabel")
+        rating_hint.setWordWrap(True)
+        layout.addWidget(rating_hint)
 
         play_all_btn = QPushButton("Play All")
         play_all_btn.clicked.connect(self._play_all_filtered)
@@ -954,9 +1059,7 @@ class MainWindow(QMainWindow):
 
     def _build_table(self) -> QWidget:
         self.table = QTableWidget(0, COL_COUNT)
-        self.table.setHorizontalHeaderLabels(
-            ["Title", "Artist", "Category", "", "Rating", ""]
-        )
+        self.table.setHorizontalHeaderLabels(["Title", "Artist", "Category", "", "Rating", ""])
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
@@ -1079,9 +1182,7 @@ class MainWindow(QMainWindow):
         self.player.set_repeat_mode(new_mode)
         labels = {RepeatMode.OFF: "Off", RepeatMode.ALL: "All", RepeatMode.ONE: "One"}
         self.repeat_btn.setToolTip(f"Repeat: {labels[new_mode]}")
-        self.repeat_btn.setStyleSheet(
-            "color: #0a84ff;" if new_mode != RepeatMode.OFF else ""
-        )
+        self.repeat_btn.setStyleSheet("color: #0a84ff;" if new_mode != RepeatMode.OFF else "")
 
     # ------------------------------------------------------------------
     # Folder / library
@@ -1100,52 +1201,174 @@ class MainWindow(QMainWindow):
         self.root_path = path
         self.path_label.setText(str(path))
         self.settings.setValue("root_path", str(path))
-        self.rescan_library()
 
+        self.table.setRowCount(0)
+        self.row_items.clear()
+        self.songs_by_id.clear()
+        self.checked_categories.clear()
+        self._last_known_categories = []
+        self._currently_highlighted_id = None
+        self.cache = load_cache(path)
+
+        self._refresh_category_choices()
         self.watcher.addPath(str(path))
         for sub in list_categories(path):
             self.watcher.addPath(str(path / sub))
 
-    def _on_dir_changed(self, _changed_path: str):
-        # Debounce: several events in quick succession -> rescan only once
-        self._rescan_timer.start()
+        self._start_scan()
 
-    def rescan_library(self):
+    def _on_dir_changed(self, _changed_path: str):
+        self._rescan_timer.start()  # debounce -> one rescan
+
+    # ------------------------------------------------------------------
+    # Background scanning
+    # ------------------------------------------------------------------
+    def _start_scan(self):
         if self.root_path is None:
             return
-        currently_playing = self.player.current_song()
-        currently_playing_path = currently_playing.path if currently_playing else None
+        if self.scan_worker is not None and self.scan_worker.isRunning():
+            self.pending_rescan = True
+            return
 
-        self.songs = scan_library(self.root_path)
+        self._update_status("Checking library...")
+        worker = ScanWorker(self.root_path, dict(self.cache))
+        worker.batchReady.connect(self._on_batch_ready)
+        worker.songReady.connect(self._on_song_ready)
+        worker.totalDetermined.connect(self._on_total_determined)
+        worker.progressUpdate.connect(self._on_progress_update)
+        worker.rowsRemoved.connect(self._on_rows_removed)
+        worker.scanError.connect(self._on_scan_error)
+        worker.scanFinished.connect(
+            lambda added, removed, moved, w=worker: self._on_scan_finished(added, removed, moved, w)
+        )
+        worker.finished.connect(lambda w=worker: self._on_thread_finished(w))
+        self.scan_worker = worker
+        worker.start()
 
-        watched = set(self.watcher.directories())
-        wanted = {str(self.root_path)} | {str(self.root_path / c) for c in list_categories(self.root_path)}
-        to_remove = list(watched - wanted)
-        to_add = list(wanted - watched)
-        if to_remove:
-            self.watcher.removePaths(to_remove)
-        if to_add:
-            self.watcher.addPaths(to_add)
+    def _on_thread_finished(self, worker: ScanWorker):
+        if self.scan_worker is worker:
+            self.scan_worker = None
+        if self.pending_rescan:
+            self.pending_rescan = False
+            QTimer.singleShot(50, self._start_scan)
 
-        self._rebuild_category_filter()
-        self._rebuild_table()
+    def _on_batch_ready(self, songs: List[Song]):
+        for song in songs:
+            self._add_or_update_row(song)
+        self._refresh_category_choices()
+        self._apply_filters()
+        self._update_status(f"{len(self.songs_by_id)} songs")
 
-        if currently_playing_path:
-            for s in self.songs:
-                if s.path == currently_playing_path:
-                    break
+    def _on_song_ready(self, song: Song):
+        self._add_or_update_row(song)
+        self._apply_filters()
 
-    def _rebuild_category_filter(self):
+    def _on_total_determined(self, total: int):
+        if total > 0:
+            if self.loading_dialog is None:
+                self.loading_dialog = LoadingDialog(self)
+            self.loading_dialog.update_progress(0, total, None, "")
+            self.loading_dialog.show()
+            self.loading_dialog.raise_()
+            self._update_status(f"Importing 0 / {total} songs...")
+        else:
+            if self.loading_dialog is not None:
+                self.loading_dialog.close()
+                self.loading_dialog = None
+
+    def _on_progress_update(self, processed: int, total: int, eta_seconds: Optional[float], current_name: str):
+        if self.loading_dialog is not None:
+            self.loading_dialog.update_progress(processed, total, eta_seconds, current_name)
+        pct = int(processed / total * 100) if total else 100
+        eta_txt = f" - ETA {format_time(int(eta_seconds * 1000))}" if eta_seconds is not None else ""
+        self._update_status(f"Importing {processed} / {total} songs ({pct}%){eta_txt}")
+
+    def _on_rows_removed(self, ids: List[str]):
+        for song_id in ids:
+            item = self.row_items.pop(song_id, None)
+            self.songs_by_id.pop(song_id, None)
+            if item is not None:
+                self.table.removeRow(item.row())
+        self._refresh_category_choices()
+
+    def _on_scan_error(self, message: str):
+        if self.loading_dialog is not None:
+            self.loading_dialog.close()
+            self.loading_dialog = None
+        self.statusBar().showMessage(f"Error while scanning library: {message}", 6000)
+        self._update_status("Error")
+
+    def _on_scan_finished(self, added_titles: List[str], removed_titles: List[str], moved_count: int, worker: ScanWorker):
+        if self.loading_dialog is not None:
+            self.loading_dialog.close()
+            self.loading_dialog = None
+
+        self.cache = worker.new_cache
+        if self.root_path is not None:
+            save_cache(self.root_path, self.cache)
+
+        self._refresh_category_choices()
+        self._update_status(f"{len(self.songs_by_id)} songs \u2022 Up to date")
+
+        if added_titles or removed_titles:
+            self.last_added_titles = added_titles
+            self.last_removed_titles = removed_titles
+            self.changes_button.setEnabled(True)
+            self.statusBar().showMessage(
+                f"Library changed: +{len(added_titles)} added, -{len(removed_titles)} removed"
+                + (f" ({moved_count} moved/renamed, not counted as a change)" if moved_count else ""),
+                6000,
+            )
+
+    def _update_status(self, text: str):
+        self.status_label.setText(text)
+
+    def _show_changes_dialog(self):
+        lines = []
+        if self.last_added_titles:
+            lines.append(f"Added ({len(self.last_added_titles)}):")
+            lines.extend(f"  + {t}" for t in self.last_added_titles[:50])
+            if len(self.last_added_titles) > 50:
+                lines.append(f"  ... and {len(self.last_added_titles) - 50} more")
+        if self.last_removed_titles:
+            if lines:
+                lines.append("")
+            lines.append(f"Removed ({len(self.last_removed_titles)}):")
+            lines.extend(f"  - {t}" for t in self.last_removed_titles[:50])
+            if len(self.last_removed_titles) > 50:
+                lines.append(f"  ... and {len(self.last_removed_titles) - 50} more")
+        if not lines:
+            lines.append("No recent additions or removals.")
+        QMessageBox.information(self, "Recent library changes", "\n".join(lines))
+
+    def _refresh_category_choices(self):
+        cats = list_categories(self.root_path) if self.root_path else []
+        if cats == self._last_known_categories:
+            return
+        self._last_known_categories = cats
+
         self.category_list.blockSignals(True)
         self.category_list.clear()
-        categories = list_categories(self.root_path) if self.root_path else []
-        for cat in categories:
+        for cat in cats:
             item = QListWidgetItem(cat)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked if cat in self.checked_categories else Qt.Unchecked)
             self.category_list.addItem(item)
         self.category_list.blockSignals(False)
-        self.checked_categories &= set(categories)
+        self.checked_categories &= set(cats)
+
+        for song_id, item in self.row_items.items():
+            row = item.row()
+            combo = self.table.cellWidget(row, COL_CATEGORY)
+            if combo is None:
+                continue
+            current = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(cats)
+            if current in cats:
+                combo.setCurrentText(current)
+            combo.blockSignals(False)
 
     def _on_category_filter_changed(self, item: QListWidgetItem):
         cat = item.text()
@@ -1153,74 +1376,101 @@ class MainWindow(QMainWindow):
             self.checked_categories.add(cat)
         else:
             self.checked_categories.discard(cat)
-        self._rebuild_table()
+        self._apply_filters()
+
+    def _on_rating_filter_changed(self, value: int):
+        self.min_rating_filter = value
+        self._apply_filters()
 
     # ------------------------------------------------------------------
-    # Table
+    # Table row management (incremental - the table is never torn down on a
+    # filter/search change, so the filter selection is never lost).
     # ------------------------------------------------------------------
-    def _filtered_songs(self) -> List[Song]:
+    def _matches_filters(self, song: Song) -> bool:
+        if self.checked_categories and song.category not in self.checked_categories:
+            return False
         search = self.search_box.text().strip().lower()
-        result = []
-        for s in self.songs:
-            if self.checked_categories and s.category not in self.checked_categories:
+        if search and search not in song.title.lower() and search not in song.artist.lower():
+            return False
+        if self.min_rating_filter > 0 and song.rating < self.min_rating_filter:
+            return False
+        return True
+
+    def _apply_filters(self):
+        for song_id, song in self.songs_by_id.items():
+            item = self.row_items.get(song_id)
+            if item is None:
                 continue
-            if search and search not in s.title.lower() and search not in s.artist.lower():
-                continue
-            result.append(s)
-        return result
+            self.table.setRowHidden(item.row(), not self._matches_filters(song))
 
-    def _rebuild_table(self):
-        songs = self._filtered_songs()
-        self.table.setRowCount(0)
-        self.table.setRowCount(len(songs))
-        all_categories = list_categories(self.root_path) if self.root_path else []
+    def _filtered_songs(self) -> List[Song]:
+        return [s for s in self.songs_by_id.values() if self._matches_filters(s)]
 
-        for row, song in enumerate(songs):
-            title_item = QTableWidgetItem(song.title)
-            title_item.setData(Qt.UserRole, song.id)
-            self.table.setItem(row, COL_TITLE, title_item)
-            self.table.setItem(row, COL_ARTIST, QTableWidgetItem(song.artist))
-
-            combo = QComboBox()
-            combo.addItems(all_categories)
-            if song.category in all_categories:
+    def _add_or_update_row(self, song: Song):
+        self.songs_by_id[song.id] = song
+        existing_item = self.row_items.get(song.id)
+        if existing_item is not None:
+            row = existing_item.row()
+            existing_item.setText(song.title)
+            artist_item = self.table.item(row, COL_ARTIST)
+            if artist_item is not None:
+                artist_item.setText(song.artist)
+            combo = self.table.cellWidget(row, COL_CATEGORY)
+            if combo is not None and combo.currentText() != song.category:
+                combo.blockSignals(True)
                 combo.setCurrentText(song.category)
-            combo.setEnabled(False)
-            combo.currentTextChanged.connect(
-                lambda new_cat, s=song, c=combo: self._on_category_combo_changed(s, c, new_cat)
-            )
-            self.table.setCellWidget(row, COL_CATEGORY, combo)
+                combo.blockSignals(False)
+            star_widget = self.table.cellWidget(row, COL_RATING)
+            if star_widget is not None:
+                star_widget.set_rating(song.rating)
+            self.table.setRowHidden(row, not self._matches_filters(song))
+        else:
+            self._insert_song_row(song)
 
-            cat_lock = LockButton(
-                "Locked: category cannot be changed. Click to unlock.",
-                "Unlocked: category can now be changed (this will move the file)."
-            )
-            cat_lock.toggledLock.connect(
-                lambda unlocked, combo=combo: combo.setEnabled(unlocked)
-            )
-            self.table.setCellWidget(row, COL_CATEGORY_LOCK, self._centered(cat_lock))
+    def _insert_song_row(self, song: Song):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
 
-            star_widget = StarRatingWidget(song.rating)
-            star_widget.set_editable(False)
-            star_widget.ratingChanged.connect(
-                lambda new_rating, s=song: self._on_rating_changed(s, new_rating)
-            )
-            self.table.setCellWidget(row, COL_RATING, star_widget)
+        title_item = QTableWidgetItem(song.title)
+        title_item.setData(Qt.UserRole, song.id)
+        self.table.setItem(row, COL_TITLE, title_item)
+        self.table.setItem(row, COL_ARTIST, QTableWidgetItem(song.artist))
+        self.row_items[song.id] = title_item
 
-            rating_lock = LockButton(
-                "Locked: rating cannot be changed. Click to unlock.",
-                "Unlocked: rating can now be set/changed."
-            )
-            rating_lock.toggledLock.connect(
-                lambda unlocked, star=star_widget: star.set_editable(unlocked)
-            )
-            self.table.setCellWidget(row, COL_RATING_LOCK, self._centered(rating_lock))
+        all_categories = list_categories(self.root_path) if self.root_path else []
+        combo = QComboBox()
+        combo.addItems(all_categories)
+        if song.category in all_categories:
+            combo.setCurrentText(song.category)
+        combo.setEnabled(False)
+        combo.currentTextChanged.connect(
+            lambda new_cat, s=song, c=combo: self._on_category_combo_changed(s, c, new_cat)
+        )
+        self.table.setCellWidget(row, COL_CATEGORY, combo)
 
-            # Keep references so we can auto re-lock after a change
-            combo.setProperty("lock_ref", cat_lock)
-            star_widget.setProperty("lock_ref", rating_lock)
+        cat_lock = LockButton(
+            "Locked: category cannot be changed. Click to unlock.",
+            "Unlocked: category can now be changed (this will move the file)."
+        )
+        cat_lock.toggledLock.connect(lambda unlocked, combo=combo: combo.setEnabled(unlocked))
+        self.table.setCellWidget(row, COL_CATEGORY_LOCK, self._centered(cat_lock))
 
-        self._highlight_playing_row(self.player.current_song())
+        star_widget = StarRatingWidget(song.rating)
+        star_widget.set_editable(False)
+        star_widget.ratingChanged.connect(lambda new_rating, s=song: self._on_rating_changed(s, new_rating))
+        self.table.setCellWidget(row, COL_RATING, star_widget)
+
+        rating_lock = LockButton(
+            "Locked: rating cannot be changed. Click to unlock.",
+            "Unlocked: rating can now be set/changed."
+        )
+        rating_lock.toggledLock.connect(lambda unlocked, star=star_widget: star.set_editable(unlocked))
+        self.table.setCellWidget(row, COL_RATING_LOCK, self._centered(rating_lock))
+
+        combo.setProperty("lock_ref", cat_lock)
+        star_widget.setProperty("lock_ref", rating_lock)
+
+        self.table.setRowHidden(row, not self._matches_filters(song))
 
     @staticmethod
     def _centered(widget: QWidget) -> QWidget:
@@ -1238,7 +1488,7 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         song_id = item.data(Qt.UserRole)
-        song = next((s for s in self.songs if s.id == song_id), None)
+        song = self.songs_by_id.get(song_id)
         if song:
             self.player.play_song(song, queue=self._filtered_songs())
 
@@ -1248,15 +1498,23 @@ class MainWindow(QMainWindow):
             self.player.play_song(songs[0], queue=songs)
 
     def _highlight_playing_row(self, playing_song: Optional[Song]):
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, COL_TITLE)
-            if item is None:
-                continue
-            is_playing = playing_song is not None and item.data(Qt.UserRole) == playing_song.id
-            f = item.font()
-            f.setBold(is_playing)
-            item.setFont(f)
-            item.setForeground(Qt.cyan if is_playing else Qt.white)
+        if self._currently_highlighted_id is not None:
+            prev_item = self.row_items.get(self._currently_highlighted_id)
+            if prev_item is not None:
+                f = prev_item.font()
+                f.setBold(False)
+                prev_item.setFont(f)
+                prev_item.setForeground(Qt.white)
+
+        self._currently_highlighted_id = playing_song.id if playing_song else None
+
+        if playing_song is not None:
+            item = self.row_items.get(playing_song.id)
+            if item is not None:
+                f = item.font()
+                f.setBold(True)
+                item.setFont(f)
+                item.setForeground(Qt.cyan)
 
     # ------------------------------------------------------------------
     # Change category -> physically move the file
@@ -1265,7 +1523,7 @@ class MainWindow(QMainWindow):
         if new_category == song.category:
             return
         if not combo.isEnabled():
-            return  # should not happen because of the lock, but just in case
+            return
 
         if self.player.current_song() is song and self.player.is_playing():
             QMessageBox.warning(
@@ -1279,6 +1537,7 @@ class MainWindow(QMainWindow):
             return
 
         old_category = song.category
+        old_path_str = str(song.path)
         try:
             new_path = safe_move_song(song, self.root_path, new_category)
         except SafeMoveError as e:
@@ -1296,12 +1555,26 @@ class MainWindow(QMainWindow):
         song.category = new_category
         self.player.notify_song_path_changed(song, new_path)
 
-        # Automatically re-lock (green)
+        # Keep the on-disk cache in sync immediately so the next scan doesn't
+        # need to re-read this file at all.
+        rec = self.cache.pop(old_path_str, {})
+        try:
+            st = new_path.stat()
+            rec.update({"size": st.st_size, "mtime": st.st_mtime, "title": song.title,
+                        "artist": song.artist, "rating": song.rating,
+                        "duration": song.duration, "id": song.id})
+            self.cache[str(new_path)] = rec
+            if self.root_path is not None:
+                save_cache(self.root_path, self.cache)
+        except OSError:
+            pass
+
         lock: LockButton = combo.property("lock_ref")
         if lock is not None:
             lock.set_locked(True)
         combo.setEnabled(False)
 
+        self.table.setRowHidden(self.row_items[song.id].row(), not self._matches_filters(song))
         self.statusBar().showMessage(
             f"'{song.title}' moved from '{old_category}' to '{new_category}'.", 4000
         )
@@ -1319,12 +1592,29 @@ class MainWindow(QMainWindow):
             )
             return
         song.rating = new_rating
+
+        try:
+            st = song.path.stat()
+            rec = self.cache.get(str(song.path), {})
+            rec.update({"size": st.st_size, "mtime": st.st_mtime, "title": song.title,
+                        "artist": song.artist, "rating": new_rating,
+                        "duration": song.duration, "id": song.id})
+            self.cache[str(song.path)] = rec
+            if self.root_path is not None:
+                save_cache(self.root_path, self.cache)
+        except OSError:
+            pass
+
         sender = self.sender()
         if isinstance(sender, StarRatingWidget):
             lock: LockButton = sender.property("lock_ref")
             if lock is not None:
                 lock.set_locked(True)
             sender.set_editable(False)
+
+        item = self.row_items.get(song.id)
+        if item is not None:
+            self.table.setRowHidden(item.row(), not self._matches_filters(song))
         self.statusBar().showMessage(f"Rating for '{song.title}' saved: {new_rating}/5", 3000)
 
 
