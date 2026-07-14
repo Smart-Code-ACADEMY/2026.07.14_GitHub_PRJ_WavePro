@@ -4,17 +4,6 @@ Music Library App
 =================
 Single-file, modern dark-mode (Apple-style) music library + player.
 
-Changes in this version:
-- LEFT SIDEBAR REMOVED. All filters are now INLINE above the song list,
-  Excel-style: a row of dropdowns/controls sits directly above the table
-  columns (Category filter, Rating filter, Search). Filters are persistent
-  and never reset the table – only rows are shown/hidden.
-- Lock icons are smaller (18 x 18 px, font size 9) so they fit perfectly
-  inside a table row without clipping.
-- Everything else (background scan, cache, progress window, crash-safe move,
-  rating written into file, move-vs-add/remove detection, repeat modes,
-  player controls, changes view) is unchanged.
-
 Run:
     pip install PySide6 mutagen
     python music_app.py
@@ -49,20 +38,20 @@ from PySide6.QtGui import QFont
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QProgressBar, QPushButton, QSlider,
     QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 ORG_NAME = "LocalMusicApps"
-APP_NAME = "MusicLibrary"
+APP_NAME  = "MusicLibrary"
 
 # ============================================================================
 # Metadata helpers
 # ============================================================================
 RATING_TXXX_DESC = "RATING"
-MP4_RATING_ATOM = "----:com.apple.iTunes:RATING"
-SUPPORTED_EXTENSIONS = {".mp3", ".flac", ".ogg", ".m4a", ".mp4", ".wav", ".wma", ".aac", ".oga"}
+MP4_RATING_ATOM  = "----:com.apple.iTunes:RATING"
+SUPPORTED_EXTENSIONS = {".mp3",".flac",".ogg",".m4a",".mp4",".wav",".wma",".aac",".oga"}
 
 
 def read_display_tags(path: Path) -> Tuple[str, str]:
@@ -72,7 +61,7 @@ def read_display_tags(path: Path) -> Tuple[str, str]:
         if audio and audio.tags:
             t = audio.tags.get("title")
             a = audio.tags.get("artist")
-            if t: title = t[0]
+            if t: title  = t[0]
             if a: artist = a[0]
     except Exception:
         pass
@@ -132,6 +121,7 @@ def read_rating(path: Path) -> int:
 
 
 def write_rating(path: Path, rating: int) -> bool:
+    """Write rating (0-5) directly into the audio file's own metadata."""
     rating = _clamp(rating)
     ext = path.suffix.lower()
     try:
@@ -140,7 +130,8 @@ def write_rating(path: Path, rating: int) -> bool:
                 id3 = ID3(path)
             except ID3NoHeaderError:
                 id3 = ID3()
-            for f in [f for f in id3.getall("TXXX") if getattr(f, "desc", "").upper() == RATING_TXXX_DESC]:
+            for f in [f for f in id3.getall("TXXX")
+                      if getattr(f, "desc", "").upper() == RATING_TXXX_DESC]:
                 id3.delall(f"TXXX:{f.desc}")
             id3.add(TXXX(encoding=3, desc=RATING_TXXX_DESC, text=[str(rating)]))
             id3.save(path)
@@ -191,11 +182,11 @@ def _safe_int(v) -> int:
 # ============================================================================
 @dataclass
 class Song:
-    path: Path
+    path:     Path
     category: str
-    title: str
-    artist: str
-    rating: int
+    title:    str
+    artist:   str
+    rating:   int
     duration: float = 0.0
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
@@ -241,10 +232,9 @@ def scan_library(root: Path) -> List[Song]:
     for path_str, (category, _s, _m) in fast_list_files(root).items():
         file = Path(path_str)
         title, artist = read_display_tags(file)
-        rating = read_rating(file)
-        duration = read_duration_seconds(file)
         songs.append(Song(path=file, category=category, title=title,
-                          artist=artist, rating=rating, duration=duration))
+                          artist=artist, rating=read_rating(file),
+                          duration=read_duration_seconds(file)))
     return songs
 
 
@@ -264,19 +254,17 @@ def safe_move_song(song: "Song", root: Path, target_category: str) -> Path:
         while dest.exists():
             dest = target_dir / f"{stem} ({counter}){suffix}"
             counter += 1
-    tmp_dest = dest.with_name(dest.name + ".part")
+    tmp = dest.with_name(dest.name + ".part")
     try:
-        shutil.copy2(src, tmp_dest)
-        if os.path.getsize(tmp_dest) != os.path.getsize(src):
+        shutil.copy2(src, tmp)
+        if os.path.getsize(tmp) != os.path.getsize(src):
             raise SafeMoveError("Verification failed (size mismatch)")
-        os.replace(tmp_dest, dest)
+        os.replace(tmp, dest)
         os.remove(src)
     except Exception as e:
-        if tmp_dest.exists():
-            try:
-                os.remove(tmp_dest)
-            except OSError:
-                pass
+        if tmp.exists():
+            try: os.remove(tmp)
+            except OSError: pass
         raise SafeMoveError(str(e))
     return dest
 
@@ -288,30 +276,30 @@ def get_cache_path(root: Path) -> Path:
     base = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
     if not base:
         base = str(Path.home() / ".music_library_app")
-    base_path = Path(base)
+    bp = Path(base)
     try:
-        base_path.mkdir(parents=True, exist_ok=True)
+        bp.mkdir(parents=True, exist_ok=True)
     except OSError:
-        base_path = Path.home()
+        bp = Path.home()
     h = hashlib.md5(str(root.resolve()).encode()).hexdigest()
-    return base_path / f"music_library_cache_{h}.json"
+    return bp / f"music_library_cache_{h}.json"
 
 
 def load_cache(root: Path) -> Dict[str, dict]:
-    path = get_cache_path(root)
-    if not path.is_file():
+    p = get_cache_path(root)
+    if not p.is_file():
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
 
 def save_cache(root: Path, cache: Dict[str, dict]):
-    path = get_cache_path(root)
+    p = get_cache_path(root)
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(p, "w", encoding="utf-8") as f:
             json.dump(cache, f)
     except Exception:
         pass
@@ -339,18 +327,18 @@ class ScanWorker(QThread):
         try:
             current = fast_list_files(self.root)
         except Exception as e:
-            self.scanError.emit(str(e))
-            return
+            self.scanError.emit(str(e)); return
 
-        old_cache = self.previous_cache
-        old_paths, new_paths = set(old_cache), set(current)
+        old = self.previous_cache
+        old_paths, new_paths = set(old), set(current)
         common = old_paths & new_paths
 
         unchanged, changed = [], []
         for p in common:
             _, size, mtime = current[p]
-            rec = old_cache.get(p, {})
-            if rec.get("size") == size and rec.get("mtime") is not None and abs(rec["mtime"] - mtime) < 1.0:
+            rec = old.get(p, {})
+            if rec.get("size") == size and rec.get("mtime") is not None \
+                    and abs(rec["mtime"] - mtime) < 1.0:
                 unchanged.append(p)
             else:
                 changed.append(p)
@@ -360,76 +348,80 @@ class ScanWorker(QThread):
 
         missing_by_size: Dict[int, List[str]] = {}
         for p in missing_paths:
-            missing_by_size.setdefault(old_cache.get(p, {}).get("size"), []).append(p)
+            missing_by_size.setdefault(old.get(p, {}).get("size"), []).append(p)
 
         moved_pairs, truly_added = [], []
         for p in added_paths:
             _, size, _ = current[p]
-            candidates = missing_by_size.get(size)
-            if candidates:
-                old_p = candidates.pop()
-                if not candidates:
-                    del missing_by_size[size]
+            cands = missing_by_size.get(size)
+            if cands:
+                old_p = cands.pop()
+                if not cands: del missing_by_size[size]
                 moved_pairs.append((old_p, p))
             else:
                 truly_added.append(p)
 
         truly_missing = [p for lst in missing_by_size.values() for p in lst]
         new_cache: Dict[str, dict] = {}
-        batch_songs: List[Song] = []
+        batch: List[Song] = []
 
         for p in unchanged:
             cat, size, mtime = current[p]
-            rec = old_cache[p]
+            rec = old[p]
             song = Song(path=Path(p), category=cat,
-                        title=rec.get("title", Path(p).stem), artist=rec.get("artist", ""),
-                        rating=rec.get("rating", 0), duration=rec.get("duration", 0.0),
+                        title=rec.get("title", Path(p).stem),
+                        artist=rec.get("artist", ""),
+                        rating=rec.get("rating", 0),
+                        duration=rec.get("duration", 0.0),
                         id=rec.get("id") or uuid.uuid4().hex)
             new_cache[p] = {**rec, "size": size, "mtime": mtime, "id": song.id}
-            batch_songs.append(song)
+            batch.append(song)
 
         for old_p, new_p in moved_pairs:
             cat, size, mtime = current[new_p]
-            rec = old_cache.get(old_p, {})
+            rec = old.get(old_p, {})
             song = Song(path=Path(new_p), category=cat,
-                        title=rec.get("title", Path(new_p).stem), artist=rec.get("artist", ""),
-                        rating=rec.get("rating", 0), duration=rec.get("duration", 0.0),
+                        title=rec.get("title", Path(new_p).stem),
+                        artist=rec.get("artist", ""),
+                        rating=rec.get("rating", 0),
+                        duration=rec.get("duration", 0.0),
                         id=rec.get("id") or uuid.uuid4().hex)
             new_cache[new_p] = {**rec, "size": size, "mtime": mtime, "id": song.id}
-            batch_songs.append(song)
+            batch.append(song)
 
-        if batch_songs:
-            self.batchReady.emit(batch_songs)
+        if batch:
+            self.batchReady.emit(batch)
 
-        slow_paths = truly_added + changed
-        self.totalDetermined.emit(len(slow_paths))
-
+        slow = truly_added + changed
+        self.totalDetermined.emit(len(slow))
         start = time.monotonic()
-        for i, p in enumerate(slow_paths, 1):
+        for i, p in enumerate(slow, 1):
             cat, size, mtime = current[p]
-            path_obj = Path(p)
-            title, artist = read_display_tags(path_obj)
-            rating   = read_rating(path_obj)
-            duration = read_duration_seconds(path_obj)
-            old_id   = old_cache.get(p, {}).get("id")
-            song = Song(path=path_obj, category=cat, title=title, artist=artist,
-                        rating=rating, duration=duration, id=old_id or uuid.uuid4().hex)
-            new_cache[p] = {"size": size, "mtime": mtime, "title": title, "artist": artist,
-                            "rating": rating, "duration": duration, "id": song.id}
+            po = Path(p)
+            title, artist = read_display_tags(po)
+            rating   = read_rating(po)
+            duration = read_duration_seconds(po)
+            old_id   = old.get(p, {}).get("id")
+            song = Song(path=po, category=cat, title=title, artist=artist,
+                        rating=rating, duration=duration,
+                        id=old_id or uuid.uuid4().hex)
+            new_cache[p] = {"size": size, "mtime": mtime, "title": title,
+                            "artist": artist, "rating": rating,
+                            "duration": duration, "id": song.id}
             elapsed = time.monotonic() - start
             rate    = i / elapsed if elapsed > 0 else 0
-            eta     = (len(slow_paths) - i) / rate if rate > 0 else None
-            self.progressUpdate.emit(i, len(slow_paths), eta, path_obj.name)
+            eta     = (len(slow) - i) / rate if rate > 0 else None
+            self.progressUpdate.emit(i, len(slow), eta, po.name)
             self.songReady.emit(song)
 
-        removed_ids = [old_cache[p]["id"] for p in truly_missing if "id" in old_cache.get(p, {})]
+        removed_ids = [old[p]["id"] for p in truly_missing if "id" in old.get(p, {})]
         if removed_ids:
             self.rowsRemoved.emit(removed_ids)
 
         self.new_cache = new_cache
         self.scanFinished.emit(
             [new_cache.get(p, {}).get("title", Path(p).stem) for p in truly_added],
-            [old_cache[p].get("title", Path(p).stem) for p in truly_missing],
+            [old[p].get("title", Path(p).stem) for p in truly_missing],
             len(moved_pairs),
         )
 
@@ -470,20 +462,17 @@ class PlayerController(QObject):
         return self._player.playbackState() == QMediaPlayer.PlayingState
 
     def set_repeat_mode(self, mode: RepeatMode):
-        self._repeat = mode
-        self.repeatModeChanged.emit(mode)
+        self._repeat = mode; self.repeatModeChanged.emit(mode)
 
     def repeat_mode(self) -> RepeatMode:
         return self._repeat
 
     def toggle_play_pause(self):
-        if self._index < 0:
-            return
+        if self._index < 0: return
         self._player.pause() if self.is_playing() else self._player.play()
 
     def next(self):
-        if not self._queue:
-            return
+        if not self._queue: return
         if self._repeat == RepeatMode.ONE:
             self._load(autoplay=True); return
         if self._index + 1 < len(self._queue):
@@ -495,8 +484,7 @@ class PlayerController(QObject):
         self._load(autoplay=True)
 
     def previous(self):
-        if not self._queue:
-            return
+        if not self._queue: return
         if self._player.position() > 3000:
             self._player.setPosition(0); return
         if self._index - 1 >= 0:
@@ -507,8 +495,7 @@ class PlayerController(QObject):
             self._index = 0
         self._load(autoplay=True)
 
-    def seek(self, ms: int):
-        self._player.setPosition(ms)
+    def seek(self, ms: int): self._player.setPosition(ms)
 
     def set_volume(self, v: int):
         self._audio.setVolume(max(0, min(100, v)) / 100.0)
@@ -549,11 +536,11 @@ class PlayerController(QObject):
 
 
 # ============================================================================
-# Widgets
+# LockButton widget
 # ============================================================================
 class LockButton(QToolButton):
-    """Compact lock button: green = locked, red = unlocked."""
-    toggledLock = Signal(bool)
+    """Green = locked (safe), red = unlocked (editable)."""
+    toggledLock = Signal(bool)   # True = now unlocked
 
     def __init__(self, tip_locked: str, tip_unlocked: str, parent=None):
         super().__init__(parent)
@@ -561,8 +548,10 @@ class LockButton(QToolButton):
         self._tip_locked   = tip_locked
         self._tip_unlocked = tip_unlocked
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(18, 18)
-        f = QFont(); f.setPointSize(9); self.setFont(f)
+        # Icon size stays 18×18; the row height is set to 44 px so there
+        # is comfortable padding above and below the button.
+        self.setFixedSize(24, 24)
+        f = QFont(); f.setPointSize(11); self.setFont(f)
         self.clicked.connect(self._toggle)
         self._refresh()
 
@@ -570,8 +559,7 @@ class LockButton(QToolButton):
         return self._locked
 
     def set_locked(self, v: bool, emit=False):
-        self._locked = v
-        self._refresh()
+        self._locked = v; self._refresh()
         if emit: self.toggledLock.emit(not v)
 
     def _toggle(self):
@@ -584,67 +572,89 @@ class LockButton(QToolButton):
             self.setText("\U0001F512")
             self.setToolTip(self._tip_locked)
             self.setStyleSheet(
-                "QToolButton{background:rgba(48,209,88,0.15);border:1px solid #30D158;"
-                "border-radius:5px;color:#30D158;}"
-                "QToolButton:hover{background:rgba(48,209,88,0.28);}")
+                "QToolButton{background:rgba(48,209,88,.15);border:1px solid #30D158;"
+                "border-radius:6px;color:#30D158;padding:2px;}"
+                "QToolButton:hover{background:rgba(48,209,88,.28);}")
         else:
             self.setText("\U0001F513")
             self.setToolTip(self._tip_unlocked)
             self.setStyleSheet(
-                "QToolButton{background:rgba(255,69,58,0.15);border:1px solid #FF453A;"
-                "border-radius:5px;color:#FF453A;}"
-                "QToolButton:hover{background:rgba(255,69,58,0.28);}")
+                "QToolButton{background:rgba(255,69,58,.15);border:1px solid #FF453A;"
+                "border-radius:6px;color:#FF453A;padding:2px;}"
+                "QToolButton:hover{background:rgba(255,69,58,.28);}")
 
 
+# ============================================================================
+# StarRatingWidget
+# ============================================================================
 class StarRatingWidget(QWidget):
-    """5 stars: gray outline when unrated, yellow when rated."""
+    """
+    5 stars: gray outline when unrated, yellow when rated.
+    Min = 0 (all gray), Max = 5 (all yellow).
+    Clicking the active star again resets to 0.
+    Editable only after the corresponding lock is opened.
+    """
     ratingChanged = Signal(int)
     COLOR_FILLED = "#FFD60A"
     COLOR_EMPTY  = "#6e6e73"
 
-    def __init__(self, rating=0, parent=None):
+    def __init__(self, rating: int = 0, parent=None):
         super().__init__(parent)
-        self._rating = rating
+        self._rating   = _clamp(rating)
         self._editable = False
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(2, 0, 2, 0)
-        lay.setSpacing(0)
-        self._btns = []
+        lay.setContentsMargins(4, 0, 4, 0)
+        lay.setSpacing(1)
+        self._btns: List[QPushButton] = []
         for i in range(5):
-            btn = QPushButton(); btn.setFlat(True)
-            btn.setFixedSize(20, 20)
+            btn = QPushButton()
+            btn.setFlat(True)
+            btn.setFixedSize(22, 22)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda _, idx=i: self._click(idx))
+            # critical: use default-arg capture to avoid closure-over-loop-var bug
+            btn.clicked.connect(lambda _checked=False, idx=i: self._on_click(idx))
             lay.addWidget(btn)
             self._btns.append(btn)
         lay.addStretch()
         self._refresh()
 
+    # public API -------------------------------------------------------
     def rating(self) -> int:
         return self._rating
 
     def set_rating(self, v: int):
-        self._rating = max(0, min(5, v)); self._refresh()
+        self._rating = _clamp(v)
+        self._refresh()
 
     def set_editable(self, v: bool):
-        self._editable = v; self._refresh()
+        self._editable = v
+        self._refresh()
 
-    def _click(self, idx: int):
-        if not self._editable: return
-        nr = idx + 1
-        if nr == self._rating: nr = 0
-        self._rating = nr; self._refresh()
-        self.ratingChanged.emit(nr)
+    # internal ---------------------------------------------------------
+    def _on_click(self, idx: int):
+        if not self._editable:
+            return
+        new = idx + 1
+        if new == self._rating:
+            new = 0          # click active star again → reset to 0
+        self._rating = new
+        self._refresh()
+        self.ratingChanged.emit(self._rating)
 
     def _refresh(self):
         for i, btn in enumerate(self._btns):
             filled = i < self._rating
             color  = self.COLOR_FILLED if filled else self.COLOR_EMPTY
             btn.setText("\u2605" if filled else "\u2606")
+            # colour must show even when disabled
             btn.setStyleSheet(
-                f"QPushButton{{border:none;background:transparent;color:{color};font-size:15px;}}"
-                f"QPushButton:disabled{{color:{color};}}")
-            btn.setEnabled(self._editable)
+                f"QPushButton{{border:none;background:transparent;"
+                f"color:{color};font-size:16px;}}"
+                f"QPushButton:disabled{{color:{color};}}"
+            )
+            # Always enable the button widget; we guard editing in _on_click
+            # so the cursor and visual remain consistent.
+            btn.setEnabled(True)
 
 
 # ============================================================================
@@ -663,27 +673,29 @@ class LoadingDialog(QDialog):
         lay.addWidget(self.bar)
         self.detail = QLabel(""); self.detail.setObjectName("subtleLabel")
         self.detail.setWordWrap(True); lay.addWidget(self.detail)
-        self.eta = QLabel(""); self.eta.setObjectName("subtleLabel")
-        lay.addWidget(self.eta); lay.addStretch()
+        self.eta_lbl = QLabel(""); self.eta_lbl.setObjectName("subtleLabel")
+        lay.addWidget(self.eta_lbl); lay.addStretch()
 
-    def update_progress(self, done: int, total: int, eta_s: Optional[float], name: str):
+    def update_progress(self, done: int, total: int,
+                        eta_s: Optional[float], name: str):
         pct = int(done / total * 100) if total else 100
         self.bar.setValue(pct)
         self.detail.setText(f"{done} / {total} songs  ({pct}%)\n{name}")
-        self.eta.setText(
-            f"Estimated time remaining: {_fmt_time(int(eta_s * 1000))}" if eta_s is not None
-            else "Estimating time remaining…")
+        self.eta_lbl.setText(
+            f"Estimated time remaining: {_fmt_time(int(eta_s * 1000))}"
+            if eta_s is not None else "Estimating time remaining…")
 
 
 # ============================================================================
 # Stylesheet
 # ============================================================================
 DARK_QSS = """
-* { font-family: -apple-system,"SF Pro Text","Segoe UI","Helvetica Neue",Arial,sans-serif; outline:none; }
+* { font-family: -apple-system,"SF Pro Text","Segoe UI","Helvetica Neue",Arial,sans-serif;
+    outline: none; }
 
-QMainWindow, QWidget#centralWidget { background:#1c1c1e; }
-QWidget  { color:#f2f2f7; background:transparent; }
-QDialog  { background:#1c1c1e; }
+QMainWindow, QWidget#centralWidget { background: #1c1c1e; }
+QWidget  { color: #f2f2f7; background: transparent; }
+QDialog  { background: #1c1c1e; }
 
 QLabel#sectionTitle { font-size:20px; font-weight:600; color:#fff; padding:4px 0; }
 QLabel#subtleLabel  { color:#8e8e93; font-size:12px; }
@@ -691,43 +703,46 @@ QLabel#pathLabel    { color:#0a84ff; font-size:12px; padding:2px 8px;
                       background:rgba(10,132,255,.1); border-radius:6px; }
 QLabel#statusLabel  { color:#8e8e93; font-size:12px; padding:2px 8px; }
 
-#topBar { background:#1c1c1e; border:none; padding:10px; spacing:8px; }
+#topBar    { background:#1c1c1e; border:none; padding:10px; spacing:8px; }
+#filterBar { background:#232325; border-bottom:1px solid #2c2c2e; }
 
 QPushButton {
     background:#2c2c2e; border:1px solid #3a3a3c; border-radius:10px;
     padding:8px 16px; color:#f2f2f7; font-size:13px; font-weight:500; }
-QPushButton:hover   { background:#3a3a3c; border-color:#48484a; }
-QPushButton:pressed { background:#232325; }
-QPushButton:disabled{ color:#5a5a5e; border-color:#2c2c2e; }
+QPushButton:hover    { background:#3a3a3c; border-color:#48484a; }
+QPushButton:pressed  { background:#232325; }
+QPushButton:disabled { color:#5a5a5e; border-color:#2c2c2e; }
 
-QPushButton#accentButton { background:#0a84ff; border-color:#0a84ff; color:#fff; font-weight:600; }
+QPushButton#accentButton { background:#0a84ff; border-color:#0a84ff;
+                           color:#fff; font-weight:600; }
 QPushButton#accentButton:hover { background:#3399ff; }
 
-QPushButton#transportButton { background:transparent; border:none; border-radius:22px;
-                               font-size:18px; padding:6px; }
+QPushButton#playFilteredButton { background:#30d158; border-color:#30d158;
+                                 color:#fff; font-weight:600; }
+QPushButton#playFilteredButton:hover { background:#4dde70; }
+
+QPushButton#transportButton { background:transparent; border:none;
+                              border-radius:22px; font-size:18px; padding:6px; }
 QPushButton#transportButton:hover { background:#2c2c2e; }
 
 QPushButton#playPauseButton { background:#fff; border-radius:24px; color:#1c1c1e;
-                               font-size:18px; min-width:48px; min-height:48px; }
+                              font-size:18px; min-width:48px; min-height:48px; }
 QPushButton#playPauseButton:hover { background:#e5e5ea; }
-
-/* Filter bar above table */
-QFrame#filterBar { background:#232325; border-bottom:1px solid #2c2c2e; }
 
 QTableWidget {
     background:#1c1c1e; alternate-background-color:#202022;
     border:none; gridline-color:transparent;
     selection-background-color:rgba(10,132,255,.25); selection-color:#fff; }
-QTableWidget::item { padding:4px; border-bottom:1px solid #2c2c2e; }
+QTableWidget::item { padding:6px 4px; border-bottom:1px solid #2c2c2e; }
 QHeaderView::section {
     background:#1c1c1e; color:#8e8e93; border:none;
     border-bottom:1px solid #2c2c2e;
-    padding:6px; font-size:11px; font-weight:600; text-transform:uppercase; }
+    padding:8px 6px; font-size:11px; font-weight:600; text-transform:uppercase; }
 QTableWidget::item:selected { background:rgba(10,132,255,.22); }
 
 QComboBox {
     background:#2c2c2e; border:1px solid #3a3a3c; border-radius:8px;
-    padding:3px 8px; color:#f2f2f7; }
+    padding:4px 10px; color:#f2f2f7; }
 QComboBox:disabled { color:#5a5a5e; background:#232325; }
 QComboBox::drop-down { border:none; width:18px; }
 QComboBox QAbstractItemView {
@@ -762,12 +777,22 @@ QMessageBox { background:#2c2c2e; }
 
 
 # ============================================================================
-# Utility
+# Helpers
 # ============================================================================
 def _fmt_time(ms: int) -> str:
     s = max(0, ms // 1000)
     m, s = divmod(s, 60)
     return f"{m:02d}:{s:02d}"
+
+
+def _centered(widget: QWidget) -> QWidget:
+    w = QWidget()
+    lay = QHBoxLayout(w)
+    lay.setContentsMargins(4, 0, 4, 0)   # horizontal padding so icon isn't clipped
+    lay.addStretch()
+    lay.addWidget(widget)
+    lay.addStretch()
+    return w
 
 
 # ============================================================================
@@ -781,6 +806,8 @@ COL_RATING        = 4
 COL_RATING_LOCK   = 5
 COL_COUNT         = 6
 
+ROW_HEIGHT = 44   # px – comfortable padding around lock icons
+
 
 # ============================================================================
 # Main window
@@ -789,19 +816,19 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Music Library")
-        self.resize(1180, 760)
+        self.resize(1200, 760)
 
-        self.settings = QSettings(ORG_NAME, APP_NAME)
+        self.settings  = QSettings(ORG_NAME, APP_NAME)
         self.root_path: Optional[Path] = None
-        self.cache: Dict[str, dict] = {}
-        self.songs_by_id: Dict[str, Song] = {}
+        self.cache: Dict[str, dict]    = {}
+        self.songs_by_id: Dict[str, Song]          = {}
         self.row_items:   Dict[str, QTableWidgetItem] = {}
-        self._highlighted_id: Optional[str] = None
-        self._last_cats: List[str] = []
+        self._highlighted_id: Optional[str]        = None
+        self._last_cats: List[str]                  = []
 
-        # active filter values
+        # active filter state
         self._filter_cat    = "All"
-        self._filter_rating = 0          # 0 = show all
+        self._filter_rating = 0      # 0 = show all
         self._filter_search = ""
 
         self.scan_worker: Optional[ScanWorker] = None
@@ -813,7 +840,8 @@ class MainWindow(QMainWindow):
         self.player = PlayerController(self)
         self.watcher = QFileSystemWatcher(self)
         self.watcher.directoryChanged.connect(self._on_dir_changed)
-        self._rescan_timer = QTimer(self); self._rescan_timer.setSingleShot(True)
+        self._rescan_timer = QTimer(self)
+        self._rescan_timer.setSingleShot(True)
         self._rescan_timer.setInterval(500)
         self._rescan_timer.timeout.connect(self._start_scan)
 
@@ -825,7 +853,7 @@ class MainWindow(QMainWindow):
             self._set_root(Path(last))
 
     # ------------------------------------------------------------------
-    # UI
+    # UI building
     # ------------------------------------------------------------------
     def _build_ui(self):
         central = QWidget(); central.setObjectName("centralWidget")
@@ -837,7 +865,7 @@ class MainWindow(QMainWindow):
         vlay.addWidget(self._build_table(), stretch=1)
         vlay.addWidget(self._build_player_bar())
 
-    # ---- top bar ----
+    # ── top bar ──────────────────────────────────────────────────────
     def _build_top_bar(self) -> QWidget:
         bar = QFrame(); bar.setObjectName("topBar")
         lay = QHBoxLayout(bar)
@@ -846,10 +874,12 @@ class MainWindow(QMainWindow):
         title = QLabel("Music Library"); title.setObjectName("sectionTitle")
         lay.addWidget(title)
 
-        self.path_label = QLabel("No folder selected"); self.path_label.setObjectName("pathLabel")
+        self.path_label = QLabel("No folder selected")
+        self.path_label.setObjectName("pathLabel")
         lay.addWidget(self.path_label)
 
-        self.status_label = QLabel(""); self.status_label.setObjectName("statusLabel")
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("statusLabel")
         lay.addWidget(self.status_label)
 
         self.changes_btn = QPushButton("View changes")
@@ -859,71 +889,91 @@ class MainWindow(QMainWindow):
 
         lay.addStretch()
 
-        refresh_btn = QPushButton("Refresh"); refresh_btn.clicked.connect(self._start_scan)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._start_scan)
         lay.addWidget(refresh_btn)
 
-        add_btn = QPushButton("Add Music Folder"); add_btn.setObjectName("accentButton")
+        add_btn = QPushButton("Add Music Folder")
+        add_btn.setObjectName("accentButton")
         add_btn.clicked.connect(self._choose_folder)
         lay.addWidget(add_btn)
         return bar
 
-    # ---- Excel-style filter bar ----
+    # ── filter bar (Excel-style) ──────────────────────────────────────
     def _build_filter_bar(self) -> QWidget:
         bar = QFrame(); bar.setObjectName("filterBar")
         lay = QHBoxLayout(bar)
-        lay.setContentsMargins(8, 6, 8, 6); lay.setSpacing(6)
+        lay.setContentsMargins(12, 8, 12, 8); lay.setSpacing(8)
 
-        # Search (wide, on the left)
-        search_lbl = QLabel("🔍"); search_lbl.setObjectName("subtleLabel")
-        lay.addWidget(search_lbl)
+        # Search
+        search_icon = QLabel("🔍"); search_icon.setObjectName("subtleLabel")
+        lay.addWidget(search_icon)
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Search title or artist…")
-        self.search_box.setFixedWidth(240)
+        self.search_box.setFixedWidth(230)
         self.search_box.textChanged.connect(self._on_search_changed)
         lay.addWidget(self.search_box)
 
-        lay.addSpacing(20)
+        lay.addSpacing(16)
 
-        # Category dropdown filter
+        # Category filter
         cat_lbl = QLabel("Category:"); cat_lbl.setObjectName("subtleLabel")
         lay.addWidget(cat_lbl)
         self.cat_filter = QComboBox()
-        self.cat_filter.setFixedWidth(160)
+        self.cat_filter.setFixedWidth(155)
         self.cat_filter.addItem("All")
         self.cat_filter.currentTextChanged.connect(self._on_cat_filter_changed)
         lay.addWidget(self.cat_filter)
 
-        lay.addSpacing(20)
+        lay.addSpacing(16)
 
-        # Rating dropdown filter  (★★★★★ style labels)
+        # Rating filter — exact star values, max = 5, NOT "5+"
         rat_lbl = QLabel("Min. Rating:"); rat_lbl.setObjectName("subtleLabel")
         lay.addWidget(rat_lbl)
         self.rat_filter = QComboBox()
-        self.rat_filter.setFixedWidth(140)
+        self.rat_filter.setFixedWidth(150)
         self.rat_filter.addItem("All ratings", 0)
-        for n in range(1, 6):
-            self.rat_filter.addItem("★" * n + "☆" * (5 - n) + f"  ({n}+)", n)
+        # 1★ = at least 1 star … 5★ = exactly 5 stars (max)
+        star_labels = {
+            1: "★☆☆☆☆  (1 star)",
+            2: "★★☆☆☆  (2 stars)",
+            3: "★★★☆☆  (3 stars)",
+            4: "★★★★☆  (4 stars)",
+            5: "★★★★★  (5 stars)",
+        }
+        for n, lbl in star_labels.items():
+            self.rat_filter.addItem(lbl, n)
         self.rat_filter.currentIndexChanged.connect(self._on_rat_filter_changed)
         lay.addWidget(self.rat_filter)
 
+        lay.addSpacing(16)
+
+        # ── Play filtered button ──────────────────────────────────────
+        self.play_filtered_btn = QPushButton("▶  Play Filtered")
+        self.play_filtered_btn.setObjectName("playFilteredButton")
+        self.play_filtered_btn.setToolTip(
+            "Play all songs currently visible (respects active filters)")
+        self.play_filtered_btn.clicked.connect(self._play_filtered)
+        lay.addWidget(self.play_filtered_btn)
+
         lay.addStretch()
 
-        # Reset button
         reset_btn = QPushButton("Reset filters")
         reset_btn.clicked.connect(self._reset_filters)
         lay.addWidget(reset_btn)
         return bar
 
-    # ---- table ----
+    # ── song table ────────────────────────────────────────────────────
     def _build_table(self) -> QWidget:
         self.table = QTableWidget(0, COL_COUNT)
-        self.table.setHorizontalHeaderLabels(["Title", "Artist", "Category", "", "Rating", ""])
+        self.table.setHorizontalHeaderLabels(
+            ["Title", "Artist", "Category", "", "Rating", ""])
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
         h = self.table.horizontalHeader()
         h.setSectionResizeMode(COL_TITLE,         QHeaderView.Stretch)
         h.setSectionResizeMode(COL_ARTIST,        QHeaderView.Stretch)
@@ -934,7 +984,7 @@ class MainWindow(QMainWindow):
         self.table.doubleClicked.connect(self._on_double_click)
         return self.table
 
-    # ---- player bar ----
+    # ── player bar ────────────────────────────────────────────────────
     def _build_player_bar(self) -> QWidget:
         bar = QFrame(); bar.setObjectName("playerBar"); bar.setFixedHeight(92)
         outer = QVBoxLayout(bar)
@@ -942,7 +992,8 @@ class MainWindow(QMainWindow):
 
         seek_row = QHBoxLayout()
         self.lbl_pos = QLabel("00:00"); self.lbl_pos.setObjectName("subtleLabel")
-        self.seek_slider = QSlider(Qt.Horizontal); self.seek_slider.setRange(0, 0)
+        self.seek_slider = QSlider(Qt.Horizontal)
+        self.seek_slider.setRange(0, 0)
         self.seek_slider.sliderMoved.connect(self.player.seek)
         self.lbl_dur = QLabel("00:00"); self.lbl_dur.setObjectName("subtleLabel")
         seek_row.addWidget(self.lbl_pos)
@@ -952,7 +1003,8 @@ class MainWindow(QMainWindow):
 
         ctrl = QHBoxLayout(); ctrl.setSpacing(12)
         self.lbl_now = QLabel("Nothing is playing")
-        self.lbl_now.setObjectName("subtleLabel"); self.lbl_now.setMinimumWidth(260)
+        self.lbl_now.setObjectName("subtleLabel")
+        self.lbl_now.setMinimumWidth(260)
         ctrl.addWidget(self.lbl_now, stretch=1)
         ctrl.addStretch()
 
@@ -960,19 +1012,23 @@ class MainWindow(QMainWindow):
         prev_btn.clicked.connect(self.player.previous); ctrl.addWidget(prev_btn)
 
         self.pp_btn = QPushButton("\u25B6"); self.pp_btn.setObjectName("playPauseButton")
-        self.pp_btn.clicked.connect(self.player.toggle_play_pause); ctrl.addWidget(self.pp_btn)
+        self.pp_btn.clicked.connect(self.player.toggle_play_pause)
+        ctrl.addWidget(self.pp_btn)
 
         next_btn = QPushButton("\u23ED"); next_btn.setObjectName("transportButton")
         next_btn.clicked.connect(self.player.next); ctrl.addWidget(next_btn)
 
-        self.rep_btn = QPushButton("\U0001F501"); self.rep_btn.setObjectName("transportButton")
-        self.rep_btn.setToolTip("Repeat: Off"); self.rep_btn.clicked.connect(self._cycle_repeat)
+        self.rep_btn = QPushButton("\U0001F501")
+        self.rep_btn.setObjectName("transportButton")
+        self.rep_btn.setToolTip("Repeat: Off")
+        self.rep_btn.clicked.connect(self._cycle_repeat)
         ctrl.addWidget(self.rep_btn)
 
         ctrl.addStretch()
         ctrl.addWidget(QLabel("\U0001F50A"))
-        self.vol_slider = QSlider(Qt.Horizontal); self.vol_slider.setRange(0, 100)
-        self.vol_slider.setValue(80); self.vol_slider.setFixedWidth(110)
+        self.vol_slider = QSlider(Qt.Horizontal)
+        self.vol_slider.setRange(0, 100); self.vol_slider.setValue(80)
+        self.vol_slider.setFixedWidth(110)
         self.vol_slider.valueChanged.connect(self.player.set_volume)
         ctrl.addWidget(self.vol_slider)
         self.player.set_volume(80)
@@ -1006,7 +1062,7 @@ class MainWindow(QMainWindow):
 
     def _cycle_repeat(self):
         order = [RepeatMode.OFF, RepeatMode.ALL, RepeatMode.ONE]
-        new = order[(order.index(self.player.repeat_mode()) + 1) % 3]
+        new   = order[(order.index(self.player.repeat_mode()) + 1) % 3]
         self.player.set_repeat_mode(new)
         labels = {RepeatMode.OFF: "Off", RepeatMode.ALL: "All", RepeatMode.ONE: "One"}
         self.rep_btn.setToolTip(f"Repeat: {labels[new]}")
@@ -1043,7 +1099,7 @@ class MainWindow(QMainWindow):
         self._rescan_timer.start()
 
     # ------------------------------------------------------------------
-    # Scanning
+    # Background scanning
     # ------------------------------------------------------------------
     def _start_scan(self):
         if self.root_path is None: return
@@ -1089,7 +1145,7 @@ class MainWindow(QMainWindow):
     def _on_progress(self, done: int, total: int, eta: Optional[float], name: str):
         if self.loading_dialog:
             self.loading_dialog.update_progress(done, total, eta, name)
-        pct = int(done / total * 100) if total else 100
+        pct   = int(done / total * 100) if total else 100
         eta_t = f" – ETA {_fmt_time(int(eta * 1000))}" if eta else ""
         self._set_status(f"Importing {done}/{total} ({pct}%){eta_t}")
 
@@ -1106,7 +1162,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Scan error: {msg}", 6000)
         self._set_status("Error")
 
-    def _on_finished(self, added: List[str], removed: List[str], moved: int, w: ScanWorker):
+    def _on_finished(self, added: List[str], removed: List[str],
+                     moved: int, w: ScanWorker):
         if self.loading_dialog: self.loading_dialog.close(); self.loading_dialog = None
         self.cache = w.new_cache
         if self.root_path: save_cache(self.root_path, self.cache)
@@ -1127,37 +1184,35 @@ class MainWindow(QMainWindow):
         if self.last_added:
             lines.append(f"Added ({len(self.last_added)}):")
             lines += [f"  + {t}" for t in self.last_added[:50]]
-            if len(self.last_added) > 50: lines.append(f"  … and {len(self.last_added)-50} more")
+            if len(self.last_added) > 50:
+                lines.append(f"  … and {len(self.last_added)-50} more")
         if self.last_removed:
             if lines: lines.append("")
             lines.append(f"Removed ({len(self.last_removed)}):")
             lines += [f"  - {t}" for t in self.last_removed[:50]]
-            if len(self.last_removed) > 50: lines.append(f"  … and {len(self.last_removed)-50} more")
+            if len(self.last_removed) > 50:
+                lines.append(f"  … and {len(self.last_removed)-50} more")
         if not lines: lines.append("No recent additions or removals.")
         QMessageBox.information(self, "Recent library changes", "\n".join(lines))
 
     # ------------------------------------------------------------------
-    # Category filter dropdown rebuild
+    # Category filter dropdown
     # ------------------------------------------------------------------
     def _rebuild_cat_filter(self):
         cats = list_categories(self.root_path) if self.root_path else []
         if cats == self._last_cats: return
         self._last_cats = cats
 
-        # Remember current selection
         prev = self.cat_filter.currentText()
         self.cat_filter.blockSignals(True)
         self.cat_filter.clear()
         self.cat_filter.addItem("All")
         for c in cats: self.cat_filter.addItem(c)
-        if prev in cats:
-            self.cat_filter.setCurrentText(prev)
-        else:
-            self.cat_filter.setCurrentText("All")
+        self.cat_filter.setCurrentText(prev if prev in cats else "All")
         self.cat_filter.blockSignals(False)
         self._filter_cat = self.cat_filter.currentText()
 
-        # Update every row's combo
+        # update every row's combo
         for sid, item in self.row_items.items():
             combo = self.table.cellWidget(item.row(), COL_CATEGORY)
             if combo is None: continue
@@ -1167,7 +1222,7 @@ class MainWindow(QMainWindow):
             combo.blockSignals(False)
 
     # ------------------------------------------------------------------
-    # Filters
+    # Filter handlers
     # ------------------------------------------------------------------
     def _on_search_changed(self, txt: str):
         self._filter_search = txt.strip().lower()
@@ -1182,17 +1237,18 @@ class MainWindow(QMainWindow):
         self._apply_filters()
 
     def _reset_filters(self):
-        self.search_box.blockSignals(True); self.search_box.setText(""); self.search_box.blockSignals(False)
-        self.cat_filter.blockSignals(True);  self.cat_filter.setCurrentText("All");  self.cat_filter.blockSignals(False)
-        self.rat_filter.blockSignals(True);  self.rat_filter.setCurrentIndex(0);     self.rat_filter.blockSignals(False)
+        self.search_box.blockSignals(True);  self.search_box.setText("");          self.search_box.blockSignals(False)
+        self.cat_filter.blockSignals(True);  self.cat_filter.setCurrentText("All"); self.cat_filter.blockSignals(False)
+        self.rat_filter.blockSignals(True);  self.rat_filter.setCurrentIndex(0);    self.rat_filter.blockSignals(False)
         self._filter_search = ""; self._filter_cat = "All"; self._filter_rating = 0
         self._apply_filters()
 
     def _matches(self, song: Song) -> bool:
         if self._filter_cat not in ("All", song.category):
             return False
-        if self._filter_search and self._filter_search not in song.title.lower() \
-                and self._filter_search not in song.artist.lower():
+        if self._filter_search and \
+                self._filter_search not in song.title.lower() and \
+                self._filter_search not in song.artist.lower():
             return False
         if self._filter_rating > 0 and song.rating < self._filter_rating:
             return False
@@ -1208,7 +1264,18 @@ class MainWindow(QMainWindow):
         return [s for s in self.songs_by_id.values() if self._matches(s)]
 
     # ------------------------------------------------------------------
-    # Table rows (incremental – never torn down on filter change)
+    # Play filtered
+    # ------------------------------------------------------------------
+    def _play_filtered(self):
+        songs = self._filtered_songs()
+        if not songs:
+            QMessageBox.information(self, "Nothing to play",
+                                    "No songs match the current filter selection.")
+            return
+        self.player.play_song(songs[0], queue=songs)
+
+    # ------------------------------------------------------------------
+    # Table rows (incremental)
     # ------------------------------------------------------------------
     def _add_or_update(self, song: Song):
         self.songs_by_id[song.id] = song
@@ -1220,7 +1287,9 @@ class MainWindow(QMainWindow):
             if ai: ai.setText(song.artist)
             combo = self.table.cellWidget(row, COL_CATEGORY)
             if combo and combo.currentText() != song.category:
-                combo.blockSignals(True); combo.setCurrentText(song.category); combo.blockSignals(False)
+                combo.blockSignals(True)
+                combo.setCurrentText(song.category)
+                combo.blockSignals(False)
             star = self.table.cellWidget(row, COL_RATING)
             if star: star.set_rating(song.rating)
             self.table.setRowHidden(row, not self._matches(song))
@@ -1230,12 +1299,15 @@ class MainWindow(QMainWindow):
     def _insert_row(self, song: Song):
         row = self.table.rowCount()
         self.table.insertRow(row)
+        self.table.setRowHeight(row, ROW_HEIGHT)
 
-        ti = QTableWidgetItem(song.title); ti.setData(Qt.UserRole, song.id)
-        self.table.setItem(row, COL_TITLE, ti)
+        ti = QTableWidgetItem(song.title)
+        ti.setData(Qt.UserRole, song.id)
+        self.table.setItem(row, COL_TITLE,  ti)
         self.table.setItem(row, COL_ARTIST, QTableWidgetItem(song.artist))
         self.row_items[song.id] = ti
 
+        # ── Category combo ──
         cats = list_categories(self.root_path) if self.root_path else []
         combo = QComboBox(); combo.addItems(cats)
         if song.category in cats: combo.setCurrentText(song.category)
@@ -1244,23 +1316,30 @@ class MainWindow(QMainWindow):
             lambda nc, s=song, c=combo: self._on_cat_combo(s, c, nc))
         self.table.setCellWidget(row, COL_CATEGORY, combo)
 
-        cat_lock = LockButton("Locked: cannot change category. Click to unlock.",
-                              "Unlocked: changing category will move the file.")
+        # ── Category lock ──
+        cat_lock = LockButton(
+            "Locked: cannot change category. Click to unlock.",
+            "Unlocked: changing category will MOVE the file.")
         cat_lock.toggledLock.connect(lambda unlocked, c=combo: c.setEnabled(unlocked))
         self.table.setCellWidget(row, COL_CATEGORY_LOCK, _centered(cat_lock))
 
+        # ── Star rating ──
         star = StarRatingWidget(song.rating)
+        # stars start uneditable; rating lock controls this
         star.set_editable(False)
-        star.ratingChanged.connect(lambda nr, s=song: self._on_rating(s, nr))
+        star.ratingChanged.connect(lambda nr, s=song, sw=star: self._on_rating(s, sw, nr))
         self.table.setCellWidget(row, COL_RATING, star)
 
-        rat_lock = LockButton("Locked: cannot change rating. Click to unlock.",
-                              "Unlocked: you can now set/change the rating.")
+        # ── Rating lock ──
+        rat_lock = LockButton(
+            "Locked: cannot change rating. Click to unlock.",
+            "Unlocked: click the stars to set/change the rating.")
         rat_lock.toggledLock.connect(lambda unlocked, sw=star: sw.set_editable(unlocked))
         self.table.setCellWidget(row, COL_RATING_LOCK, _centered(rat_lock))
 
         combo.setProperty("lock_ref", cat_lock)
         star.setProperty("lock_ref", rat_lock)
+
         self.table.setRowHidden(row, not self._matches(song))
 
     def _on_double_click(self, index):
@@ -1268,10 +1347,6 @@ class MainWindow(QMainWindow):
         if item is None: return
         song = self.songs_by_id.get(item.data(Qt.UserRole))
         if song: self.player.play_song(song, queue=self._filtered_songs())
-
-    def _play_all(self):
-        songs = self._filtered_songs()
-        if songs: self.player.play_song(songs[0], queue=songs)
 
     def _highlight(self, playing: Optional[Song]):
         if self._highlighted_id:
@@ -1324,47 +1399,47 @@ class MainWindow(QMainWindow):
         if lock: lock.set_locked(True)
         combo.setEnabled(False)
         self.table.setRowHidden(self.row_items[song.id].row(), not self._matches(song))
-        self.statusBar().showMessage(f"'{song.title}' moved: {old_cat} → {new_cat}", 4000)
+        self.statusBar().showMessage(
+            f"'{song.title}' moved: {old_cat} → {new_cat}", 4000)
 
     # ------------------------------------------------------------------
-    # Rating change → write into file
+    # Rating change → write into the file
     # ------------------------------------------------------------------
-    def _on_rating(self, song: Song, new_rating: int):
+    def _on_rating(self, song: Song, star_widget: "StarRatingWidget", new_rating: int):
         if not write_rating(song.path, new_rating):
             QMessageBox.warning(self, "Rating not saved",
-                                f"Could not write rating into '{song.filename}'.")
+                                f"Could not write rating into '{song.filename}'.\n"
+                                "The format may not support embedded ratings.")
             return
         song.rating = new_rating
+
+        # Keep cache in sync so next scan doesn't re-read this file
         try:
-            st = song.path.stat()
+            st  = song.path.stat()
             rec = self.cache.get(str(song.path), {})
-            rec.update({"size": st.st_size, "mtime": st.st_mtime, "title": song.title,
-                        "artist": song.artist, "rating": new_rating,
-                        "duration": song.duration, "id": song.id})
+            rec.update({"size": st.st_size, "mtime": st.st_mtime,
+                        "title": song.title, "artist": song.artist,
+                        "rating": new_rating, "duration": song.duration,
+                        "id": song.id})
             self.cache[str(song.path)] = rec
             if self.root_path: save_cache(self.root_path, self.cache)
         except OSError:
             pass
-        sender = self.sender()
-        if isinstance(sender, StarRatingWidget):
-            lock: LockButton = sender.property("lock_ref")
-            if lock: lock.set_locked(True)
-            sender.set_editable(False)
+
+        # Auto re-lock the rating lock
+        lock: LockButton = star_widget.property("lock_ref")
+        if lock: lock.set_locked(True)
+        star_widget.set_editable(False)
+
+        # Re-evaluate visibility (rating filter may now exclude/include this song)
         item = self.row_items.get(song.id)
         if item: self.table.setRowHidden(item.row(), not self._matches(song))
-        self.statusBar().showMessage(f"Rating for '{song.title}' saved: {new_rating}/5", 3000)
+
+        self.statusBar().showMessage(
+            f"Rating for '{song.title}' saved: {new_rating}/5", 3000)
 
 
 # ============================================================================
-# Helpers
-# ============================================================================
-def _centered(widget: QWidget) -> QWidget:
-    w = QWidget(); lay = QHBoxLayout(w)
-    lay.setContentsMargins(0, 0, 0, 0)
-    lay.addStretch(); lay.addWidget(widget); lay.addStretch()
-    return w
-
-
 def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_QSS)
