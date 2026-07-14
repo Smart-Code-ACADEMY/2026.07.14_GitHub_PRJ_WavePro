@@ -1,0 +1,14 @@
+# Temporäre Office-Dateien ignorieren
+~$*
+$*
+*.tmp
+*.temp
+*.swp
+*.lock
+
+# Nur diese eine Excel-Datei ignorieren
+# Tech_1.0_VIP-SWs.xlsx
+
+# Igonre following folders
+# assets
+.idea

@@ -1,0 +1,40 @@
+Legend:
+🆕  -> change for new site/store
+🔄  -> change for new campaign
+🔍  -> needed to be explored
+📌  -> not done, TBD
+💡  -> tip
+🚶#x -> step flow
+
+✅  -> select
+❌  -> remove
+🟡  -> optional
+
+⬇️↩️⤵️
+
+
+├── 🔄🟡📌
+│  ├── 🔄📌
+│  │  ├── 🔄✅🔍📌
+│  │  ├── 🔄✅🔍📌
+│  ├── 🔄📌  
+│  │     ├── 🔄✅🔍📌
+│  │     ├── 🔄❌🔍📌
+│  ├── 🔄📌
+│        ├── 🔄✅🔍📌
+│
+├── 🔄🟡🔍📌
+│   ├── 🔄🔍📌
+│      ├── 🔄🔍📌  ...
+│
+├── 🔄🟡🔍📌
+    ├── 🔄🔍📌
+    │  ├── 🔄🔍📌
+    │
+    ├── 🔄🟡🔍📌
+        ├── 🔄🔍📌
+        ├── 🔄🔍📌
+        ├── 🔄🔍📌
+
+
+
