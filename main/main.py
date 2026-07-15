@@ -459,6 +459,7 @@ class PlayerController(QObject):
     positionChanged      = Signal(int)
     durationChanged      = Signal(int)
     repeatModeChanged    = Signal(object)
+    shuffleChanged       = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -467,7 +468,8 @@ class PlayerController(QObject):
         self._player.setAudioOutput(self._audio)
         self._queue: List[Song] = []
         self._index = -1
-        self._repeat = RepeatMode.OFF
+        self._repeat  = RepeatMode.OFF
+        self._shuffle = False
         self._player.playbackStateChanged.connect(self._on_state)
         self._player.positionChanged.connect(self.positionChanged.emit)
         self._player.durationChanged.connect(self.durationChanged.emit)
@@ -485,6 +487,13 @@ class PlayerController(QObject):
     def repeat_mode(self) -> RepeatMode:
         return self._repeat
 
+    def is_shuffle(self) -> bool:
+        return self._shuffle
+
+    def set_shuffle(self, enabled: bool):
+        self._shuffle = enabled
+        self.shuffleChanged.emit(enabled)
+
     def toggle_play_pause(self):
         if self._index < 0: return
         self._player.pause() if self.is_playing() else self._player.play()
@@ -493,24 +502,42 @@ class PlayerController(QObject):
         if not self._queue: return
         if self._repeat == RepeatMode.ONE:
             self._load(autoplay=True); return
-        if self._index + 1 < len(self._queue):
-            self._index += 1
-        elif self._repeat == RepeatMode.ALL:
-            self._index = 0
+        if self._shuffle:
+            import random
+            candidates = [i for i in range(len(self._queue)) if i != self._index]
+            if candidates:
+                self._index = random.choice(candidates)
+            elif self._repeat == RepeatMode.ALL:
+                self._index = 0
+            else:
+                self._player.stop(); self.songChanged.emit(None); return
         else:
-            self._player.stop(); self.songChanged.emit(None); return
+            if self._index + 1 < len(self._queue):
+                self._index += 1
+            elif self._repeat == RepeatMode.ALL:
+                self._index = 0
+            else:
+                self._player.stop(); self.songChanged.emit(None); return
         self._load(autoplay=True)
 
     def previous(self):
         if not self._queue: return
         if self._player.position() > 3000:
             self._player.setPosition(0); return
-        if self._index - 1 >= 0:
-            self._index -= 1
-        elif self._repeat == RepeatMode.ALL:
-            self._index = len(self._queue) - 1
+        if self._shuffle:
+            import random
+            candidates = [i for i in range(len(self._queue)) if i != self._index]
+            if candidates:
+                self._index = random.choice(candidates)
+            else:
+                self._index = 0
         else:
-            self._index = 0
+            if self._index - 1 >= 0:
+                self._index -= 1
+            elif self._repeat == RepeatMode.ALL:
+                self._index = len(self._queue) - 1
+            else:
+                self._index = 0
         self._load(autoplay=True)
 
     def seek(self, ms: int): self._player.setPosition(ms)
@@ -558,48 +585,45 @@ class PlayerController(QObject):
 # ============================================================================
 class LockButton(QToolButton):
     """
-    Flat, minimal 2D lock icon.
-    Locked   → solid green  with a closed-lock SVG path character
-    Unlocked → solid red    with an open-lock SVG path character
+    Fully solid color indicator — no outline, no border, no structure.
+    Uses a filled shield/circle character rendered entirely in one colour:
+      • Solid GREEN  (#30D158) = locked / safe — no changes possible
+      • Solid RED    (#FF453A) = unlocked / active — change is in progress
 
-    Uses QToolButton (not QPushButton) so the global QPushButton stylesheet
-    never affects it.  The icon is drawn as a Unicode glyph at a size where
-    it clearly reads as a padlock without any visual clutter.
+    The entire icon surface is one flat colour so it reads like a
+    professional traffic-light indicator.
     """
     toggledLock = Signal(bool)   # True = now unlocked
 
-    # Clean, single-weight lock glyphs from Segoe UI Symbol / SF Symbols
-    _ICON_LOCKED   = "\U0001F512"   # 🔒  — will be re-styled via QSS to look flat
-    _ICON_UNLOCKED = "\U0001F513"   # 🔓
+    # ⬤  U+2B24 BLACK LARGE CIRCLE – renders as a perfect solid disc
+    # We use it as a "filled shield" placeholder; the colour does all the work.
+    _GLYPH = "\u2B24"   # ⬤
 
-    # Flat colour-only stylesheet — no background, no border, just a tinted
-    # icon that clearly communicates locked (green) / unlocked (red)
-    _CSS_LOCKED = (
-        "QToolButton{"
-        "  background: transparent;"
+    _CSS = (
+        "QToolButton{{"
+        "  background: {color};"
         "  border: none;"
-        "  color: #30D158;"          # Apple green
-        "  font-size: 14px;"
-        "}"
-        "QToolButton:hover{ color: #4dde70; }"
+        "  border-radius: 9px;"
+        "  color: {color};"   # text same colour so glyph blends into fill
+        "  font-size: 8px;"
+        "}}"
+        "QToolButton:hover{{"
+        "  background: {hover};"
+        "}}"
     )
-    _CSS_UNLOCKED = (
-        "QToolButton{"
-        "  background: transparent;"
-        "  border: none;"
-        "  color: #FF453A;"          # Apple red
-        "  font-size: 14px;"
-        "}"
-        "QToolButton:hover{ color: #ff6961; }"
-    )
+
+    _GREEN       = "#30D158"
+    _GREEN_HOVER = "#4dde70"
+    _RED         = "#FF453A"
+    _RED_HOVER   = "#ff6961"
 
     def __init__(self, tip_locked: str, tip_unlocked: str, parent=None):
         super().__init__(parent)
-        self._locked = True
+        self._locked       = True
         self._tip_locked   = tip_locked
         self._tip_unlocked = tip_unlocked
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(22, 22)
+        self.setFixedSize(18, 18)
         self.clicked.connect(self._toggle)
         self._refresh()
 
@@ -618,14 +642,15 @@ class LockButton(QToolButton):
         self.toggledLock.emit(not self._locked)
 
     def _refresh(self):
+        self.setText(self._GLYPH)
         if self._locked:
-            self.setText(self._ICON_LOCKED)
             self.setToolTip(self._tip_locked)
-            self.setStyleSheet(self._CSS_LOCKED)
+            self.setStyleSheet(
+                self._CSS.format(color=self._GREEN, hover=self._GREEN_HOVER))
         else:
-            self.setText(self._ICON_UNLOCKED)
             self.setToolTip(self._tip_unlocked)
-            self.setStyleSheet(self._CSS_UNLOCKED)
+            self.setStyleSheet(
+                self._CSS.format(color=self._RED, hover=self._RED_HOVER))
 
 
 # ============================================================================
@@ -1183,6 +1208,12 @@ class MainWindow(QMainWindow):
         self.rep_btn.clicked.connect(self._cycle_repeat)
         ctrl.addWidget(self.rep_btn)
 
+        ctrl.addSpacing(4)
+
+        self.shuf_btn = _tbtn("⇄", 28, "Shuffle: Off", fg="#6e6e73", font_size=16)
+        self.shuf_btn.clicked.connect(self._toggle_shuffle)
+        ctrl.addWidget(self.shuf_btn)
+
         ctrl.addSpacing(6)
 
         prev_btn = _tbtn("⏮", 34, "Previous", font_size=18)
@@ -1214,8 +1245,8 @@ class MainWindow(QMainWindow):
 
         ctrl.addSpacing(6)
 
-        # Spacer same width as repeat button so centre group stays centred
-        ctrl.addSpacing(28)
+        # Spacer matching repeat+gap+shuffle on the left so centre stays centred
+        ctrl.addSpacing(60)
 
         ctrl.addStretch(1)
 
@@ -1272,6 +1303,24 @@ class MainWindow(QMainWindow):
         if not self.seek_slider.isSliderDown():
             self.seek_slider.setValue(ms)
         self.lbl_pos.setText(_fmt_time(ms))
+
+    def _toggle_shuffle(self):
+        enabled = not self.player.is_shuffle()
+        self.player.set_shuffle(enabled)
+        if enabled:
+            self.shuf_btn.setToolTip("Shuffle: On")
+            self.shuf_btn.setStyleSheet(
+                "QToolButton{background:rgba(10,132,255,0.15);border:none;border-radius:14px;"
+                "color:#0a84ff;font-size:16px;font-weight:700;}"
+                "QToolButton:hover{background:rgba(10,132,255,0.25);}"
+            )
+        else:
+            self.shuf_btn.setToolTip("Shuffle: Off")
+            self.shuf_btn.setStyleSheet(
+                "QToolButton{background:transparent;border:none;border-radius:14px;"
+                "color:#6e6e73;font-size:16px;}"
+                "QToolButton:hover{background:rgba(255,255,255,0.12);color:#ffffff;}"
+            )
 
     def _cycle_repeat(self):
         order = [RepeatMode.OFF, RepeatMode.ALL, RepeatMode.ONE]
