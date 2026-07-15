@@ -548,10 +548,8 @@ class LockButton(QToolButton):
         self._tip_locked   = tip_locked
         self._tip_unlocked = tip_unlocked
         self.setCursor(Qt.PointingHandCursor)
-        # Icon size stays 18×18; the row height is set to 44 px so there
-        # is comfortable padding above and below the button.
-        self.setFixedSize(24, 24)
-        f = QFont(); f.setPointSize(11); self.setFont(f)
+        self.setFixedSize(20, 20)
+        f = QFont(); f.setPointSize(9); self.setFont(f)
         self.clicked.connect(self._toggle)
         self._refresh()
 
@@ -573,14 +571,14 @@ class LockButton(QToolButton):
             self.setToolTip(self._tip_locked)
             self.setStyleSheet(
                 "QToolButton{background:rgba(48,209,88,.15);border:1px solid #30D158;"
-                "border-radius:6px;color:#30D158;padding:2px;}"
+                "border-radius:5px;color:#30D158;padding:1px;}"
                 "QToolButton:hover{background:rgba(48,209,88,.28);}")
         else:
             self.setText("\U0001F513")
             self.setToolTip(self._tip_unlocked)
             self.setStyleSheet(
                 "QToolButton{background:rgba(255,69,58,.15);border:1px solid #FF453A;"
-                "border-radius:6px;color:#FF453A;padding:2px;}"
+                "border-radius:5px;color:#FF453A;padding:1px;}"
                 "QToolButton:hover{background:rgba(255,69,58,.28);}")
 
 
@@ -646,15 +644,14 @@ class StarRatingWidget(QWidget):
             filled = i < self._rating
             color  = self.COLOR_FILLED if filled else self.COLOR_EMPTY
             btn.setText("\u2605" if filled else "\u2606")
-            # colour must show even when disabled
             btn.setStyleSheet(
                 f"QPushButton{{border:none;background:transparent;"
                 f"color:{color};font-size:16px;}}"
                 f"QPushButton:disabled{{color:{color};}}"
             )
-            # Always enable the button widget; we guard editing in _on_click
-            # so the cursor and visual remain consistent.
-            btn.setEnabled(True)
+            # Enable buttons only when editable so clicks actually reach _on_click.
+            # The colour override in :disabled ensures stars look the same either way.
+            btn.setEnabled(self._editable)
 
 
 # ============================================================================
@@ -788,7 +785,7 @@ def _fmt_time(ms: int) -> str:
 def _centered(widget: QWidget) -> QWidget:
     w = QWidget()
     lay = QHBoxLayout(w)
-    lay.setContentsMargins(4, 0, 4, 0)   # horizontal padding so icon isn't clipped
+    lay.setContentsMargins(6, 0, 6, 0)
     lay.addStretch()
     lay.addWidget(widget)
     lay.addStretch()
@@ -803,10 +800,9 @@ COL_ARTIST        = 1
 COL_CATEGORY      = 2
 COL_CATEGORY_LOCK = 3
 COL_RATING        = 4
-COL_RATING_LOCK   = 5
-COL_COUNT         = 6
+COL_COUNT         = 5
 
-ROW_HEIGHT = 44   # px – comfortable padding around lock icons
+ROW_HEIGHT = 38   # px – fits 20px lock icons with comfortable padding
 
 
 # ============================================================================
@@ -967,7 +963,7 @@ class MainWindow(QMainWindow):
     def _build_table(self) -> QWidget:
         self.table = QTableWidget(0, COL_COUNT)
         self.table.setHorizontalHeaderLabels(
-            ["Title", "Artist", "Category", "", "Rating", ""])
+            ["Title", "Artist", "Category", "", "Rating  ★"])
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
@@ -980,7 +976,6 @@ class MainWindow(QMainWindow):
         h.setSectionResizeMode(COL_CATEGORY,      QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_CATEGORY_LOCK, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_RATING,        QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(COL_RATING_LOCK,   QHeaderView.ResizeToContents)
         self.table.doubleClicked.connect(self._on_double_click)
         return self.table
 
@@ -1290,8 +1285,10 @@ class MainWindow(QMainWindow):
                 combo.blockSignals(True)
                 combo.setCurrentText(song.category)
                 combo.blockSignals(False)
-            star = self.table.cellWidget(row, COL_RATING)
-            if star: star.set_rating(song.rating)
+            star_wrapper = self.table.cellWidget(row, COL_RATING)
+            if star_wrapper:
+                star = star_wrapper.findChild(StarRatingWidget)
+                if star: star.set_rating(song.rating)
             self.table.setRowHidden(row, not self._matches(song))
         else:
             self._insert_row(song)
@@ -1323,22 +1320,21 @@ class MainWindow(QMainWindow):
         cat_lock.toggledLock.connect(lambda unlocked, c=combo: c.setEnabled(unlocked))
         self.table.setCellWidget(row, COL_CATEGORY_LOCK, _centered(cat_lock))
 
-        # ── Star rating ──
+        # ── Star rating (always directly clickable – no lock) ──
+        # Stars are always editable. Clicking a star immediately writes
+        # the rating into the audio file and shows a confirmation toast.
+        star_wrapper = QWidget()
+        star_lay = QHBoxLayout(star_wrapper)
+        star_lay.setContentsMargins(4, 0, 16, 0)   # 16 px right padding before scrollbar
+        star_lay.setSpacing(0)
         star = StarRatingWidget(song.rating)
-        # stars start uneditable; rating lock controls this
-        star.set_editable(False)
+        star.set_editable(True)   # always editable, no lock needed
         star.ratingChanged.connect(lambda nr, s=song, sw=star: self._on_rating(s, sw, nr))
-        self.table.setCellWidget(row, COL_RATING, star)
-
-        # ── Rating lock ──
-        rat_lock = LockButton(
-            "Locked: cannot change rating. Click to unlock.",
-            "Unlocked: click the stars to set/change the rating.")
-        rat_lock.toggledLock.connect(lambda unlocked, sw=star: sw.set_editable(unlocked))
-        self.table.setCellWidget(row, COL_RATING_LOCK, _centered(rat_lock))
+        star_lay.addWidget(star)
+        star_lay.addStretch()
+        self.table.setCellWidget(row, COL_RATING, star_wrapper)
 
         combo.setProperty("lock_ref", cat_lock)
-        star.setProperty("lock_ref", rat_lock)
 
         self.table.setRowHidden(row, not self._matches(song))
 
@@ -1403,7 +1399,7 @@ class MainWindow(QMainWindow):
             f"'{song.title}' moved: {old_cat} → {new_cat}", 4000)
 
     # ------------------------------------------------------------------
-    # Rating change → write into the file
+    # Rating change → write directly into the audio file
     # ------------------------------------------------------------------
     def _on_rating(self, song: Song, star_widget: "StarRatingWidget", new_rating: int):
         if not write_rating(song.path, new_rating):
@@ -1426,17 +1422,18 @@ class MainWindow(QMainWindow):
         except OSError:
             pass
 
-        # Auto re-lock the rating lock
-        lock: LockButton = star_widget.property("lock_ref")
-        if lock: lock.set_locked(True)
-        star_widget.set_editable(False)
-
-        # Re-evaluate visibility (rating filter may now exclude/include this song)
+        # Re-evaluate row visibility (rating filter may now hide/show this song)
         item = self.row_items.get(song.id)
-        if item: self.table.setRowHidden(item.row(), not self._matches(song))
+        if item:
+            self.table.setRowHidden(item.row(), not self._matches(song))
 
-        self.statusBar().showMessage(
-            f"Rating for '{song.title}' saved: {new_rating}/5", 3000)
+        # Popup confirmation: rating saved directly into the file
+        stars = "★" * new_rating + "☆" * (5 - new_rating)
+        if new_rating == 0:
+            msg = f"Rating removed for:\n{song.title}"
+        else:
+            msg = f"Rating saved directly into file:\n{song.title}\n\n{stars}  ({new_rating}/5)"
+        QMessageBox.information(self, "Rating saved", msg)
 
 
 # ============================================================================
