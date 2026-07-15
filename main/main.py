@@ -558,13 +558,40 @@ class PlayerController(QObject):
 # ============================================================================
 class LockButton(QToolButton):
     """
-    Compact lock indicator button.
-    Locked   → small green dot with closed-lock glyph  (safe, default)
-    Unlocked → small red dot with open-lock glyph      (editing enabled)
-    Uses text glyphs (⊙ / ⊘) with a coloured dot accent for a clean,
-    professional look that scales well at small sizes.
+    Flat, minimal 2D lock icon.
+    Locked   → solid green  with a closed-lock SVG path character
+    Unlocked → solid red    with an open-lock SVG path character
+
+    Uses QToolButton (not QPushButton) so the global QPushButton stylesheet
+    never affects it.  The icon is drawn as a Unicode glyph at a size where
+    it clearly reads as a padlock without any visual clutter.
     """
     toggledLock = Signal(bool)   # True = now unlocked
+
+    # Clean, single-weight lock glyphs from Segoe UI Symbol / SF Symbols
+    _ICON_LOCKED   = "\U0001F512"   # 🔒  — will be re-styled via QSS to look flat
+    _ICON_UNLOCKED = "\U0001F513"   # 🔓
+
+    # Flat colour-only stylesheet — no background, no border, just a tinted
+    # icon that clearly communicates locked (green) / unlocked (red)
+    _CSS_LOCKED = (
+        "QToolButton{"
+        "  background: transparent;"
+        "  border: none;"
+        "  color: #30D158;"          # Apple green
+        "  font-size: 14px;"
+        "}"
+        "QToolButton:hover{ color: #4dde70; }"
+    )
+    _CSS_UNLOCKED = (
+        "QToolButton{"
+        "  background: transparent;"
+        "  border: none;"
+        "  color: #FF453A;"          # Apple red
+        "  font-size: 14px;"
+        "}"
+        "QToolButton:hover{ color: #ff6961; }"
+    )
 
     def __init__(self, tip_locked: str, tip_unlocked: str, parent=None):
         super().__init__(parent)
@@ -572,8 +599,7 @@ class LockButton(QToolButton):
         self._tip_locked   = tip_locked
         self._tip_unlocked = tip_unlocked
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(20, 20)
-        f = QFont(); f.setPointSize(9); self.setFont(f)
+        self.setFixedSize(22, 22)
         self.clicked.connect(self._toggle)
         self._refresh()
 
@@ -581,8 +607,10 @@ class LockButton(QToolButton):
         return self._locked
 
     def set_locked(self, v: bool, emit=False):
-        self._locked = v; self._refresh()
-        if emit: self.toggledLock.emit(not v)
+        self._locked = v
+        self._refresh()
+        if emit:
+            self.toggledLock.emit(not v)
 
     def _toggle(self):
         self._locked = not self._locked
@@ -591,39 +619,13 @@ class LockButton(QToolButton):
 
     def _refresh(self):
         if self._locked:
-            # Closed lock — use a clean "lock" look: solid filled circle, green
-            self.setText("●")
+            self.setText(self._ICON_LOCKED)
             self.setToolTip(self._tip_locked)
-            self.setStyleSheet(
-                "QToolButton{"
-                "  background: rgba(48,209,88,0.18);"
-                "  border: 1.5px solid rgba(48,209,88,0.55);"
-                "  border-radius: 10px;"
-                "  color: #30D158;"
-                "  font-size: 7px;"
-                "}"
-                "QToolButton:hover{"
-                "  background: rgba(48,209,88,0.30);"
-                "  border-color: #30D158;"
-                "}"
-            )
+            self.setStyleSheet(self._CSS_LOCKED)
         else:
-            # Open / unlocked — orange-red dot
-            self.setText("●")
+            self.setText(self._ICON_UNLOCKED)
             self.setToolTip(self._tip_unlocked)
-            self.setStyleSheet(
-                "QToolButton{"
-                "  background: rgba(255,69,58,0.18);"
-                "  border: 1.5px solid rgba(255,69,58,0.55);"
-                "  border-radius: 10px;"
-                "  color: #FF453A;"
-                "  font-size: 7px;"
-                "}"
-                "QToolButton:hover{"
-                "  background: rgba(255,69,58,0.30);"
-                "  border-color: #FF453A;"
-                "}"
-            )
+            self.setStyleSheet(self._CSS_UNLOCKED)
 
 
 # ============================================================================
@@ -1159,49 +1161,66 @@ class MainWindow(QMainWindow):
 
         ctrl.addStretch(1)
 
-        # ── Transport buttons (centre) ──
-        def _tbtn(icon_text: str, size: int = 32, tooltip: str = "") -> QPushButton:
-            btn = QPushButton(icon_text)
-            btn.setObjectName("transportBtn")
+        # ── Transport buttons – use QToolButton so the global QPushButton
+        #    stylesheet never interferes ──────────────────────────────
+        def _tbtn(icon_text: str, size: int = 32, tooltip: str = "",
+                  fg: str = "#e5e5ea", font_size: int = 17) -> QToolButton:
+            btn = QToolButton()
+            btn.setText(icon_text)
             btn.setFixedSize(size, size)
             btn.setToolTip(tooltip)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(
+                f"QToolButton{{background:transparent;border:none;"
+                f"border-radius:{size//2}px;color:{fg};"
+                f"font-size:{font_size}px;}}"
+                f"QToolButton:hover{{background:rgba(255,255,255,0.12);color:#ffffff;}}"
+                f"QToolButton:pressed{{background:rgba(255,255,255,0.06);}}"
+            )
             return btn
 
-        self.rep_btn = _tbtn("↻", 28, "Repeat: Off")
-        self.rep_btn.setObjectName("transportBtnDim")
+        self.rep_btn = _tbtn("↻", 28, "Repeat: Off", fg="#6e6e73", font_size=16)
         self.rep_btn.clicked.connect(self._cycle_repeat)
         ctrl.addWidget(self.rep_btn)
 
-        ctrl.addSpacing(8)
+        ctrl.addSpacing(6)
 
-        prev_btn = _tbtn("⏮", 32, "Previous")
+        prev_btn = _tbtn("⏮", 34, "Previous", font_size=18)
         prev_btn.clicked.connect(self.player.previous)
         ctrl.addWidget(prev_btn)
 
         ctrl.addSpacing(4)
 
-        self.pp_btn = QPushButton("▶")
-        self.pp_btn.setObjectName("playBtn")
-        self.pp_btn.setFixedSize(44, 44)
+        # Play/Pause — white filled circle
+        self.pp_btn = QToolButton()
+        self.pp_btn.setText("▶")
+        self.pp_btn.setFixedSize(46, 46)
         self.pp_btn.setToolTip("Play / Pause")
+        self.pp_btn.setCursor(Qt.PointingHandCursor)
+        self.pp_btn.setStyleSheet(
+            "QToolButton{background:#ffffff;border:none;border-radius:23px;"
+            "color:#1c1c1e;font-size:17px;font-weight:700;}"
+            "QToolButton:hover{background:#e5e5ea;}"
+            "QToolButton:pressed{background:#c7c7cc;}"
+        )
         self.pp_btn.clicked.connect(self.player.toggle_play_pause)
         ctrl.addWidget(self.pp_btn)
 
         ctrl.addSpacing(4)
 
-        next_btn = _tbtn("⏭", 32, "Next")
+        next_btn = _tbtn("⏭", 34, "Next", font_size=18)
         next_btn.clicked.connect(self.player.next)
         ctrl.addWidget(next_btn)
 
-        ctrl.addSpacing(8)
+        ctrl.addSpacing(6)
 
-        # Placeholder same width as repeat so centre group is truly centred
+        # Spacer same width as repeat button so centre group stays centred
         ctrl.addSpacing(28)
 
         ctrl.addStretch(1)
 
         # ── Volume (right side) ──
-        self.vol_icon = QLabel("▐")
+        self.vol_icon = QLabel("🔊")
         self.vol_icon.setObjectName("volIcon")
         ctrl.addWidget(self.vol_icon)
 
@@ -1263,14 +1282,16 @@ class MainWindow(QMainWindow):
         self.rep_btn.setToolTip(tips[new])
         self.rep_btn.setText(icons[new])
         if new == RepeatMode.OFF:
-            self.rep_btn.setObjectName("transportBtnDim")
-            self.rep_btn.setStyleSheet("")
-        else:
-            self.rep_btn.setObjectName("transportBtnActive")
             self.rep_btn.setStyleSheet(
-                "QPushButton#transportBtnActive{"
-                "color:#0a84ff;background:rgba(10,132,255,0.12);"
-                "border:none;border-radius:14px;font-size:16px;font-weight:600;}"
+                "QToolButton{background:transparent;border:none;border-radius:14px;"
+                "color:#6e6e73;font-size:16px;}"
+                "QToolButton:hover{background:rgba(255,255,255,0.12);color:#ffffff;}"
+            )
+        else:
+            self.rep_btn.setStyleSheet(
+                "QToolButton{background:rgba(10,132,255,0.15);border:none;border-radius:14px;"
+                "color:#0a84ff;font-size:16px;font-weight:700;}"
+                "QToolButton:hover{background:rgba(10,132,255,0.25);}"
             )
 
     # ------------------------------------------------------------------
