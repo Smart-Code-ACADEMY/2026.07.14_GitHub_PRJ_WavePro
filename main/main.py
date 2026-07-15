@@ -363,55 +363,72 @@ class ScanWorker(QThread):
 
         truly_missing = [p for lst in missing_by_size.values() for p in lst]
         new_cache: Dict[str, dict] = {}
-        batch: List[Song] = []
 
-        for p in unchanged:
-            cat, size, mtime = current[p]
-            rec = old[p]
-            song = Song(path=Path(p), category=cat,
-                        title=rec.get("title", Path(p).stem),
-                        artist=rec.get("artist", ""),
-                        rating=rec.get("rating", 0),
-                        duration=rec.get("duration", 0.0),
-                        id=rec.get("id") or uuid.uuid4().hex)
-            new_cache[p] = {**rec, "size": size, "mtime": mtime, "id": song.id}
-            batch.append(song)
+        # Build the full ordered work list:
+        #   Phase 1 – cached/moved  (fast, no disk tag read)
+        #   Phase 2 – new/changed   (slow, must read tags from disk)
+        # We stream ALL of them one-by-one so the UI always shows live progress.
 
-        for old_p, new_p in moved_pairs:
-            cat, size, mtime = current[new_p]
-            rec = old.get(old_p, {})
-            song = Song(path=Path(new_p), category=cat,
-                        title=rec.get("title", Path(new_p).stem),
-                        artist=rec.get("artist", ""),
-                        rating=rec.get("rating", 0),
-                        duration=rec.get("duration", 0.0),
-                        id=rec.get("id") or uuid.uuid4().hex)
-            new_cache[new_p] = {**rec, "size": size, "mtime": mtime, "id": song.id}
-            batch.append(song)
+        fast_items: List[Tuple[str, bool]] = (
+            [(p, False) for p in unchanged] +
+            [(new_p, False) for _, new_p in moved_pairs]
+        )
+        slow_items: List[str] = truly_added + changed
 
-        if batch:
-            self.batchReady.emit(batch)
+        total = len(fast_items) + len(slow_items)
+        self.totalDetermined.emit(total)
 
-        slow = truly_added + changed
-        self.totalDetermined.emit(len(slow))
         start = time.monotonic()
-        for i, p in enumerate(slow, 1):
+        done  = 0
+
+        # ── Phase 1: cached songs (no tag reading, very fast) ──────────
+        for p, _ in fast_items:
+            cat, size, mtime = current[p]
+            # Was this a moved file? find original key if needed
+            rec = old.get(p)
+            if rec is None:
+                # moved: find original record
+                for old_p, new_p in moved_pairs:
+                    if new_p == p:
+                        rec = old.get(old_p, {})
+                        break
+            if rec is None:
+                rec = {}
+            song = Song(
+                path=Path(p), category=cat,
+                title=rec.get("title", Path(p).stem),
+                artist=rec.get("artist", ""),
+                rating=rec.get("rating", 0),
+                duration=rec.get("duration", 0.0),
+                id=rec.get("id") or uuid.uuid4().hex,
+            )
+            new_cache[p] = {**rec, "size": size, "mtime": mtime, "id": song.id}
+            done += 1
+            elapsed = time.monotonic() - start
+            rate    = done / elapsed if elapsed > 0.001 else 0
+            eta     = (total - done) / rate if rate > 0 else None
+            self.progressUpdate.emit(done, total, eta, song.title)
+            self.songReady.emit(song)
+
+        # ── Phase 2: new/changed songs (reads tags from disk) ──────────
+        for p in slow_items:
             cat, size, mtime = current[p]
             po = Path(p)
             title, artist = read_display_tags(po)
-            rating   = read_rating(po)
-            duration = read_duration_seconds(po)
-            old_id   = old.get(p, {}).get("id")
+            rating        = read_rating(po)
+            duration      = read_duration_seconds(po)
+            old_id        = old.get(p, {}).get("id")
             song = Song(path=po, category=cat, title=title, artist=artist,
                         rating=rating, duration=duration,
                         id=old_id or uuid.uuid4().hex)
             new_cache[p] = {"size": size, "mtime": mtime, "title": title,
                             "artist": artist, "rating": rating,
                             "duration": duration, "id": song.id}
+            done += 1
             elapsed = time.monotonic() - start
-            rate    = i / elapsed if elapsed > 0 else 0
-            eta     = (len(slow) - i) / rate if rate > 0 else None
-            self.progressUpdate.emit(i, len(slow), eta, po.name)
+            rate    = done / elapsed if elapsed > 0.001 else 0
+            eta     = (total - done) / rate if rate > 0 else None
+            self.progressUpdate.emit(done, total, eta, po.name)
             self.songReady.emit(song)
 
         removed_ids = [old[p]["id"] for p in truly_missing if "id" in old.get(p, {})]
@@ -423,6 +440,7 @@ class ScanWorker(QThread):
             [new_cache.get(p, {}).get("title", Path(p).stem) for p in truly_added],
             [old[p].get("title", Path(p).stem) for p in truly_missing],
             len(moved_pairs),
+
         )
 
 
@@ -548,8 +566,8 @@ class LockButton(QToolButton):
         self._tip_locked   = tip_locked
         self._tip_unlocked = tip_unlocked
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(20, 20)
-        f = QFont(); f.setPointSize(9); self.setFont(f)
+        self.setFixedSize(16, 16)
+        f = QFont(); f.setPointSize(8); self.setFont(f)
         self.clicked.connect(self._toggle)
         self._refresh()
 
@@ -571,14 +589,14 @@ class LockButton(QToolButton):
             self.setToolTip(self._tip_locked)
             self.setStyleSheet(
                 "QToolButton{background:rgba(48,209,88,.15);border:1px solid #30D158;"
-                "border-radius:5px;color:#30D158;padding:1px;}"
+                "border-radius:4px;color:#30D158;padding:0px;}"
                 "QToolButton:hover{background:rgba(48,209,88,.28);}")
         else:
             self.setText("\U0001F513")
             self.setToolTip(self._tip_unlocked)
             self.setStyleSheet(
                 "QToolButton{background:rgba(255,69,58,.15);border:1px solid #FF453A;"
-                "border-radius:5px;color:#FF453A;padding:1px;}"
+                "border-radius:4px;color:#FF453A;padding:0px;}"
                 "QToolButton:hover{background:rgba(255,69,58,.28);}")
 
 
@@ -589,7 +607,7 @@ class StarRatingWidget(QWidget):
     """
     5 stars always visible:
     - No rating  → 5 clearly visible GRAY outline stars  ☆☆☆☆☆
-    - With rating → filled YELLOW stars + gray empties   ★★★☆☆
+    - With rating → filled GREEN stars + gray empties     ★★★☆☆
     Always directly clickable (no lock needed).
     Clicking the same active star resets to 0.
     """
@@ -674,51 +692,34 @@ class StarRatingWidget(QWidget):
 class LoadingDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Importing Music Library")
-        self.setModal(True)          # modal so it's always on top and visible
-        self.setFixedSize(500, 200)
+        self.setWindowTitle("Loading Library")
+        self.setModal(True)
+        self.setFixedSize(420, 120)
         self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(28, 24, 28, 24)
-        lay.setSpacing(14)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(10)
 
-        hdr = QLabel("📂  Importing songs into library…")
-        hdr.setObjectName("sectionTitle")
-        lay.addWidget(hdr)
+        self.title_lbl = QLabel("Loading music library…")
+        self.title_lbl.setObjectName("subtleLabel")
+        lay.addWidget(self.title_lbl)
 
         self.bar = QProgressBar()
         self.bar.setRange(0, 100)
-        self.bar.setTextVisible(True)
-        self.bar.setFixedHeight(22)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(6)
         lay.addWidget(self.bar)
 
         self.count_lbl = QLabel("")
         self.count_lbl.setObjectName("subtleLabel")
-        f = QFont(); f.setPointSize(12); self.count_lbl.setFont(f)
         lay.addWidget(self.count_lbl)
-
-        self.file_lbl = QLabel("")
-        self.file_lbl.setObjectName("subtleLabel")
-        self.file_lbl.setWordWrap(True)
-        lay.addWidget(self.file_lbl)
-
-        self.eta_lbl = QLabel("")
-        self.eta_lbl.setObjectName("subtleLabel")
-        lay.addWidget(self.eta_lbl)
 
     def update_progress(self, done: int, total: int,
                         eta_s: Optional[float], name: str):
         pct = int(done / total * 100) if total else 0
         self.bar.setValue(pct)
-        self.count_lbl.setText(f"{done}  of  {total}  songs  —  {pct} %")
-        self.file_lbl.setText(f"Reading: {name}" if name else "")
-        if eta_s is not None:
-            self.eta_lbl.setText(f"⏱  Estimated time remaining: {_fmt_time(int(eta_s * 1000))}")
-        elif done == 0:
-            self.eta_lbl.setText("⏱  Calculating…")
-        else:
-            self.eta_lbl.setText("")
+        self.count_lbl.setText(f"{done} of {total} songs  —  {pct}%")
 
 
 # ============================================================================
@@ -815,7 +816,7 @@ QPushButton#starBtn {
     min-height: 26px;
 }
 QPushButton#starBtn:hover  { background: rgba(255,255,255,0.08); border-radius:4px; }
-QPushButton#starBtn:disabled { background: transparent; }
+QPushButton#starBtn:disabled { background: transparent; color: #8e8e93; }
 
 QFrame#playerBar { background:#232325; border-top:1px solid #2c2c2e; }
 
@@ -1172,34 +1173,35 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(50, self._start_scan)
 
     def _on_batch(self, songs: List[Song]):
+        # batchReady is no longer emitted; kept for safety
         for s in songs: self._add_or_update(s)
         self._rebuild_cat_filter(); self._apply_filters()
-        self._set_status(f"{len(self.songs_by_id)} songs  (loading…)")
 
     def _on_song_ready(self, song: Song):
-        self._add_or_update(song); self._apply_filters()
+        self._add_or_update(song)
+        self._apply_filters()
 
     def _on_total(self, total: int):
-        if total > 0:
-            if not self.loading_dialog:
-                self.loading_dialog = LoadingDialog(self)
-            self.loading_dialog.update_progress(0, total, None, "")
-            self.loading_dialog.show()
-            self.loading_dialog.raise_()
-            self.loading_dialog.activateWindow()
-            self._set_status(f"Importing 0 / {total} songs…")
-        else:
-            # All from cache – nothing slow to read
-            if self.loading_dialog:
-                self.loading_dialog.close()
-                self.loading_dialog = None
+        # Always open the loading dialog so the user always gets feedback,
+        # whether songs come from cache (fast) or disk (slow).
+        if not self.loading_dialog:
+            self.loading_dialog = LoadingDialog(self)
+        self.loading_dialog.update_progress(0, total, None, "")
+        self.loading_dialog.show()
+        self.loading_dialog.raise_()
+        self.loading_dialog.activateWindow()
+        self._set_status(f"Loading 0 / {total} songs…")
 
     def _on_progress(self, done: int, total: int, eta: Optional[float], name: str):
         if self.loading_dialog:
             self.loading_dialog.update_progress(done, total, eta, name)
         pct   = int(done / total * 100) if total else 100
         eta_t = f" – ETA {_fmt_time(int(eta * 1000))}" if eta else ""
-        self._set_status(f"Importing {done} / {total} songs  ({pct}%){eta_t}")
+        self._set_status(f"Loading {done} / {total} songs  ({pct}%){eta_t}")
+        # Rebuild category filter every 50 songs so the filter dropdown
+        # stays up to date while songs stream in
+        if done % 50 == 0:
+            self._rebuild_cat_filter()
 
     def _on_removed(self, ids: List[str]):
         for sid in ids:
