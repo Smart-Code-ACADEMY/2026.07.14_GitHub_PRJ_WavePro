@@ -587,36 +587,37 @@ class LockButton(QToolButton):
 # ============================================================================
 class StarRatingWidget(QWidget):
     """
-    5 stars: gray outline when unrated, yellow when rated.
-    Min = 0 (all gray), Max = 5 (all yellow).
-    Clicking the active star again resets to 0.
-    Editable only after the corresponding lock is opened.
+    5 stars always visible:
+    - No rating  → 5 clearly visible GRAY outline stars  ☆☆☆☆☆
+    - With rating → filled YELLOW stars + gray empties   ★★★☆☆
+    Always directly clickable (no lock needed).
+    Clicking the same active star resets to 0.
     """
     ratingChanged = Signal(int)
-    COLOR_FILLED = "#FFD60A"
-    COLOR_EMPTY  = "#6e6e73"
+    COLOR_FILLED = "#FFD60A"   # yellow
+    COLOR_EMPTY  = "#8e8e93"   # medium gray – clearly visible on dark background
 
     def __init__(self, rating: int = 0, parent=None):
         super().__init__(parent)
         self._rating   = _clamp(rating)
         self._editable = False
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(4, 0, 4, 0)
-        lay.setSpacing(1)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(2)
         self._btns: List[QPushButton] = []
         for i in range(5):
             btn = QPushButton()
             btn.setFlat(True)
-            btn.setFixedSize(22, 22)
+            btn.setFixedSize(26, 26)
             btn.setCursor(Qt.PointingHandCursor)
-            # critical: use default-arg capture to avoid closure-over-loop-var bug
+            # Use objectName so our specific style beats the global QPushButton rule
+            btn.setObjectName("starBtn")
             btn.clicked.connect(lambda _checked=False, idx=i: self._on_click(idx))
             lay.addWidget(btn)
             self._btns.append(btn)
         lay.addStretch()
         self._refresh()
 
-    # public API -------------------------------------------------------
     def rating(self) -> int:
         return self._rating
 
@@ -628,13 +629,12 @@ class StarRatingWidget(QWidget):
         self._editable = v
         self._refresh()
 
-    # internal ---------------------------------------------------------
     def _on_click(self, idx: int):
         if not self._editable:
             return
         new = idx + 1
         if new == self._rating:
-            new = 0          # click active star again → reset to 0
+            new = 0   # click same active star → reset to 0
         self._rating = new
         self._refresh()
         self.ratingChanged.emit(self._rating)
@@ -643,44 +643,82 @@ class StarRatingWidget(QWidget):
         for i, btn in enumerate(self._btns):
             filled = i < self._rating
             color  = self.COLOR_FILLED if filled else self.COLOR_EMPTY
-            btn.setText("\u2605" if filled else "\u2606")
+            char   = "\u2605" if filled else "\u2606"   # ★ / ☆
+            btn.setText(char)
+            # Use !important-equivalent: very specific inline style
+            # The objectName selector #starBtn beats the global QPushButton rule
             btn.setStyleSheet(
-                f"QPushButton{{border:none;background:transparent;"
-                f"color:{color};font-size:16px;}}"
-                f"QPushButton:disabled{{color:{color};}}"
+                f"QPushButton#starBtn {{"
+                f"  border: none;"
+                f"  background: transparent;"
+                f"  color: {color};"
+                f"  font-size: 18px;"
+                f"  font-weight: normal;"
+                f"  padding: 0px;"
+                f"}}"
+                f"QPushButton#starBtn:hover {{"
+                f"  background: rgba(255,255,255,0.08);"
+                f"  border-radius: 4px;"
+                f"}}"
+                f"QPushButton#starBtn:disabled {{"
+                f"  color: {color};"
+                f"  background: transparent;"
+                f"}}"
             )
-            # Enable buttons only when editable so clicks actually reach _on_click.
-            # The colour override in :disabled ensures stars look the same either way.
             btn.setEnabled(self._editable)
 
 
 # ============================================================================
-# Loading dialog
+# Loading dialog – shown whenever new/changed files are being read
 # ============================================================================
 class LoadingDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Importing Music")
-        self.setModal(False); self.setFixedSize(460, 160)
+        self.setWindowTitle("Importing Music Library")
+        self.setModal(True)          # modal so it's always on top and visible
+        self.setFixedSize(500, 200)
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint)
+
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 20, 20, 20); lay.setSpacing(10)
-        lbl = QLabel("Importing songs…"); lbl.setObjectName("sectionTitle")
-        lay.addWidget(lbl)
-        self.bar = QProgressBar(); self.bar.setRange(0, 100)
+        lay.setContentsMargins(28, 24, 28, 24)
+        lay.setSpacing(14)
+
+        hdr = QLabel("📂  Importing songs into library…")
+        hdr.setObjectName("sectionTitle")
+        lay.addWidget(hdr)
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        self.bar.setTextVisible(True)
+        self.bar.setFixedHeight(22)
         lay.addWidget(self.bar)
-        self.detail = QLabel(""); self.detail.setObjectName("subtleLabel")
-        self.detail.setWordWrap(True); lay.addWidget(self.detail)
-        self.eta_lbl = QLabel(""); self.eta_lbl.setObjectName("subtleLabel")
-        lay.addWidget(self.eta_lbl); lay.addStretch()
+
+        self.count_lbl = QLabel("")
+        self.count_lbl.setObjectName("subtleLabel")
+        f = QFont(); f.setPointSize(12); self.count_lbl.setFont(f)
+        lay.addWidget(self.count_lbl)
+
+        self.file_lbl = QLabel("")
+        self.file_lbl.setObjectName("subtleLabel")
+        self.file_lbl.setWordWrap(True)
+        lay.addWidget(self.file_lbl)
+
+        self.eta_lbl = QLabel("")
+        self.eta_lbl.setObjectName("subtleLabel")
+        lay.addWidget(self.eta_lbl)
 
     def update_progress(self, done: int, total: int,
                         eta_s: Optional[float], name: str):
-        pct = int(done / total * 100) if total else 100
+        pct = int(done / total * 100) if total else 0
         self.bar.setValue(pct)
-        self.detail.setText(f"{done} / {total} songs  ({pct}%)\n{name}")
-        self.eta_lbl.setText(
-            f"Estimated time remaining: {_fmt_time(int(eta_s * 1000))}"
-            if eta_s is not None else "Estimating time remaining…")
+        self.count_lbl.setText(f"{done}  of  {total}  songs  —  {pct} %")
+        self.file_lbl.setText(f"Reading: {name}" if name else "")
+        if eta_s is not None:
+            self.eta_lbl.setText(f"⏱  Estimated time remaining: {_fmt_time(int(eta_s * 1000))}")
+        elif done == 0:
+            self.eta_lbl.setText("⏱  Calculating…")
+        else:
+            self.eta_lbl.setText("")
 
 
 # ============================================================================
@@ -764,6 +802,20 @@ QLineEdit:focus { border-color:#0a84ff; }
 QProgressBar { background:#2c2c2e; border:1px solid #3a3a3c; border-radius:8px;
                text-align:center; color:#f2f2f7; height:18px; }
 QProgressBar::chunk { background:#0a84ff; border-radius:8px; }
+
+/* Star rating buttons – must override the global QPushButton rule */
+QPushButton#starBtn {
+    border: none;
+    background: transparent;
+    color: #8e8e93;
+    font-size: 18px;
+    font-weight: normal;
+    padding: 0px;
+    min-width: 26px;
+    min-height: 26px;
+}
+QPushButton#starBtn:hover  { background: rgba(255,255,255,0.08); border-radius:4px; }
+QPushButton#starBtn:disabled { background: transparent; }
 
 QFrame#playerBar { background:#232325; border-top:1px solid #2c2c2e; }
 
@@ -927,8 +979,9 @@ class MainWindow(QMainWindow):
         rat_lbl = QLabel("Min. Rating:"); rat_lbl.setObjectName("subtleLabel")
         lay.addWidget(rat_lbl)
         self.rat_filter = QComboBox()
-        self.rat_filter.setFixedWidth(150)
+        self.rat_filter.setFixedWidth(168)
         self.rat_filter.addItem("All ratings", 0)
+        self.rat_filter.addItem("☆☆☆☆☆  No rating", -1)
         # 1★ = at least 1 star … 5★ = exactly 5 stars (max)
         star_labels = {
             1: "★☆☆☆☆  (1 star)",
@@ -1121,7 +1174,7 @@ class MainWindow(QMainWindow):
     def _on_batch(self, songs: List[Song]):
         for s in songs: self._add_or_update(s)
         self._rebuild_cat_filter(); self._apply_filters()
-        self._set_status(f"{len(self.songs_by_id)} songs")
+        self._set_status(f"{len(self.songs_by_id)} songs  (loading…)")
 
     def _on_song_ready(self, song: Song):
         self._add_or_update(song); self._apply_filters()
@@ -1131,18 +1184,22 @@ class MainWindow(QMainWindow):
             if not self.loading_dialog:
                 self.loading_dialog = LoadingDialog(self)
             self.loading_dialog.update_progress(0, total, None, "")
-            self.loading_dialog.show(); self.loading_dialog.raise_()
-            self._set_status(f"Importing 0 / {total}…")
+            self.loading_dialog.show()
+            self.loading_dialog.raise_()
+            self.loading_dialog.activateWindow()
+            self._set_status(f"Importing 0 / {total} songs…")
         else:
+            # All from cache – nothing slow to read
             if self.loading_dialog:
-                self.loading_dialog.close(); self.loading_dialog = None
+                self.loading_dialog.close()
+                self.loading_dialog = None
 
     def _on_progress(self, done: int, total: int, eta: Optional[float], name: str):
         if self.loading_dialog:
             self.loading_dialog.update_progress(done, total, eta, name)
         pct   = int(done / total * 100) if total else 100
         eta_t = f" – ETA {_fmt_time(int(eta * 1000))}" if eta else ""
-        self._set_status(f"Importing {done}/{total} ({pct}%){eta_t}")
+        self._set_status(f"Importing {done} / {total} songs  ({pct}%){eta_t}")
 
     def _on_removed(self, ids: List[str]):
         for sid in ids:
@@ -1245,6 +1302,8 @@ class MainWindow(QMainWindow):
                 self._filter_search not in song.title.lower() and \
                 self._filter_search not in song.artist.lower():
             return False
+        if self._filter_rating == -1 and song.rating != 0:
+            return False   # "No rating" filter: only unrated songs
         if self._filter_rating > 0 and song.rating < self._filter_rating:
             return False
         return True
