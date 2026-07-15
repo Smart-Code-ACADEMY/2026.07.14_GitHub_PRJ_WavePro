@@ -557,7 +557,13 @@ class PlayerController(QObject):
 # LockButton widget
 # ============================================================================
 class LockButton(QToolButton):
-    """Green = locked (safe), red = unlocked (editable)."""
+    """
+    Compact lock indicator button.
+    Locked   → small green dot with closed-lock glyph  (safe, default)
+    Unlocked → small red dot with open-lock glyph      (editing enabled)
+    Uses text glyphs (⊙ / ⊘) with a coloured dot accent for a clean,
+    professional look that scales well at small sizes.
+    """
     toggledLock = Signal(bool)   # True = now unlocked
 
     def __init__(self, tip_locked: str, tip_unlocked: str, parent=None):
@@ -566,8 +572,8 @@ class LockButton(QToolButton):
         self._tip_locked   = tip_locked
         self._tip_unlocked = tip_unlocked
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(16, 16)
-        f = QFont(); f.setPointSize(8); self.setFont(f)
+        self.setFixedSize(20, 20)
+        f = QFont(); f.setPointSize(9); self.setFont(f)
         self.clicked.connect(self._toggle)
         self._refresh()
 
@@ -585,19 +591,39 @@ class LockButton(QToolButton):
 
     def _refresh(self):
         if self._locked:
-            self.setText("\U0001F512")
+            # Closed lock — use a clean "lock" look: solid filled circle, green
+            self.setText("●")
             self.setToolTip(self._tip_locked)
             self.setStyleSheet(
-                "QToolButton{background:rgba(48,209,88,.15);border:1px solid #30D158;"
-                "border-radius:4px;color:#30D158;padding:0px;}"
-                "QToolButton:hover{background:rgba(48,209,88,.28);}")
+                "QToolButton{"
+                "  background: rgba(48,209,88,0.18);"
+                "  border: 1.5px solid rgba(48,209,88,0.55);"
+                "  border-radius: 10px;"
+                "  color: #30D158;"
+                "  font-size: 7px;"
+                "}"
+                "QToolButton:hover{"
+                "  background: rgba(48,209,88,0.30);"
+                "  border-color: #30D158;"
+                "}"
+            )
         else:
-            self.setText("\U0001F513")
+            # Open / unlocked — orange-red dot
+            self.setText("●")
             self.setToolTip(self._tip_unlocked)
             self.setStyleSheet(
-                "QToolButton{background:rgba(255,69,58,.15);border:1px solid #FF453A;"
-                "border-radius:4px;color:#FF453A;padding:0px;}"
-                "QToolButton:hover{background:rgba(255,69,58,.28);}")
+                "QToolButton{"
+                "  background: rgba(255,69,58,0.18);"
+                "  border: 1.5px solid rgba(255,69,58,0.55);"
+                "  border-radius: 10px;"
+                "  color: #FF453A;"
+                "  font-size: 7px;"
+                "}"
+                "QToolButton:hover{"
+                "  background: rgba(255,69,58,0.30);"
+                "  border-color: #FF453A;"
+                "}"
+            )
 
 
 # ============================================================================
@@ -757,13 +783,68 @@ QPushButton#playFilteredButton { background:#30d158; border-color:#30d158;
                                  color:#fff; font-weight:600; }
 QPushButton#playFilteredButton:hover { background:#4dde70; }
 
-QPushButton#transportButton { background:transparent; border:none;
-                              border-radius:22px; font-size:18px; padding:6px; }
-QPushButton#transportButton:hover { background:#2c2c2e; }
+/* ── Transport buttons ── */
+QPushButton#transportBtn {
+    background: transparent;
+    border: none;
+    border-radius: 16px;
+    color: #e5e5ea;
+    font-size: 16px;
+    font-weight: 500;
+}
+QPushButton#transportBtn:hover {
+    background: rgba(255,255,255,0.10);
+    color: #ffffff;
+}
+QPushButton#transportBtn:pressed {
+    background: rgba(255,255,255,0.06);
+}
 
-QPushButton#playPauseButton { background:#fff; border-radius:24px; color:#1c1c1e;
-                              font-size:18px; min-width:48px; min-height:48px; }
-QPushButton#playPauseButton:hover { background:#e5e5ea; }
+QPushButton#transportBtnDim {
+    background: transparent;
+    border: none;
+    border-radius: 14px;
+    color: #6e6e73;
+    font-size: 16px;
+    font-weight: 600;
+}
+QPushButton#transportBtnDim:hover {
+    background: rgba(255,255,255,0.08);
+    color: #aeaeb2;
+}
+
+/* Play/Pause – filled circle, prominent */
+QPushButton#playBtn {
+    background: #ffffff;
+    border: none;
+    border-radius: 22px;
+    color: #1c1c1e;
+    font-size: 16px;
+    font-weight: 700;
+}
+QPushButton#playBtn:hover  { background: #e5e5ea; }
+QPushButton#playBtn:pressed{ background: #c7c7cc; }
+
+/* Now-playing label */
+QLabel#nowPlayingLabel {
+    color: #f2f2f7;
+    font-size: 13px;
+    font-weight: 500;
+}
+
+/* Time labels */
+QLabel#timeLabel {
+    color: #8e8e93;
+    font-size: 11px;
+    font-family: "SF Mono", "Consolas", monospace;
+}
+
+/* Volume icon */
+QLabel#volIcon {
+    color: #8e8e93;
+    font-size: 14px;
+    padding-right: 4px;
+}
 
 QTableWidget {
     background:#1c1c1e; alternate-background-color:#202022;
@@ -838,7 +919,7 @@ def _fmt_time(ms: int) -> str:
 def _centered(widget: QWidget) -> QWidget:
     w = QWidget()
     lay = QHBoxLayout(w)
-    lay.setContentsMargins(6, 0, 6, 0)
+    lay.setContentsMargins(8, 0, 8, 0)
     lay.addStretch()
     lay.addWidget(widget)
     lay.addStretch()
@@ -1035,73 +1116,137 @@ class MainWindow(QMainWindow):
 
     # ── player bar ────────────────────────────────────────────────────
     def _build_player_bar(self) -> QWidget:
-        bar = QFrame(); bar.setObjectName("playerBar"); bar.setFixedHeight(92)
+        bar = QFrame()
+        bar.setObjectName("playerBar")
+        bar.setFixedHeight(100)
         outer = QVBoxLayout(bar)
-        outer.setContentsMargins(20, 6, 20, 8); outer.setSpacing(4)
+        outer.setContentsMargins(24, 8, 24, 10)
+        outer.setSpacing(6)
 
+        # ── Seek row ──────────────────────────────────────────────────
         seek_row = QHBoxLayout()
-        self.lbl_pos = QLabel("00:00"); self.lbl_pos.setObjectName("subtleLabel")
+        seek_row.setSpacing(10)
+        self.lbl_pos = QLabel("0:00")
+        self.lbl_pos.setObjectName("timeLabel")
+        self.lbl_pos.setFixedWidth(36)
+        self.lbl_pos.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
         self.seek_slider = QSlider(Qt.Horizontal)
         self.seek_slider.setRange(0, 0)
+        self.seek_slider.setObjectName("seekSlider")
         self.seek_slider.sliderMoved.connect(self.player.seek)
-        self.lbl_dur = QLabel("00:00"); self.lbl_dur.setObjectName("subtleLabel")
+
+        self.lbl_dur = QLabel("0:00")
+        self.lbl_dur.setObjectName("timeLabel")
+        self.lbl_dur.setFixedWidth(36)
+        self.lbl_dur.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
         seek_row.addWidget(self.lbl_pos)
         seek_row.addWidget(self.seek_slider, stretch=1)
         seek_row.addWidget(self.lbl_dur)
         outer.addLayout(seek_row)
 
-        ctrl = QHBoxLayout(); ctrl.setSpacing(12)
+        # ── Controls row ──────────────────────────────────────────────
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(0)
+
+        # Now-playing info (left side)
         self.lbl_now = QLabel("Nothing is playing")
-        self.lbl_now.setObjectName("subtleLabel")
-        self.lbl_now.setMinimumWidth(260)
+        self.lbl_now.setObjectName("nowPlayingLabel")
+        self.lbl_now.setMinimumWidth(220)
+        self.lbl_now.setMaximumWidth(340)
         ctrl.addWidget(self.lbl_now, stretch=1)
-        ctrl.addStretch()
 
-        prev_btn = QPushButton("\u23EE"); prev_btn.setObjectName("transportButton")
-        prev_btn.clicked.connect(self.player.previous); ctrl.addWidget(prev_btn)
+        ctrl.addStretch(1)
 
-        self.pp_btn = QPushButton("\u25B6"); self.pp_btn.setObjectName("playPauseButton")
-        self.pp_btn.clicked.connect(self.player.toggle_play_pause)
-        ctrl.addWidget(self.pp_btn)
+        # ── Transport buttons (centre) ──
+        def _tbtn(icon_text: str, size: int = 32, tooltip: str = "") -> QPushButton:
+            btn = QPushButton(icon_text)
+            btn.setObjectName("transportBtn")
+            btn.setFixedSize(size, size)
+            btn.setToolTip(tooltip)
+            return btn
 
-        next_btn = QPushButton("\u23ED"); next_btn.setObjectName("transportButton")
-        next_btn.clicked.connect(self.player.next); ctrl.addWidget(next_btn)
-
-        self.rep_btn = QPushButton("\U0001F501")
-        self.rep_btn.setObjectName("transportButton")
-        self.rep_btn.setToolTip("Repeat: Off")
+        self.rep_btn = _tbtn("↻", 28, "Repeat: Off")
+        self.rep_btn.setObjectName("transportBtnDim")
         self.rep_btn.clicked.connect(self._cycle_repeat)
         ctrl.addWidget(self.rep_btn)
 
-        ctrl.addStretch()
-        ctrl.addWidget(QLabel("\U0001F50A"))
+        ctrl.addSpacing(8)
+
+        prev_btn = _tbtn("⏮", 32, "Previous")
+        prev_btn.clicked.connect(self.player.previous)
+        ctrl.addWidget(prev_btn)
+
+        ctrl.addSpacing(4)
+
+        self.pp_btn = QPushButton("▶")
+        self.pp_btn.setObjectName("playBtn")
+        self.pp_btn.setFixedSize(44, 44)
+        self.pp_btn.setToolTip("Play / Pause")
+        self.pp_btn.clicked.connect(self.player.toggle_play_pause)
+        ctrl.addWidget(self.pp_btn)
+
+        ctrl.addSpacing(4)
+
+        next_btn = _tbtn("⏭", 32, "Next")
+        next_btn.clicked.connect(self.player.next)
+        ctrl.addWidget(next_btn)
+
+        ctrl.addSpacing(8)
+
+        # Placeholder same width as repeat so centre group is truly centred
+        ctrl.addSpacing(28)
+
+        ctrl.addStretch(1)
+
+        # ── Volume (right side) ──
+        self.vol_icon = QLabel("▐")
+        self.vol_icon.setObjectName("volIcon")
+        ctrl.addWidget(self.vol_icon)
+
         self.vol_slider = QSlider(Qt.Horizontal)
-        self.vol_slider.setRange(0, 100); self.vol_slider.setValue(80)
-        self.vol_slider.setFixedWidth(110)
-        self.vol_slider.valueChanged.connect(self.player.set_volume)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(80)
+        self.vol_slider.setFixedWidth(100)
+        self.vol_slider.setObjectName("volSlider")
+        self.vol_slider.valueChanged.connect(self._on_volume_changed)
         ctrl.addWidget(self.vol_slider)
         self.player.set_volume(80)
+
         outer.addLayout(ctrl)
         return bar
+
+    def _on_volume_changed(self, value: int):
+        self.player.set_volume(value)
+        # Update icon to reflect mute / low / high
+        if value == 0:
+            self.vol_icon.setText("🔇")
+        elif value < 40:
+            self.vol_icon.setText("🔉")
+        else:
+            self.vol_icon.setText("🔊")
 
     # ------------------------------------------------------------------
     # Player wiring
     # ------------------------------------------------------------------
     def _connect_player(self):
         self.player.songChanged.connect(self._on_song_changed)
-        self.player.playbackStateChanged.connect(
-            lambda playing: self.pp_btn.setText("\u23F8" if playing else "\u25B6"))
+        self.player.playbackStateChanged.connect(self._on_playback_state)
         self.player.positionChanged.connect(self._on_pos)
         self.player.durationChanged.connect(
             lambda d: (self.seek_slider.setRange(0, max(0, d)),
                        self.lbl_dur.setText(_fmt_time(d))))
 
+    def _on_playback_state(self, playing: bool):
+        self.pp_btn.setText("⏸" if playing else "▶")
+
     def _on_song_changed(self, song: Optional[Song]):
         if song is None:
             self.lbl_now.setText("Nothing is playing")
         else:
-            ap = f" - {song.artist}" if song.artist else ""
-            self.lbl_now.setText(f"{song.title}{ap}  \u2022  {song.category}")
+            ap = f"  ·  {song.artist}" if song.artist else ""
+            self.lbl_now.setText(f"{song.title}{ap}  ·  {song.category}")
         self._highlight(song)
 
     def _on_pos(self, ms: int):
@@ -1113,9 +1258,20 @@ class MainWindow(QMainWindow):
         order = [RepeatMode.OFF, RepeatMode.ALL, RepeatMode.ONE]
         new   = order[(order.index(self.player.repeat_mode()) + 1) % 3]
         self.player.set_repeat_mode(new)
-        labels = {RepeatMode.OFF: "Off", RepeatMode.ALL: "All", RepeatMode.ONE: "One"}
-        self.rep_btn.setToolTip(f"Repeat: {labels[new]}")
-        self.rep_btn.setStyleSheet("color:#0a84ff;" if new != RepeatMode.OFF else "")
+        tips  = {RepeatMode.OFF: "Repeat: Off", RepeatMode.ALL: "Repeat: All", RepeatMode.ONE: "Repeat: One"}
+        icons = {RepeatMode.OFF: "↻", RepeatMode.ALL: "↻", RepeatMode.ONE: "↺"}
+        self.rep_btn.setToolTip(tips[new])
+        self.rep_btn.setText(icons[new])
+        if new == RepeatMode.OFF:
+            self.rep_btn.setObjectName("transportBtnDim")
+            self.rep_btn.setStyleSheet("")
+        else:
+            self.rep_btn.setObjectName("transportBtnActive")
+            self.rep_btn.setStyleSheet(
+                "QPushButton#transportBtnActive{"
+                "color:#0a84ff;background:rgba(10,132,255,0.12);"
+                "border:none;border-radius:14px;font-size:16px;font-weight:600;}"
+            )
 
     # ------------------------------------------------------------------
     # Folder management
