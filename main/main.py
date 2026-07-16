@@ -450,9 +450,10 @@ class ScanWorker(QThread):
 # Player
 # ============================================================================
 class RepeatMode(Enum):
-    OFF = 0
-    ONE = 1
-    ALL = 2
+    OFF     = 0
+    ONE     = 1
+    ALL     = 2
+    REVERSE = 3   # play all songs in reverse order
 
 
 class PlayerController(QObject):
@@ -509,8 +510,14 @@ class PlayerController(QObject):
             candidates = [i for i in range(len(self._queue)) if i != self._index]
             if candidates:
                 self._index = random.choice(candidates)
-            elif self._repeat == RepeatMode.ALL:
+            elif self._repeat in (RepeatMode.ALL, RepeatMode.REVERSE):
                 self._index = 0
+            else:
+                self._player.stop(); self.songChanged.emit(None); return
+        elif self._repeat == RepeatMode.REVERSE:
+            # REVERSE: auto-advance goes backwards
+            if self._index - 1 >= 0:
+                self._index -= 1
             else:
                 self._player.stop(); self.songChanged.emit(None); return
         else:
@@ -533,6 +540,12 @@ class PlayerController(QObject):
                 self._index = random.choice(candidates)
             else:
                 self._index = 0
+        elif self._repeat == RepeatMode.REVERSE:
+            # In REVERSE mode, "previous" goes forward
+            if self._index + 1 < len(self._queue):
+                self._index += 1
+            else:
+                self._index = len(self._queue) - 1
         else:
             if self._index - 1 >= 0:
                 self._index -= 1
@@ -1400,78 +1413,71 @@ class MainWindow(QMainWindow):
 
         ctrl.addStretch(1)
 
-        # Helper for transport QToolButtons
-        def _tbtn(icon_text: str, size: int = 28, tooltip: str = "",
-                  fg: str = "#e5e5ea", font_size: int = 15) -> QToolButton:
+        # ── All transport buttons: white-circle style ─────────────────
+        def _circle_btn(text: str, size: int, tooltip: str,
+                        bg: str = "#2c2c2e", fg: str = "#f2f2f7",
+                        font_size: int = 15) -> QToolButton:
             btn = QToolButton()
-            btn.setText(icon_text)
+            btn.setText(text)
             btn.setFixedSize(size, size)
             btn.setToolTip(tooltip)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setStyleSheet(
-                f"QToolButton{{background:transparent;border:none;"
-                f"border-radius:{size//2}px;color:{fg};font-size:{font_size}px;}}"
-                f"QToolButton:hover{{background:rgba(255,255,255,0.12);color:#fff;}}"
-                f"QToolButton:pressed{{background:rgba(255,255,255,0.06);}}"
+                f"QToolButton{{background:{bg};border:none;border-radius:{size//2}px;"
+                f"color:{fg};font-size:{font_size}px;font-weight:600;}}"
+                f"QToolButton:hover{{background:#3a3a3c;color:#ffffff;}}"
+                f"QToolButton:pressed{{background:#232325;}}"
             )
             return btn
 
-        # Repeat-All button  ↻
-        self.rep_btn = _tbtn("↻", 26, "Repeat: Off", fg="#6e6e73", font_size=14)
+        # ── Repeat (4-state cycle: Off → All → Reverse → One) ────────
+        self.rep_btn = _circle_btn("↻", 36, "Repeat: Off",
+                                   bg="#2c2c2e", fg="#8e8e93", font_size=16)
         self.rep_btn.clicked.connect(self._cycle_repeat)
         ctrl.addWidget(self.rep_btn)
 
-        ctrl.addSpacing(2)
+        ctrl.addSpacing(8)
 
-        # Repeat-One button  ①
-        self.rep1_btn = _tbtn("①", 26, "Repeat One: Off", fg="#6e6e73", font_size=13)
-        self.rep1_btn.clicked.connect(self._toggle_repeat_one)
-        ctrl.addWidget(self.rep1_btn)
-
-        ctrl.addSpacing(2)
-
-        # Shuffle button  ⇄
-        self.shuf_btn = _tbtn("⇄", 26, "Shuffle: Off", fg="#6e6e73", font_size=14)
-        self.shuf_btn.clicked.connect(self._toggle_shuffle)
-        ctrl.addWidget(self.shuf_btn)
-
-        ctrl.addSpacing(6)
-
-        prev_btn = _tbtn("⏮", 32, "Previous", font_size=17)
+        # ── Prev ──────────────────────────────────────────────────────
+        prev_btn = _circle_btn("⏮", 40, "Previous", font_size=17)
         prev_btn.clicked.connect(self.player.previous)
         ctrl.addWidget(prev_btn)
 
-        ctrl.addSpacing(3)
+        ctrl.addSpacing(6)
 
-        # Play/Pause — white filled circle
+        # ── Play / Pause (largest, white) ─────────────────────────────
         self.pp_btn = QToolButton()
         self.pp_btn.setText("▶")
-        self.pp_btn.setFixedSize(44, 44)
+        self.pp_btn.setFixedSize(50, 50)
         self.pp_btn.setToolTip("Play / Pause")
         self.pp_btn.setCursor(Qt.PointingHandCursor)
         self.pp_btn.setStyleSheet(
-            "QToolButton{background:#ffffff;border:none;border-radius:22px;"
-            "color:#1c1c1e;font-size:16px;font-weight:700;}"
+            "QToolButton{background:#ffffff;border:none;border-radius:25px;"
+            "color:#1c1c1e;font-size:19px;font-weight:800;}"
             "QToolButton:hover{background:#e5e5ea;}"
             "QToolButton:pressed{background:#c7c7cc;}"
         )
         self.pp_btn.clicked.connect(self.player.toggle_play_pause)
         ctrl.addWidget(self.pp_btn)
 
-        ctrl.addSpacing(3)
+        ctrl.addSpacing(6)
 
-        next_btn = _tbtn("⏭", 32, "Next", font_size=17)
+        # ── Next ──────────────────────────────────────────────────────
+        next_btn = _circle_btn("⏭", 40, "Next", font_size=17)
         next_btn.clicked.connect(self.player.next)
         ctrl.addWidget(next_btn)
 
-        ctrl.addSpacing(6)
+        ctrl.addSpacing(8)
 
-        # Spacer (mirrors rep+rep1+shuf on the left)
-        ctrl.addSpacing(82)
+        # ── Shuffle – right of Next ────────────────────────────────────
+        self.shuf_btn = _circle_btn("⇄", 36, "Shuffle: Off",
+                                    bg="#2c2c2e", fg="#8e8e93", font_size=16)
+        self.shuf_btn.clicked.connect(self._toggle_shuffle)
+        ctrl.addWidget(self.shuf_btn)
 
         ctrl.addStretch(1)
 
-        # Volume
+        # Volume (right side)
         self.vol_icon = QLabel("🔊")
         self.vol_icon.setObjectName("volIcon")
         ctrl.addWidget(self.vol_icon)
@@ -1553,78 +1559,50 @@ class MainWindow(QMainWindow):
         dur = self.seek_slider.maximum()
         self.vu_meter.set_position(ms, max(1, dur))
 
-    def _toggle_repeat_one(self):
-        """Toggle Repeat-One independently of the Repeat-All cycle."""
-        current = self.player.repeat_mode()
-        if current == RepeatMode.ONE:
-            # Turn off repeat-one → go back to OFF
-            self.player.set_repeat_mode(RepeatMode.OFF)
-            self.rep1_btn.setToolTip("Repeat One: Off")
-            self.rep1_btn.setStyleSheet(
-                "QToolButton{background:transparent;border:none;border-radius:13px;"
-                "color:#6e6e73;font-size:13px;}"
-                "QToolButton:hover{background:rgba(255,255,255,0.12);color:#fff;}"
-            )
-            # Also reset rep_btn to OFF appearance
-            self.rep_btn.setStyleSheet(
-                "QToolButton{background:transparent;border:none;border-radius:13px;"
-                "color:#6e6e73;font-size:14px;}"
-                "QToolButton:hover{background:rgba(255,255,255,0.12);color:#fff;}"
-            )
-            self.rep_btn.setToolTip("Repeat: Off")
-        else:
-            # Activate repeat-one
-            self.player.set_repeat_mode(RepeatMode.ONE)
-            self.rep1_btn.setToolTip("Repeat One: On")
-            self.rep1_btn.setStyleSheet(
-                "QToolButton{background:rgba(10,132,255,0.15);border:none;border-radius:13px;"
-                "color:#0a84ff;font-size:13px;font-weight:700;}"
-                "QToolButton:hover{background:rgba(10,132,255,0.25);}"
-            )
-            # Dim rep_btn since repeat-one overrides repeat-all
-            self.rep_btn.setStyleSheet(
-                "QToolButton{background:transparent;border:none;border-radius:13px;"
-                "color:#3a3a3c;font-size:14px;}"
-            )
+    def _cycle_repeat(self):
+        """Cycle: Off → All → Reverse → One → Off"""
+        order = [RepeatMode.OFF, RepeatMode.ALL, RepeatMode.REVERSE, RepeatMode.ONE]
+        new   = order[(order.index(self.player.repeat_mode()) + 1) % 4]
+        self.player.set_repeat_mode(new)
+
+        cfg = {
+            RepeatMode.OFF:     ("↻", "#8e8e93", "#2c2c2e", "Repeat: Off"),
+            RepeatMode.ALL:     ("↻", "#0a84ff", "#1a3a5c", "Repeat: All  —  restarts from beginning"),
+            RepeatMode.REVERSE: ("↺", "#0a84ff", "#1a3a5c", "Repeat: Reverse  —  plays backwards through list"),
+            RepeatMode.ONE:     ("①", "#30D158", "#1a3a2c", "Repeat: One  —  repeats this song only"),
+        }
+        icon, fg, bg, tip = cfg[new]
+        self.rep_btn.setText(icon)
+        self.rep_btn.setToolTip(tip)
+        r = self.rep_btn.width() // 2
+        self.rep_btn.setStyleSheet(
+            f"QToolButton{{background:{bg};border:none;border-radius:{r}px;"
+            f"color:{fg};font-size:16px;font-weight:700;}}"
+            f"QToolButton:hover{{background:#3a3a3c;color:#ffffff;}}"
+            f"QToolButton:pressed{{background:#232325;}}"
+        )
 
     def _toggle_shuffle(self):
         enabled = not self.player.is_shuffle()
         self.player.set_shuffle(enabled)
+        r = self.shuf_btn.width() // 2
         if enabled:
             self.shuf_btn.setToolTip("Shuffle: On")
             self.shuf_btn.setStyleSheet(
-                "QToolButton{background:rgba(10,132,255,0.15);border:none;border-radius:14px;"
-                "color:#0a84ff;font-size:16px;font-weight:700;}"
-                "QToolButton:hover{background:rgba(10,132,255,0.25);}"
+                f"QToolButton{{background:#1a3a5c;border:none;border-radius:{r}px;"
+                f"color:#0a84ff;font-size:16px;font-weight:700;}}"
+                f"QToolButton:hover{{background:#234a70;}}"
+                f"QToolButton:pressed{{background:#1a3a5c;}}"
             )
         else:
             self.shuf_btn.setToolTip("Shuffle: Off")
             self.shuf_btn.setStyleSheet(
-                "QToolButton{background:transparent;border:none;border-radius:14px;"
-                "color:#6e6e73;font-size:16px;}"
-                "QToolButton:hover{background:rgba(255,255,255,0.12);color:#ffffff;}"
+                f"QToolButton{{background:#2c2c2e;border:none;border-radius:{r}px;"
+                f"color:#8e8e93;font-size:16px;font-weight:600;}}"
+                f"QToolButton:hover{{background:#3a3a3c;color:#ffffff;}}"
+                f"QToolButton:pressed{{background:#232325;}}"
             )
 
-    def _cycle_repeat(self):
-        order = [RepeatMode.OFF, RepeatMode.ALL, RepeatMode.ONE]
-        new   = order[(order.index(self.player.repeat_mode()) + 1) % 3]
-        self.player.set_repeat_mode(new)
-        tips  = {RepeatMode.OFF: "Repeat: Off", RepeatMode.ALL: "Repeat: All", RepeatMode.ONE: "Repeat: One"}
-        icons = {RepeatMode.OFF: "↻", RepeatMode.ALL: "↻", RepeatMode.ONE: "↺"}
-        self.rep_btn.setToolTip(tips[new])
-        self.rep_btn.setText(icons[new])
-        if new == RepeatMode.OFF:
-            self.rep_btn.setStyleSheet(
-                "QToolButton{background:transparent;border:none;border-radius:14px;"
-                "color:#6e6e73;font-size:16px;}"
-                "QToolButton:hover{background:rgba(255,255,255,0.12);color:#ffffff;}"
-            )
-        else:
-            self.rep_btn.setStyleSheet(
-                "QToolButton{background:rgba(10,132,255,0.15);border:none;border-radius:14px;"
-                "color:#0a84ff;font-size:16px;font-weight:700;}"
-                "QToolButton:hover{background:rgba(10,132,255,0.25);}"
-            )
 
     # ------------------------------------------------------------------
     # Folder management
