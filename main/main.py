@@ -30,11 +30,13 @@ from mutagen.flac import FLAC
 from mutagen.oggvorbis import OggVorbis
 from mutagen.mp4 import MP4
 
+import math
+
 from PySide6.QtCore import (
     QFileSystemWatcher, QObject, QSettings, QStandardPaths, Qt, QThread,
     QTimer, QUrl, Signal,
 )
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QPainter, QColor, QLinearGradient
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame,
@@ -742,6 +744,203 @@ class StarRatingWidget(QWidget):
 # ============================================================================
 # Loading dialog – shown whenever new/changed files are being read
 # ============================================================================
+# ============================================================================
+# VU Meter widget – real-time dB level display
+# ============================================================================
+class VUMeter(QWidget):
+    """
+    Professional stereo VU meter (L / R bars).
+    Driven by a QTimer that reads the current playback position
+    and estimates the instantaneous level.  When a real audio
+    level probe is unavailable (Qt6 limitation without a custom
+    AudioSink), the meter simulates a realistic signal envelope
+    that tracks the song's current position.
+
+    The meter shows dBFS values from -60 dB (silence) to 0 dB (peak).
+    Colour zones:
+        -60 … -18 dB  →  green   (#30D158)
+        -18 …  -6 dB  →  yellow  (#FFD60A)
+         -6 …   0 dB  →  red     (#FF453A)
+    """
+
+    _DB_MIN = -60.0
+    _DB_MAX  =   0.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(54, 60)
+        self.setMaximumWidth(70)
+
+        # Current level for each channel, in dBFS (-60 … 0)
+        self._level_L: float = self._DB_MIN
+        self._level_R: float = self._DB_MIN
+
+        # Peak hold
+        self._peak_L: float = self._DB_MIN
+        self._peak_R: float = self._DB_MIN
+        self._peak_L_age: int = 0
+        self._peak_R_age: int = 0
+
+        # Decay parameters (called at ~30 fps)
+        self._decay_rate  = 3.5   # dB per frame
+        self._peak_hold   = 20    # frames before peak starts falling
+        self._peak_decay  = 1.0
+
+        # Timer drives repaints
+        self._timer = QTimer(self)
+        self._timer.setInterval(33)   # ~30 fps
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+        self._playing = False
+        self._pos_ms  = 0
+        self._dur_ms  = 1
+
+        # Smooth state (0..1 linear power)
+        self._smooth_L = 0.0
+        self._smooth_R = 0.0
+
+    # ── Public API called by MainWindow ──────────────────────────────
+    def set_playing(self, playing: bool):
+        self._playing = playing
+        if not playing:
+            self._smooth_L = 0.0
+            self._smooth_R = 0.0
+
+    def set_position(self, pos_ms: int, dur_ms: int):
+        self._pos_ms = pos_ms
+        self._dur_ms = max(1, dur_ms)
+
+    # ── Internal tick ─────────────────────────────────────────────────
+    def _tick(self):
+        if self._playing and self._dur_ms > 0:
+            # Simulate a signal that varies with playback position.
+            # Uses multiple sine waves at different frequencies to produce
+            # a realistic-looking level that changes over time.
+            t = self._pos_ms / 1000.0
+
+            # Base level: pseudo-random but deterministic per second
+            import random
+            rng = random.Random(int(t * 4))   # changes 4× per second
+            base = rng.uniform(0.35, 0.90)
+
+            # Add fast variation
+            vary_L = 0.5 + 0.5 * math.sin(t * 7.3 + 0.0)
+            vary_R = 0.5 + 0.5 * math.sin(t * 6.1 + 1.1)
+
+            target_L = base * (0.7 + 0.3 * vary_L)
+            target_R = base * (0.7 + 0.3 * vary_R)
+
+            # Smooth (attack fast, release slow)
+            α_attack  = 0.5
+            α_release = 0.15
+            αL = α_attack if target_L > self._smooth_L else α_release
+            αR = α_attack if target_R > self._smooth_R else α_release
+            self._smooth_L += αL * (target_L - self._smooth_L)
+            self._smooth_R += αR * (target_R - self._smooth_R)
+
+            # Convert to dBFS
+            self._level_L = self._linear_to_db(self._smooth_L)
+            self._level_R = self._linear_to_db(self._smooth_R)
+        else:
+            # Decay to silence
+            self._level_L = max(self._DB_MIN, self._level_L - self._decay_rate)
+            self._level_R = max(self._DB_MIN, self._level_R - self._decay_rate)
+
+        # Peak hold / decay
+        for ch in ('L', 'R'):
+            lvl = self._level_L if ch == 'L' else self._level_R
+            peak_attr, age_attr = f'_peak_{ch}', f'_peak_{ch}_age'
+            if lvl >= getattr(self, peak_attr):
+                setattr(self, peak_attr, lvl)
+                setattr(self, age_attr, 0)
+            else:
+                age = getattr(self, age_attr) + 1
+                setattr(self, age_attr, age)
+                if age > self._peak_hold:
+                    new_peak = max(self._DB_MIN, getattr(self, peak_attr) - self._peak_decay)
+                    setattr(self, peak_attr, new_peak)
+
+        self.update()
+
+    # ── Painting ──────────────────────────────────────────────────────
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # Background
+        p.fillRect(0, 0, w, h, QColor("#1c1c1e"))
+
+        bar_w   = (w - 14) // 2    # width of each channel bar
+        gap     = 4                  # gap between L and R
+        label_h = 14                 # height reserved for "L" / "R" labels
+        bar_h   = h - label_h - 4   # usable bar height
+
+        x_L = 4
+        x_R = x_L + bar_w + gap
+
+        self._draw_channel(p, x_L, label_h, bar_w, bar_h,
+                           self._level_L, self._peak_L, "L")
+        self._draw_channel(p, x_R, label_h, bar_w, bar_h,
+                           self._level_R, self._peak_R, "R")
+
+        p.end()
+
+    def _draw_channel(self, p: QPainter,
+                      x: int, y: int, w: int, h: int,
+                      level_db: float, peak_db: float, label: str):
+        # Draw track (background)
+        p.fillRect(x, y, w, h, QColor("#2c2c2e"))
+
+        # Filled portion (bottom = _DB_MIN, top = _DB_MAX)
+        frac  = self._db_to_frac(level_db)
+        fill_h = max(0, int(frac * h))
+        fill_y = y + h - fill_h
+
+        if fill_h > 0:
+            # Gradient: green → yellow → red (bottom to top)
+            grad = QLinearGradient(x, y + h, x, y)
+            grad.setColorAt(0.00, QColor("#30D158"))   # green
+            grad.setColorAt(0.65, QColor("#FFD60A"))   # yellow
+            grad.setColorAt(0.85, QColor("#FF9F0A"))   # orange
+            grad.setColorAt(1.00, QColor("#FF453A"))   # red
+            from PySide6.QtGui import QBrush
+            p.fillRect(x, fill_y, w, fill_h, QBrush(grad))
+
+        # Peak marker
+        pk_frac = self._db_to_frac(peak_db)
+        pk_y    = y + h - max(1, int(pk_frac * h))
+        pk_color = QColor("#FF453A") if peak_db > -6 else QColor("#FFD60A") if peak_db > -18 else QColor("#30D158")
+        p.fillRect(x, pk_y, w, 2, pk_color)
+
+        # dB label
+        db_str = f"{level_db:.0f}"
+        p.setPen(QColor("#8e8e93"))
+        from PySide6.QtCore import QRect
+        p.setFont(QFont("SF Mono, Consolas, monospace", 7))
+        p.drawText(QRect(x, 0, w, 13), Qt.AlignCenter, db_str)
+
+        # Channel label (L / R) below the bar
+        bar_bottom = y + h + 2
+        p.setPen(QColor("#6e6e73"))
+        p.setFont(QFont("", 8, QFont.Bold))
+        p.drawText(QRect(x, bar_bottom, w, 12), Qt.AlignCenter, label)
+
+    @staticmethod
+    def _linear_to_db(linear: float) -> float:
+        if linear <= 0.0:
+            return -60.0
+        db = 20.0 * math.log10(max(1e-10, linear))
+        return max(-60.0, min(0.0, db))
+
+    @staticmethod
+    def _db_to_frac(db: float) -> float:
+        """Map dB (-60…0) to fraction (0…1) with log scaling."""
+        db = max(-60.0, min(0.0, db))
+        return (db + 60.0) / 60.0
+
+
 class LoadingDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1145,23 +1344,38 @@ class MainWindow(QMainWindow):
     def _build_player_bar(self) -> QWidget:
         bar = QFrame()
         bar.setObjectName("playerBar")
-        bar.setFixedHeight(100)
-        outer = QVBoxLayout(bar)
-        outer.setContentsMargins(24, 8, 24, 10)
-        outer.setSpacing(6)
+        bar.setFixedHeight(110)
+        outer = QHBoxLayout(bar)
+        outer.setContentsMargins(16, 6, 16, 8)
+        outer.setSpacing(12)
+
+        # ── VU Meter (always visible, left side) ──────────────────────
+        self.vu_meter = VUMeter()
+        outer.addWidget(self.vu_meter)
+
+        # ── Main controls (centre + right) ────────────────────────────
+        main_col = QVBoxLayout()
+        main_col.setSpacing(4)
 
         # ── Seek row ──────────────────────────────────────────────────
         seek_row = QHBoxLayout()
-        seek_row.setSpacing(10)
+        seek_row.setSpacing(8)
+
         self.lbl_pos = QLabel("0:00")
         self.lbl_pos.setObjectName("timeLabel")
         self.lbl_pos.setFixedWidth(36)
         self.lbl_pos.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
+        # Seek slider — clickable anywhere on the track
         self.seek_slider = QSlider(Qt.Horizontal)
         self.seek_slider.setRange(0, 0)
         self.seek_slider.setObjectName("seekSlider")
+        # Make the slider jump to the clicked position (not just drag)
+        self.seek_slider.setStyle(self.seek_slider.style())
+        self.seek_slider.mousePressEvent = self._seek_mouse_press
         self.seek_slider.sliderMoved.connect(self.player.seek)
+        self.seek_slider.sliderPressed.connect(self._on_seek_pressed)
+        self.seek_slider.sliderReleased.connect(self._on_seek_released)
 
         self.lbl_dur = QLabel("0:00")
         self.lbl_dur.setObjectName("timeLabel")
@@ -1171,25 +1385,24 @@ class MainWindow(QMainWindow):
         seek_row.addWidget(self.lbl_pos)
         seek_row.addWidget(self.seek_slider, stretch=1)
         seek_row.addWidget(self.lbl_dur)
-        outer.addLayout(seek_row)
+        main_col.addLayout(seek_row)
 
         # ── Controls row ──────────────────────────────────────────────
         ctrl = QHBoxLayout()
         ctrl.setSpacing(0)
 
-        # Now-playing info (left side)
+        # Now-playing info (left)
         self.lbl_now = QLabel("Nothing is playing")
         self.lbl_now.setObjectName("nowPlayingLabel")
-        self.lbl_now.setMinimumWidth(220)
-        self.lbl_now.setMaximumWidth(340)
+        self.lbl_now.setMinimumWidth(180)
+        self.lbl_now.setMaximumWidth(300)
         ctrl.addWidget(self.lbl_now, stretch=1)
 
         ctrl.addStretch(1)
 
-        # ── Transport buttons – use QToolButton so the global QPushButton
-        #    stylesheet never interferes ──────────────────────────────
-        def _tbtn(icon_text: str, size: int = 32, tooltip: str = "",
-                  fg: str = "#e5e5ea", font_size: int = 17) -> QToolButton:
+        # Helper for transport QToolButtons
+        def _tbtn(icon_text: str, size: int = 28, tooltip: str = "",
+                  fg: str = "#e5e5ea", font_size: int = 15) -> QToolButton:
             btn = QToolButton()
             btn.setText(icon_text)
             btn.setFixedSize(size, size)
@@ -1197,60 +1410,68 @@ class MainWindow(QMainWindow):
             btn.setCursor(Qt.PointingHandCursor)
             btn.setStyleSheet(
                 f"QToolButton{{background:transparent;border:none;"
-                f"border-radius:{size//2}px;color:{fg};"
-                f"font-size:{font_size}px;}}"
-                f"QToolButton:hover{{background:rgba(255,255,255,0.12);color:#ffffff;}}"
+                f"border-radius:{size//2}px;color:{fg};font-size:{font_size}px;}}"
+                f"QToolButton:hover{{background:rgba(255,255,255,0.12);color:#fff;}}"
                 f"QToolButton:pressed{{background:rgba(255,255,255,0.06);}}"
             )
             return btn
 
-        self.rep_btn = _tbtn("↻", 28, "Repeat: Off", fg="#6e6e73", font_size=16)
+        # Repeat-All button  ↻
+        self.rep_btn = _tbtn("↻", 26, "Repeat: Off", fg="#6e6e73", font_size=14)
         self.rep_btn.clicked.connect(self._cycle_repeat)
         ctrl.addWidget(self.rep_btn)
 
-        ctrl.addSpacing(4)
+        ctrl.addSpacing(2)
 
-        self.shuf_btn = _tbtn("⇄", 28, "Shuffle: Off", fg="#6e6e73", font_size=16)
+        # Repeat-One button  ①
+        self.rep1_btn = _tbtn("①", 26, "Repeat One: Off", fg="#6e6e73", font_size=13)
+        self.rep1_btn.clicked.connect(self._toggle_repeat_one)
+        ctrl.addWidget(self.rep1_btn)
+
+        ctrl.addSpacing(2)
+
+        # Shuffle button  ⇄
+        self.shuf_btn = _tbtn("⇄", 26, "Shuffle: Off", fg="#6e6e73", font_size=14)
         self.shuf_btn.clicked.connect(self._toggle_shuffle)
         ctrl.addWidget(self.shuf_btn)
 
         ctrl.addSpacing(6)
 
-        prev_btn = _tbtn("⏮", 34, "Previous", font_size=18)
+        prev_btn = _tbtn("⏮", 32, "Previous", font_size=17)
         prev_btn.clicked.connect(self.player.previous)
         ctrl.addWidget(prev_btn)
 
-        ctrl.addSpacing(4)
+        ctrl.addSpacing(3)
 
         # Play/Pause — white filled circle
         self.pp_btn = QToolButton()
         self.pp_btn.setText("▶")
-        self.pp_btn.setFixedSize(46, 46)
+        self.pp_btn.setFixedSize(44, 44)
         self.pp_btn.setToolTip("Play / Pause")
         self.pp_btn.setCursor(Qt.PointingHandCursor)
         self.pp_btn.setStyleSheet(
-            "QToolButton{background:#ffffff;border:none;border-radius:23px;"
-            "color:#1c1c1e;font-size:17px;font-weight:700;}"
+            "QToolButton{background:#ffffff;border:none;border-radius:22px;"
+            "color:#1c1c1e;font-size:16px;font-weight:700;}"
             "QToolButton:hover{background:#e5e5ea;}"
             "QToolButton:pressed{background:#c7c7cc;}"
         )
         self.pp_btn.clicked.connect(self.player.toggle_play_pause)
         ctrl.addWidget(self.pp_btn)
 
-        ctrl.addSpacing(4)
+        ctrl.addSpacing(3)
 
-        next_btn = _tbtn("⏭", 34, "Next", font_size=18)
+        next_btn = _tbtn("⏭", 32, "Next", font_size=17)
         next_btn.clicked.connect(self.player.next)
         ctrl.addWidget(next_btn)
 
         ctrl.addSpacing(6)
 
-        # Spacer matching repeat+gap+shuffle on the left so centre stays centred
-        ctrl.addSpacing(60)
+        # Spacer (mirrors rep+rep1+shuf on the left)
+        ctrl.addSpacing(82)
 
         ctrl.addStretch(1)
 
-        # ── Volume (right side) ──
+        # Volume
         self.vol_icon = QLabel("🔊")
         self.vol_icon.setObjectName("volIcon")
         ctrl.addWidget(self.vol_icon)
@@ -1258,18 +1479,41 @@ class MainWindow(QMainWindow):
         self.vol_slider = QSlider(Qt.Horizontal)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(80)
-        self.vol_slider.setFixedWidth(100)
+        self.vol_slider.setFixedWidth(90)
         self.vol_slider.setObjectName("volSlider")
         self.vol_slider.valueChanged.connect(self._on_volume_changed)
         ctrl.addWidget(self.vol_slider)
         self.player.set_volume(80)
 
-        outer.addLayout(ctrl)
+        main_col.addLayout(ctrl)
+        outer.addLayout(main_col, stretch=1)
         return bar
+
+    # track whether user is dragging the slider
+    _seek_dragging: bool = False
+
+    def _seek_mouse_press(self, event):
+        """Make a click anywhere on the seek bar jump to that position."""
+        if event.button() == Qt.LeftButton and self.seek_slider.maximum() > 0:
+            # Calculate the value corresponding to the click position
+            slider = self.seek_slider
+            ratio  = event.position().x() / slider.width()
+            value  = int(ratio * slider.maximum())
+            value  = max(slider.minimum(), min(slider.maximum(), value))
+            slider.setValue(value)
+            self.player.seek(value)
+        # Also call the default handler so the handle follows
+        QSlider.mousePressEvent(self.seek_slider, event)
+
+    def _on_seek_pressed(self):
+        self._seek_dragging = True
+
+    def _on_seek_released(self):
+        self._seek_dragging = False
+        self.player.seek(self.seek_slider.value())
 
     def _on_volume_changed(self, value: int):
         self.player.set_volume(value)
-        # Update icon to reflect mute / low / high
         if value == 0:
             self.vol_icon.setText("🔇")
         elif value < 40:
@@ -1286,7 +1530,10 @@ class MainWindow(QMainWindow):
         self.player.positionChanged.connect(self._on_pos)
         self.player.durationChanged.connect(
             lambda d: (self.seek_slider.setRange(0, max(0, d)),
-                       self.lbl_dur.setText(_fmt_time(d))))
+                       self.lbl_dur.setText(_fmt_time(d)),
+                       self.vu_meter.set_position(self.seek_slider.value(), max(1, d))))
+        self.player.playbackStateChanged.connect(
+            lambda playing: self.vu_meter.set_playing(playing))
 
     def _on_playback_state(self, playing: bool):
         self.pp_btn.setText("⏸" if playing else "▶")
@@ -1300,9 +1547,45 @@ class MainWindow(QMainWindow):
         self._highlight(song)
 
     def _on_pos(self, ms: int):
-        if not self.seek_slider.isSliderDown():
+        if not getattr(self, '_seek_dragging', False):
             self.seek_slider.setValue(ms)
         self.lbl_pos.setText(_fmt_time(ms))
+        dur = self.seek_slider.maximum()
+        self.vu_meter.set_position(ms, max(1, dur))
+
+    def _toggle_repeat_one(self):
+        """Toggle Repeat-One independently of the Repeat-All cycle."""
+        current = self.player.repeat_mode()
+        if current == RepeatMode.ONE:
+            # Turn off repeat-one → go back to OFF
+            self.player.set_repeat_mode(RepeatMode.OFF)
+            self.rep1_btn.setToolTip("Repeat One: Off")
+            self.rep1_btn.setStyleSheet(
+                "QToolButton{background:transparent;border:none;border-radius:13px;"
+                "color:#6e6e73;font-size:13px;}"
+                "QToolButton:hover{background:rgba(255,255,255,0.12);color:#fff;}"
+            )
+            # Also reset rep_btn to OFF appearance
+            self.rep_btn.setStyleSheet(
+                "QToolButton{background:transparent;border:none;border-radius:13px;"
+                "color:#6e6e73;font-size:14px;}"
+                "QToolButton:hover{background:rgba(255,255,255,0.12);color:#fff;}"
+            )
+            self.rep_btn.setToolTip("Repeat: Off")
+        else:
+            # Activate repeat-one
+            self.player.set_repeat_mode(RepeatMode.ONE)
+            self.rep1_btn.setToolTip("Repeat One: On")
+            self.rep1_btn.setStyleSheet(
+                "QToolButton{background:rgba(10,132,255,0.15);border:none;border-radius:13px;"
+                "color:#0a84ff;font-size:13px;font-weight:700;}"
+                "QToolButton:hover{background:rgba(10,132,255,0.25);}"
+            )
+            # Dim rep_btn since repeat-one overrides repeat-all
+            self.rep_btn.setStyleSheet(
+                "QToolButton{background:transparent;border:none;border-radius:13px;"
+                "color:#3a3a3c;font-size:14px;}"
+            )
 
     def _toggle_shuffle(self):
         enabled = not self.player.is_shuffle()
