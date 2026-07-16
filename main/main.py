@@ -600,37 +600,52 @@ class PlayerController(QObject):
 # ============================================================================
 class LockButton(QToolButton):
     """
-    Fully solid color indicator — no outline, no border, no structure.
-    Uses a filled shield/circle character rendered entirely in one colour:
-      • Solid GREEN  (#30D158) = locked / safe — no changes possible
-      • Solid RED    (#FF453A) = unlocked / active — change is in progress
+    Text-badge lock indicator. No icon, no color fill — purely typographic.
 
-    The entire icon surface is one flat colour so it reads like a
-    professional traffic-light indicator.
+    SAFE state (locked):
+        Shows the word  « SAFE »  in a very subtle, low-contrast style.
+        Message: "everything is protected, nothing can change by accident."
+
+    EDIT state (unlocked):
+        Shows the word  « EDIT »  in an amber/orange outlined pill.
+        Message: "attention — you are now able to make a change."
+
+    Clicking toggles between the two states.
     """
     toggledLock = Signal(bool)   # True = now unlocked
 
-    # ⬤  U+2B24 BLACK LARGE CIRCLE – renders as a perfect solid disc
-    # We use it as a "filled shield" placeholder; the colour does all the work.
-    _GLYPH = "\u2B24"   # ⬤
-
-    _CSS = (
-        "QToolButton{{"
-        "  background: {color};"
-        "  border: none;"
-        "  border-radius: 9px;"
-        "  color: {color};"   # text same colour so glyph blends into fill
-        "  font-size: 8px;"
-        "}}"
-        "QToolButton:hover{{"
-        "  background: {hover};"
-        "}}"
+    _CSS_SAFE = (
+        "QToolButton{"
+        "  background: rgba(255,255,255,0.05);"
+        "  border: 1px solid rgba(255,255,255,0.10);"
+        "  border-radius: 4px;"
+        "  color: #48484a;"          # very muted — not calling attention
+        "  font-size: 9px;"
+        "  font-weight: 700;"
+        "  letter-spacing: 0.5px;"
+        "  padding: 0px 3px;"
+        "}"
+        "QToolButton:hover{"
+        "  border-color: rgba(255,255,255,0.20);"
+        "  color: #6e6e73;"
+        "}"
     )
 
-    _GREEN       = "#30D158"
-    _GREEN_HOVER = "#4dde70"
-    _RED         = "#FF453A"
-    _RED_HOVER   = "#ff6961"
+    _CSS_EDIT = (
+        "QToolButton{"
+        "  background: rgba(255,159,10,0.12);"   # amber tint
+        "  border: 1.5px solid #FF9F0A;"          # amber outline
+        "  border-radius: 4px;"
+        "  color: #FF9F0A;"
+        "  font-size: 9px;"
+        "  font-weight: 700;"
+        "  letter-spacing: 0.5px;"
+        "  padding: 0px 3px;"
+        "}"
+        "QToolButton:hover{"
+        "  background: rgba(255,159,10,0.22);"
+        "}"
+    )
 
     def __init__(self, tip_locked: str, tip_unlocked: str, parent=None):
         super().__init__(parent)
@@ -638,7 +653,7 @@ class LockButton(QToolButton):
         self._tip_locked   = tip_locked
         self._tip_unlocked = tip_unlocked
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(18, 18)
+        self.setFixedSize(38, 18)
         self.clicked.connect(self._toggle)
         self._refresh()
 
@@ -657,15 +672,14 @@ class LockButton(QToolButton):
         self.toggledLock.emit(not self._locked)
 
     def _refresh(self):
-        self.setText(self._GLYPH)
         if self._locked:
+            self.setText("SAFE")
             self.setToolTip(self._tip_locked)
-            self.setStyleSheet(
-                self._CSS.format(color=self._GREEN, hover=self._GREEN_HOVER))
+            self.setStyleSheet(self._CSS_SAFE)
         else:
+            self.setText("EDIT")
             self.setToolTip(self._tip_unlocked)
-            self.setStyleSheet(
-                self._CSS.format(color=self._RED, hover=self._RED_HOVER))
+            self.setStyleSheet(self._CSS_EDIT)
 
 
 # ============================================================================
@@ -1477,19 +1491,29 @@ class MainWindow(QMainWindow):
 
         ctrl.addStretch(1)
 
-        # Volume (right side)
+        # ── Volume in a FIXED-WIDTH container so the icon change
+        #    (🔇/🔉/🔊) never shifts the transport buttons ────────────
+        vol_container = QFrame()
+        vol_container.setFixedWidth(130)
+        vol_layout = QHBoxLayout(vol_container)
+        vol_layout.setContentsMargins(0, 0, 0, 0)
+        vol_layout.setSpacing(4)
+
         self.vol_icon = QLabel("🔊")
         self.vol_icon.setObjectName("volIcon")
-        ctrl.addWidget(self.vol_icon)
+        self.vol_icon.setFixedWidth(22)
+        self.vol_icon.setAlignment(Qt.AlignCenter)
+        vol_layout.addWidget(self.vol_icon)
 
         self.vol_slider = QSlider(Qt.Horizontal)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(80)
-        self.vol_slider.setFixedWidth(90)
         self.vol_slider.setObjectName("volSlider")
         self.vol_slider.valueChanged.connect(self._on_volume_changed)
-        ctrl.addWidget(self.vol_slider)
+        vol_layout.addWidget(self.vol_slider, stretch=1)
         self.player.set_volume(80)
+
+        ctrl.addWidget(vol_container)
 
         main_col.addLayout(ctrl)
         outer.addLayout(main_col, stretch=1)
