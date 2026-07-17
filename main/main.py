@@ -600,16 +600,16 @@ class PlayerController(QObject):
 # ============================================================================
 class LockButton(QToolButton):
     """
-    Pencil-icon edit indicator.
+    Pen/edit icon indicator.
 
-    Green pencil  =  locked / safe  - cannot be changed accidentally.
-    Red pencil    =  unlocked / editing - an important change is now possible.
+    Green pen  =  locked / safe  - cannot be changed accidentally.
+    Red pen    =  unlocked / editing - an important change is now possible.
 
     Clicking toggles between the two states.
     """
     toggledLock = Signal(bool)   # True = now unlocked
 
-    _PENCIL = "\u270F"   # pencil character
+    _PENCIL = "\U0001F58A"   # 🖊  PEN (standard edit icon)
 
     _CSS_LOCKED = (
         "QToolButton{"
@@ -1335,7 +1335,7 @@ class MainWindow(QMainWindow):
     def _build_table(self) -> QWidget:
         self.table = QTableWidget(0, COL_COUNT)
         self.table.setHorizontalHeaderLabels(
-            ["Title", "Artist", "Category", "", "Rating", ""])
+            ["Title", "Artist", "Category", "Edit", "Rating", "Edit"])
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
@@ -1872,8 +1872,8 @@ class MainWindow(QMainWindow):
 
         # ── Category lock ──
         cat_lock = LockButton(
-            "Locked: cannot change category. Click to unlock.",
-            "Unlocked: changing category will MOVE the file.")
+            "Green pen: category is protected. Click to allow editing.",
+            "Red pen: editing active. Select a new category to move the file.")
         cat_lock.toggledLock.connect(lambda unlocked, c=combo: c.setEnabled(unlocked))
         self.table.setCellWidget(row, COL_CATEGORY_LOCK, _centered(cat_lock))
 
@@ -1889,10 +1889,10 @@ class MainWindow(QMainWindow):
         star_lay.addStretch()
         self.table.setCellWidget(row, COL_RATING, star_wrapper)
 
-        # ── Rating pencil lock ──
+        # ── Rating edit lock ──
         rat_lock = LockButton(
-            "Green pencil: rating is protected. Click to allow editing.",
-            "Red pencil: rating editing is active. Click a star to rate."
+            "Green pen: rating is protected. Click to allow editing.",
+            "Red pen: editing active. Click a star to set the rating."
         )
         rat_lock.toggledLock.connect(lambda unlocked, sw=star: sw.set_editable(unlocked))
         self.table.setCellWidget(row, COL_RATING_LOCK, _centered(rat_lock))
