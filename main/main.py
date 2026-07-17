@@ -600,51 +600,37 @@ class PlayerController(QObject):
 # ============================================================================
 class LockButton(QToolButton):
     """
-    Text-badge lock indicator. No icon, no color fill — purely typographic.
+    Pencil-icon edit indicator.
 
-    SAFE state (locked):
-        Shows the word  « SAFE »  in a very subtle, low-contrast style.
-        Message: "everything is protected, nothing can change by accident."
-
-    EDIT state (unlocked):
-        Shows the word  « EDIT »  in an amber/orange outlined pill.
-        Message: "attention — you are now able to make a change."
+    Green pencil  =  locked / safe  - cannot be changed accidentally.
+    Red pencil    =  unlocked / editing - an important change is now possible.
 
     Clicking toggles between the two states.
     """
     toggledLock = Signal(bool)   # True = now unlocked
 
-    _CSS_SAFE = (
+    _PENCIL = "\u270F"   # pencil character
+
+    _CSS_LOCKED = (
         "QToolButton{"
-        "  background: rgba(255,255,255,0.05);"
-        "  border: 1px solid rgba(255,255,255,0.10);"
-        "  border-radius: 4px;"
-        "  color: #48484a;"          # very muted — not calling attention
-        "  font-size: 9px;"
-        "  font-weight: 700;"
-        "  letter-spacing: 0.5px;"
-        "  padding: 0px 3px;"
+        "  background: transparent;"
+        "  border: none;"
+        "  color: #30D158;"
+        "  font-size: 14px;"
+        "  padding: 0px;"
         "}"
-        "QToolButton:hover{"
-        "  border-color: rgba(255,255,255,0.20);"
-        "  color: #6e6e73;"
-        "}"
+        "QToolButton:hover{ color: #4dde70; }"
     )
 
-    _CSS_EDIT = (
+    _CSS_UNLOCKED = (
         "QToolButton{"
-        "  background: rgba(255,159,10,0.12);"   # amber tint
-        "  border: 1.5px solid #FF9F0A;"          # amber outline
-        "  border-radius: 4px;"
-        "  color: #FF9F0A;"
-        "  font-size: 9px;"
-        "  font-weight: 700;"
-        "  letter-spacing: 0.5px;"
-        "  padding: 0px 3px;"
+        "  background: transparent;"
+        "  border: none;"
+        "  color: #FF453A;"
+        "  font-size: 14px;"
+        "  padding: 0px;"
         "}"
-        "QToolButton:hover{"
-        "  background: rgba(255,159,10,0.22);"
-        "}"
+        "QToolButton:hover{ color: #ff6961; }"
     )
 
     def __init__(self, tip_locked: str, tip_unlocked: str, parent=None):
@@ -653,7 +639,7 @@ class LockButton(QToolButton):
         self._tip_locked   = tip_locked
         self._tip_unlocked = tip_unlocked
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(38, 18)
+        self.setFixedSize(22, 22)
         self.clicked.connect(self._toggle)
         self._refresh()
 
@@ -672,19 +658,16 @@ class LockButton(QToolButton):
         self.toggledLock.emit(not self._locked)
 
     def _refresh(self):
+        self.setText(self._PENCIL)
         if self._locked:
-            self.setText("SAFE")
             self.setToolTip(self._tip_locked)
-            self.setStyleSheet(self._CSS_SAFE)
+            self.setStyleSheet(self._CSS_LOCKED)
         else:
-            self.setText("EDIT")
             self.setToolTip(self._tip_unlocked)
-            self.setStyleSheet(self._CSS_EDIT)
+            self.setStyleSheet(self._CSS_UNLOCKED)
 
 
-# ============================================================================
-# StarRatingWidget
-# ============================================================================
+
 class StarRatingWidget(QWidget):
     """
     5 stars always visible:
@@ -1187,7 +1170,8 @@ COL_ARTIST        = 1
 COL_CATEGORY      = 2
 COL_CATEGORY_LOCK = 3
 COL_RATING        = 4
-COL_COUNT         = 5
+COL_RATING_LOCK   = 5
+COL_COUNT         = 6
 
 ROW_HEIGHT = 38   # px – fits 20px lock icons with comfortable padding
 
@@ -1351,7 +1335,7 @@ class MainWindow(QMainWindow):
     def _build_table(self) -> QWidget:
         self.table = QTableWidget(0, COL_COUNT)
         self.table.setHorizontalHeaderLabels(
-            ["Title", "Artist", "Category", "", "Rating  ★"])
+            ["Title", "Artist", "Category", "", "Rating", ""])
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
@@ -1364,6 +1348,7 @@ class MainWindow(QMainWindow):
         h.setSectionResizeMode(COL_CATEGORY,      QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_CATEGORY_LOCK, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_RATING,        QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(COL_RATING_LOCK,   QHeaderView.ResizeToContents)
         self.table.doubleClicked.connect(self._on_double_click)
         return self.table
 
@@ -1892,21 +1877,28 @@ class MainWindow(QMainWindow):
         cat_lock.toggledLock.connect(lambda unlocked, c=combo: c.setEnabled(unlocked))
         self.table.setCellWidget(row, COL_CATEGORY_LOCK, _centered(cat_lock))
 
-        # ── Star rating (always directly clickable – no lock) ──
-        # Stars are always editable. Clicking a star immediately writes
-        # the rating into the audio file and shows a confirmation toast.
+        # ── Star rating — locked by default, pencil unlocks editing ──
         star_wrapper = QWidget()
         star_lay = QHBoxLayout(star_wrapper)
-        star_lay.setContentsMargins(4, 0, 16, 0)   # 16 px right padding before scrollbar
+        star_lay.setContentsMargins(4, 0, 4, 0)
         star_lay.setSpacing(0)
         star = StarRatingWidget(song.rating)
-        star.set_editable(True)   # always editable, no lock needed
+        star.set_editable(False)   # locked by default
         star.ratingChanged.connect(lambda nr, s=song, sw=star: self._on_rating(s, sw, nr))
         star_lay.addWidget(star)
         star_lay.addStretch()
         self.table.setCellWidget(row, COL_RATING, star_wrapper)
 
+        # ── Rating pencil lock ──
+        rat_lock = LockButton(
+            "Green pencil: rating is protected. Click to allow editing.",
+            "Red pencil: rating editing is active. Click a star to rate."
+        )
+        rat_lock.toggledLock.connect(lambda unlocked, sw=star: sw.set_editable(unlocked))
+        self.table.setCellWidget(row, COL_RATING_LOCK, _centered(rat_lock))
+
         combo.setProperty("lock_ref", cat_lock)
+        star.setProperty("lock_ref", rat_lock)
 
         self.table.setRowHidden(row, not self._matches(song))
 
@@ -1993,6 +1985,12 @@ class MainWindow(QMainWindow):
             if self.root_path: save_cache(self.root_path, self.cache)
         except OSError:
             pass
+
+        # Auto re-lock the rating pencil after saving
+        lock: LockButton = star_widget.property("lock_ref")
+        if lock:
+            lock.set_locked(True)
+        star_widget.set_editable(False)
 
         # Re-evaluate row visibility (rating filter may now hide/show this song)
         item = self.row_items.get(song.id)
