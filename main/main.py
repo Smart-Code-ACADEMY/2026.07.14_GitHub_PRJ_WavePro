@@ -1106,10 +1106,16 @@ QComboBox QAbstractItemView {
     background:#2c2c2e; border:1px solid #3a3a3c;
     selection-background-color:#0a84ff; color:#f2f2f7; outline:none; }
 
-QScrollBar:vertical { background:transparent; width:10px; }
-QScrollBar::handle:vertical { background:#48484a; border-radius:5px; min-height:24px; }
-QScrollBar::handle:vertical:hover { background:#5a5a5e; }
+QScrollBar:vertical {
+    background: transparent; width: 8px; margin: 2px 2px 2px 0;
+}
+QScrollBar::handle:vertical {
+    background: #3a3a3c; border-radius: 4px; min-height: 28px;
+}
+QScrollBar::handle:vertical:hover   { background: #58585c; }
+QScrollBar::handle:vertical:pressed  { background: #6e6e73; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }
 
 QSlider::groove:horizontal { height:4px; background:#3a3a3c; border-radius:2px; }
 QSlider::sub-page:horizontal { background:#0a84ff; border-radius:2px; }
@@ -1223,7 +1229,6 @@ class MainWindow(QMainWindow):
 
         self.scan_worker: Optional[ScanWorker] = None
         self.pending_rescan = False
-        self.loading_dialog: Optional[LoadingDialog] = None
         self.last_added:   List[str] = []
         self.last_removed: List[str] = []
 
@@ -1262,7 +1267,7 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # ── Main bar row ──────────────────────────────────────────────
+        # Main bar row
         bar = QFrame(); bar.setObjectName("topBarInner")
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(14, 8, 14, 8); lay.setSpacing(10)
@@ -1271,79 +1276,111 @@ class MainWindow(QMainWindow):
         title.setObjectName("sectionTitle")
         lay.addWidget(title)
 
-        # Compact path button — click to see/change the folder
         self.path_btn = QPushButton("No folder")
         self.path_btn.setObjectName("pathBtn")
         self.path_btn.setToolTip("Click to change the music folder")
         self.path_btn.setCursor(Qt.PointingHandCursor)
-        self.path_btn.setMaximumWidth(280)
+        self.path_btn.setMaximumWidth(260)
         self.path_btn.clicked.connect(self._choose_folder)
         lay.addWidget(self.path_btn)
 
-        # Inline status (song count / loading progress)
-        self.status_label = QLabel("")
-        self.status_label.setObjectName("statusLabel")
-        lay.addWidget(self.status_label)
-
-        # Changes badge (hidden until there are changes)
-        self.changes_btn = QPushButton("View changes")
-        self.changes_btn.setEnabled(False)
-        self.changes_btn.setVisible(False)
-        self.changes_btn.clicked.connect(self._show_changes)
-        lay.addWidget(self.changes_btn)
-
         lay.addStretch()
 
-        refresh_btn = QPushButton("↺  Refresh")
+        refresh_btn = QPushButton("\u21BA  Refresh")
         refresh_btn.clicked.connect(self._start_scan)
         lay.addWidget(refresh_btn)
 
         outer.addWidget(bar)
 
-        # ── Toast strip (slides in below the bar for a few seconds) ──
-        self.toast_bar = QFrame()
-        self.toast_bar.setObjectName("toastBar")
-        self.toast_bar.setVisible(False)
-        self.toast_bar.setFixedHeight(32)
-        toast_lay = QHBoxLayout(self.toast_bar)
-        toast_lay.setContentsMargins(16, 0, 16, 0)
-        self.toast_label = QLabel("")
-        self.toast_label.setObjectName("toastLabel")
-        toast_lay.addWidget(self.toast_label)
-        toast_lay.addStretch()
-        toast_close = QToolButton()
-        toast_close.setText("✕")
-        toast_close.setStyleSheet(
-            "QToolButton{background:transparent;border:none;color:#8e8e93;font-size:11px;}"
-            "QToolButton:hover{color:#f2f2f7;}")
-        toast_close.clicked.connect(lambda: self.toast_bar.setVisible(False))
-        toast_lay.addWidget(toast_close)
-        outer.addWidget(self.toast_bar)
+        # Permanent status strip — always visible, never a popup.
+        # This is the single place where ALL status info appears:
+        # loading progress, confirmations, warnings, errors.
+        self.info_bar = QFrame()
+        self.info_bar.setObjectName("infoBar")
+        self.info_bar.setFixedHeight(32)
+        info_lay = QHBoxLayout(self.info_bar)
+        info_lay.setContentsMargins(16, 0, 16, 0)
+        info_lay.setSpacing(10)
 
-        # Timer to auto-hide the toast
-        self._toast_timer = QTimer(self)
-        self._toast_timer.setSingleShot(True)
-        self._toast_timer.timeout.connect(lambda: self.toast_bar.setVisible(False))
+        self.status_dot = QLabel("\u25CF")
+        self.status_dot.setFixedWidth(12)
+        self.status_dot.setAlignment(Qt.AlignCenter)
+        self.status_dot.setStyleSheet("color:#48484a;font-size:8px;")
+        info_lay.addWidget(self.status_dot)
+
+        self.status_label = QLabel("Ready")
+        self.status_label.setObjectName("statusLabel")
+        info_lay.addWidget(self.status_label, stretch=1)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setFixedWidth(180)
+        self.progress_bar.setFixedHeight(5)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setVisible(False)
+        info_lay.addWidget(self.progress_bar)
+
+        self.song_count_label = QLabel("")
+        self.song_count_label.setObjectName("subtleLabel")
+        self.song_count_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        info_lay.addWidget(self.song_count_label)
+
+        self.changes_btn = QPushButton("View changes")
+        self.changes_btn.setEnabled(False)
+        self.changes_btn.setVisible(False)
+        self.changes_btn.clicked.connect(self._show_changes)
+        info_lay.addWidget(self.changes_btn)
+
+        outer.addWidget(self.info_bar)
+
+        self._status_reset_timer = QTimer(self)
+        self._status_reset_timer.setSingleShot(True)
+        self._status_reset_timer.timeout.connect(self._reset_status_style)
 
         return wrapper
 
-    def _show_toast(self, message: str, duration_ms: int = 3500,
-                    kind: str = "info"):
-        """Show an inline toast notification below the top bar."""
-        colors = {
-            "info":    ("#1a3a5c", "#0a84ff"),
-            "success": ("#1a3a2c", "#30D158"),
-            "warning": ("#3a2c1a", "#FF9F0A"),
-            "error":   ("#3a1a1a", "#FF453A"),
-        }
-        bg, fg = colors.get(kind, colors["info"])
-        self.toast_bar.setStyleSheet(
-            f"QFrame#toastBar{{background:{bg};border-bottom:1px solid {fg}44;}}")
-        self.toast_label.setStyleSheet(f"color:{fg};font-size:12px;font-weight:500;")
-        self.toast_label.setText(message)
-        self.toast_bar.setVisible(True)
-        self._toast_timer.start(duration_ms)
+    _STATUS_COLORS = {
+        "idle":    ("#48484a", "#8e8e93"),
+        "loading": ("#0a84ff", "#c7c7cc"),
+        "success": ("#30D158", "#d1fae5"),
+        "warning": ("#FF9F0A", "#ffe5b0"),
+        "error":   ("#FF453A", "#ffd0ce"),
+    }
 
+    def _set_info(self, message: str, kind: str = "idle",
+                  auto_reset: bool = True, duration_ms: int = 4000):
+        dot_color, text_color = self._STATUS_COLORS.get(kind, self._STATUS_COLORS["idle"])
+        self.status_dot.setStyleSheet(f"color:{dot_color};font-size:8px;")
+        self.status_label.setStyleSheet(f"color:{text_color};font-size:12px;")
+        self.status_label.setText(message)
+        bg_map = {
+            "idle":    "#232325", "loading": "#1c2535",
+            "success": "#0d2a1a", "warning": "#2a1e0a", "error": "#2a0f0f",
+        }
+        self.info_bar.setStyleSheet(
+            f"QFrame#infoBar{{background:{bg_map.get(kind,'#232325')};"
+            f"border-bottom:1px solid {dot_color}33;}}")
+        if auto_reset and kind not in ("idle", "loading"):
+            self._status_reset_timer.start(duration_ms)
+
+    def _reset_status_style(self):
+        n = len(self.songs_by_id)
+        txt = f"{n} songs  \u2022  Up to date" if n else "Ready"
+        self._set_info(txt, "idle", auto_reset=False)
+        self.song_count_label.setText(f"{n} songs" if n else "")
+
+    def _show_toast(self, message: str, duration_ms: int = 3500, kind: str = "info"):
+        kind_map = {"info": "idle", "success": "success",
+                    "warning": "warning", "error": "error"}
+        self._set_info(message, kind_map.get(kind, "idle"),
+                       auto_reset=True, duration_ms=duration_ms)
+
+    def _set_status(self, txt: str):
+        """Legacy helper — routes to _set_info."""
+        if "Loading" in txt or "Importing" in txt or "Checking" in txt:
+            self._set_info(txt, "loading", auto_reset=False)
+        else:
+            self._set_info(txt, "idle", auto_reset=False)
 
 
     # ── filter bar (Excel-style) ──────────────────────────────────────
@@ -1760,24 +1797,18 @@ class MainWindow(QMainWindow):
         self._apply_filters()
 
     def _on_total(self, total: int):
-        # Always open the loading dialog so the user always gets feedback,
-        # whether songs come from cache (fast) or disk (slow).
-        if not self.loading_dialog:
-            self.loading_dialog = LoadingDialog(self)
-        self.loading_dialog.update_progress(0, total, None, "")
-        self.loading_dialog.show()
-        self.loading_dialog.raise_()
-        self.loading_dialog.activateWindow()
-        self._set_status(f"Loading 0 / {total} songs…")
+        self.progress_bar.setRange(0, max(1, total))
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self._set_info(f"Loading  0 / {total} songs…", "loading", auto_reset=False)
 
     def _on_progress(self, done: int, total: int, eta: Optional[float], name: str):
-        if self.loading_dialog:
-            self.loading_dialog.update_progress(done, total, eta, name)
+        self.progress_bar.setValue(done)
         pct   = int(done / total * 100) if total else 100
-        eta_t = f" – ETA {_fmt_time(int(eta * 1000))}" if eta else ""
-        self._set_status(f"Loading {done} / {total} songs  ({pct}%){eta_t}")
-        # Rebuild category filter every 50 songs so the filter dropdown
-        # stays up to date while songs stream in
+        eta_t = f"  –  ETA {_fmt_time(int(eta * 1000))}" if eta else ""
+        self._set_info(
+            f"Loading  {done} / {total} songs  ({pct}%){eta_t}",
+            "loading", auto_reset=False)
         if done % 50 == 0:
             self._rebuild_cat_filter()
 
@@ -1790,17 +1821,20 @@ class MainWindow(QMainWindow):
         self._rebuild_cat_filter()
 
     def _on_scan_error(self, msg: str):
-        if self.loading_dialog: self.loading_dialog.close(); self.loading_dialog = None
-        self._show_toast(f"Scan error: {msg}", 8000, "error")
-        self._set_status("Error")
+        self.progress_bar.setVisible(False)
+        self._set_info(f"Scan error: {msg}", "error", duration_ms=8000)
+        self.progress_bar.setVisible(False)
 
     def _on_finished(self, added: List[str], removed: List[str],
                      moved: int, w: ScanWorker):
-        if self.loading_dialog: self.loading_dialog.close(); self.loading_dialog = None
+        self.progress_bar.setVisible(False)
         self.cache = w.new_cache
         if self.root_path: save_cache(self.root_path, self.cache)
         self._rebuild_cat_filter()
-        self._set_status(f"{len(self.songs_by_id)} songs \u2022 Up to date")
+        n = len(self.songs_by_id)
+        self.song_count_label.setText(f"{n} songs")
+        self._set_info(f"{n} songs  \u2022  Up to date", "success",
+                       auto_reset=True, duration_ms=3000)
         if added or removed:
             self.last_added = added; self.last_removed = removed
             self.changes_btn.setEnabled(True)
@@ -1810,10 +1844,8 @@ class MainWindow(QMainWindow):
             if n_add: parts.append(f"+{n_add} added")
             if n_rem: parts.append(f"-{n_rem} removed")
             if moved:  parts.append(f"{moved} moved")
-            self._show_toast("Library changed: " + ",  ".join(parts), 5000, "info")
-
-    def _set_status(self, txt: str):
-        self.status_label.setText(txt)
+            self._set_info("Library changed: " + ",  ".join(parts),
+                           "warning", auto_reset=True, duration_ms=5000)
 
     def _show_changes(self):
         lines = []
