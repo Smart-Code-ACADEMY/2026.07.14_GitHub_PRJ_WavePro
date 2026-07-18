@@ -600,23 +600,28 @@ class PlayerController(QObject):
 # ============================================================================
 class LockButton(QToolButton):
     """
-    Pen/edit icon indicator.
+    Minimal edit-permission indicator.
 
-    Green pen  =  locked / safe  - cannot be changed accidentally.
-    Red pen    =  unlocked / editing - an important change is now possible.
+    Green  =  locked / safe.   Shows a small pen icon in green.
+              Nothing can be changed by accident.
 
-    Clicking toggles between the two states.
+    Red    =  unlocked / editing.  Same pen in red.
+              Attention: an important change is now possible.
+
+    Uses a simple pen glyph (✒ U+2712) which is clean, universally
+    recognised as "edit", and renders crisply at small sizes.
     """
     toggledLock = Signal(bool)   # True = now unlocked
 
-    _PENCIL = "\U0001F58A"   # 🖊  PEN (standard edit icon)
+    # ✒  BLACK NIB — clean, minimal, universally understood as "edit"
+    _ICON = "\u2712"
 
     _CSS_LOCKED = (
         "QToolButton{"
         "  background: transparent;"
         "  border: none;"
-        "  color: #30D158;"
-        "  font-size: 14px;"
+        "  color: #30D158;"          # green = safe
+        "  font-size: 13px;"
         "  padding: 0px;"
         "}"
         "QToolButton:hover{ color: #4dde70; }"
@@ -626,8 +631,8 @@ class LockButton(QToolButton):
         "QToolButton{"
         "  background: transparent;"
         "  border: none;"
-        "  color: #FF453A;"
-        "  font-size: 14px;"
+        "  color: #FF453A;"          # red = attention / editing active
+        "  font-size: 13px;"
         "  padding: 0px;"
         "}"
         "QToolButton:hover{ color: #ff6961; }"
@@ -639,7 +644,7 @@ class LockButton(QToolButton):
         self._tip_locked   = tip_locked
         self._tip_unlocked = tip_unlocked
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(22, 22)
+        self.setFixedSize(20, 20)
         self.clicked.connect(self._toggle)
         self._refresh()
 
@@ -658,14 +663,13 @@ class LockButton(QToolButton):
         self.toggledLock.emit(not self._locked)
 
     def _refresh(self):
-        self.setText(self._PENCIL)
+        self.setText(self._ICON)
         if self._locked:
             self.setToolTip(self._tip_locked)
             self.setStyleSheet(self._CSS_LOCKED)
         else:
             self.setToolTip(self._tip_unlocked)
             self.setStyleSheet(self._CSS_UNLOCKED)
-
 
 
 class StarRatingWidget(QWidget):
@@ -1137,6 +1141,25 @@ QPushButton#starBtn:disabled { background: transparent; color: #8e8e93; }
 
 QFrame#playerBar { background:#232325; border-top:1px solid #2c2c2e; }
 
+/* Path button in top bar */
+QPushButton#pathBtn {
+    background: rgba(10,132,255,0.10);
+    border: 1px solid rgba(10,132,255,0.30);
+    border-radius: 8px;
+    color: #0a84ff;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 4px 10px;
+    text-align: left;
+}
+QPushButton#pathBtn:hover {
+    background: rgba(10,132,255,0.20);
+    border-color: #0a84ff;
+}
+
+/* Toast strip */
+QLabel#toastLabel { font-size: 12px; font-weight: 500; }
+
 QToolTip { background:#3a3a3c; color:#f2f2f7; border:1px solid #48484a;
            padding:4px 8px; border-radius:6px; }
 QMessageBox { background:#2c2c2e; }
@@ -1152,10 +1175,10 @@ def _fmt_time(ms: int) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def _centered(widget: QWidget) -> QWidget:
+def _centered(widget: QWidget, right_pad: int = 8) -> QWidget:
     w = QWidget()
     lay = QHBoxLayout(w)
-    lay.setContentsMargins(8, 0, 8, 0)
+    lay.setContentsMargins(8, 0, right_pad, 0)
     lay.addStretch()
     lay.addWidget(widget)
     lay.addStretch()
@@ -1232,39 +1255,96 @@ class MainWindow(QMainWindow):
         vlay.addWidget(self._build_table(), stretch=1)
         vlay.addWidget(self._build_player_bar())
 
-    # ── top bar ──────────────────────────────────────────────────────
+    # ── top bar (compact, everything inline) ─────────────────────────
     def _build_top_bar(self) -> QWidget:
-        bar = QFrame(); bar.setObjectName("topBar")
-        lay = QHBoxLayout(bar)
-        lay.setContentsMargins(16, 10, 16, 10); lay.setSpacing(10)
+        wrapper = QWidget(); wrapper.setObjectName("topBar")
+        outer = QVBoxLayout(wrapper)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        title = QLabel("Music Library"); title.setObjectName("sectionTitle")
+        # ── Main bar row ──────────────────────────────────────────────
+        bar = QFrame(); bar.setObjectName("topBarInner")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(14, 8, 14, 8); lay.setSpacing(10)
+
+        title = QLabel("Music Library")
+        title.setObjectName("sectionTitle")
         lay.addWidget(title)
 
-        self.path_label = QLabel("No folder selected")
-        self.path_label.setObjectName("pathLabel")
-        lay.addWidget(self.path_label)
+        # Compact path button — click to see/change the folder
+        self.path_btn = QPushButton("No folder")
+        self.path_btn.setObjectName("pathBtn")
+        self.path_btn.setToolTip("Click to change the music folder")
+        self.path_btn.setCursor(Qt.PointingHandCursor)
+        self.path_btn.setMaximumWidth(280)
+        self.path_btn.clicked.connect(self._choose_folder)
+        lay.addWidget(self.path_btn)
 
+        # Inline status (song count / loading progress)
         self.status_label = QLabel("")
         self.status_label.setObjectName("statusLabel")
         lay.addWidget(self.status_label)
 
+        # Changes badge (hidden until there are changes)
         self.changes_btn = QPushButton("View changes")
         self.changes_btn.setEnabled(False)
+        self.changes_btn.setVisible(False)
         self.changes_btn.clicked.connect(self._show_changes)
         lay.addWidget(self.changes_btn)
 
         lay.addStretch()
 
-        refresh_btn = QPushButton("Refresh")
+        refresh_btn = QPushButton("↺  Refresh")
         refresh_btn.clicked.connect(self._start_scan)
         lay.addWidget(refresh_btn)
 
-        add_btn = QPushButton("Add Music Folder")
-        add_btn.setObjectName("accentButton")
-        add_btn.clicked.connect(self._choose_folder)
-        lay.addWidget(add_btn)
-        return bar
+        outer.addWidget(bar)
+
+        # ── Toast strip (slides in below the bar for a few seconds) ──
+        self.toast_bar = QFrame()
+        self.toast_bar.setObjectName("toastBar")
+        self.toast_bar.setVisible(False)
+        self.toast_bar.setFixedHeight(32)
+        toast_lay = QHBoxLayout(self.toast_bar)
+        toast_lay.setContentsMargins(16, 0, 16, 0)
+        self.toast_label = QLabel("")
+        self.toast_label.setObjectName("toastLabel")
+        toast_lay.addWidget(self.toast_label)
+        toast_lay.addStretch()
+        toast_close = QToolButton()
+        toast_close.setText("✕")
+        toast_close.setStyleSheet(
+            "QToolButton{background:transparent;border:none;color:#8e8e93;font-size:11px;}"
+            "QToolButton:hover{color:#f2f2f7;}")
+        toast_close.clicked.connect(lambda: self.toast_bar.setVisible(False))
+        toast_lay.addWidget(toast_close)
+        outer.addWidget(self.toast_bar)
+
+        # Timer to auto-hide the toast
+        self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(lambda: self.toast_bar.setVisible(False))
+
+        return wrapper
+
+    def _show_toast(self, message: str, duration_ms: int = 3500,
+                    kind: str = "info"):
+        """Show an inline toast notification below the top bar."""
+        colors = {
+            "info":    ("#1a3a5c", "#0a84ff"),
+            "success": ("#1a3a2c", "#30D158"),
+            "warning": ("#3a2c1a", "#FF9F0A"),
+            "error":   ("#3a1a1a", "#FF453A"),
+        }
+        bg, fg = colors.get(kind, colors["info"])
+        self.toast_bar.setStyleSheet(
+            f"QFrame#toastBar{{background:{bg};border-bottom:1px solid {fg}44;}}")
+        self.toast_label.setStyleSheet(f"color:{fg};font-size:12px;font-weight:500;")
+        self.toast_label.setText(message)
+        self.toast_bar.setVisible(True)
+        self._toast_timer.start(duration_ms)
+
+
 
     # ── filter bar (Excel-style) ──────────────────────────────────────
     def _build_filter_bar(self) -> QWidget:
@@ -1626,7 +1706,9 @@ class MainWindow(QMainWindow):
         if self.watcher.directories():
             self.watcher.removePaths(self.watcher.directories())
         self.root_path = path
-        self.path_label.setText(str(path))
+        # Show only the folder name on the button, full path in tooltip
+        self.path_btn.setText(f"📁  {path.name}")
+        self.path_btn.setToolTip(str(path))
         self.settings.setValue("root_path", str(path))
 
         self.table.setRowCount(0)
@@ -1709,7 +1791,7 @@ class MainWindow(QMainWindow):
 
     def _on_scan_error(self, msg: str):
         if self.loading_dialog: self.loading_dialog.close(); self.loading_dialog = None
-        self.statusBar().showMessage(f"Scan error: {msg}", 6000)
+        self._show_toast(f"Scan error: {msg}", 8000, "error")
         self._set_status("Error")
 
     def _on_finished(self, added: List[str], removed: List[str],
@@ -1722,9 +1804,13 @@ class MainWindow(QMainWindow):
         if added or removed:
             self.last_added = added; self.last_removed = removed
             self.changes_btn.setEnabled(True)
-            self.statusBar().showMessage(
-                f"Library changed: +{len(added)} added, -{len(removed)} removed"
-                + (f" ({moved} moved)" if moved else ""), 6000)
+            self.changes_btn.setVisible(True)
+            n_add, n_rem = len(added), len(removed)
+            parts = []
+            if n_add: parts.append(f"+{n_add} added")
+            if n_rem: parts.append(f"-{n_rem} removed")
+            if moved:  parts.append(f"{moved} moved")
+            self._show_toast("Library changed: " + ",  ".join(parts), 5000, "info")
 
     def _set_status(self, txt: str):
         self.status_label.setText(txt)
@@ -1744,6 +1830,8 @@ class MainWindow(QMainWindow):
                 lines.append(f"  … and {len(self.last_removed)-50} more")
         if not lines: lines.append("No recent additions or removals.")
         QMessageBox.information(self, "Recent library changes", "\n".join(lines))
+        self.changes_btn.setVisible(False)
+        self.changes_btn.setEnabled(False)
 
     # ------------------------------------------------------------------
     # Category filter dropdown
@@ -1821,8 +1909,7 @@ class MainWindow(QMainWindow):
     def _play_filtered(self):
         songs = self._filtered_songs()
         if not songs:
-            QMessageBox.information(self, "Nothing to play",
-                                    "No songs match the current filter selection.")
+            self._show_toast("No songs match the current filter selection.", 3000, "warning")
             return
         self.player.play_song(songs[0], queue=songs)
 
@@ -1895,7 +1982,7 @@ class MainWindow(QMainWindow):
             "Red pen: editing active. Click a star to set the rating."
         )
         rat_lock.toggledLock.connect(lambda unlocked, sw=star: sw.set_editable(unlocked))
-        self.table.setCellWidget(row, COL_RATING_LOCK, _centered(rat_lock))
+        self.table.setCellWidget(row, COL_RATING_LOCK, _centered(rat_lock, right_pad=14))
 
         combo.setProperty("lock_ref", cat_lock)
         star.setProperty("lock_ref", rat_lock)
@@ -1927,8 +2014,7 @@ class MainWindow(QMainWindow):
     def _on_cat_combo(self, song: Song, combo: QComboBox, new_cat: str):
         if new_cat == song.category or not combo.isEnabled(): return
         if self.player.current_song() is song and self.player.is_playing():
-            QMessageBox.warning(self, "Playback in progress",
-                                "Pause the song first before moving it to another category.")
+            self._show_toast("Pause the song first before moving it to another category.", 3500, "warning")
             combo.blockSignals(True); combo.setCurrentText(song.category); combo.blockSignals(False)
             return
 
@@ -1936,8 +2022,7 @@ class MainWindow(QMainWindow):
         try:
             new_path = safe_move_song(song, self.root_path, new_cat)
         except SafeMoveError as e:
-            QMessageBox.critical(self, "Move failed",
-                                 f"Could not safely move the file:\n{e}\n\nOriginal was NOT modified.")
+            self._show_toast(f"Move failed: {e}  —  Original was NOT modified.", 6000, "error")
             combo.blockSignals(True); combo.setCurrentText(old_cat); combo.blockSignals(False)
             return
 
@@ -1959,17 +2044,16 @@ class MainWindow(QMainWindow):
         if lock: lock.set_locked(True)
         combo.setEnabled(False)
         self.table.setRowHidden(self.row_items[song.id].row(), not self._matches(song))
-        self.statusBar().showMessage(
-            f"'{song.title}' moved: {old_cat} → {new_cat}", 4000)
+        self._show_toast(f"✓  '{song.title}'  moved: {old_cat} → {new_cat}", 3500, "success")
 
     # ------------------------------------------------------------------
     # Rating change → write directly into the audio file
     # ------------------------------------------------------------------
     def _on_rating(self, song: Song, star_widget: "StarRatingWidget", new_rating: int):
         if not write_rating(song.path, new_rating):
-            QMessageBox.warning(self, "Rating not saved",
-                                f"Could not write rating into '{song.filename}'.\n"
-                                "The format may not support embedded ratings.")
+            self._show_toast(
+                f"Could not write rating into '{song.filename}' — format may not support it.",
+                5000, "error")
             return
         song.rating = new_rating
 
@@ -1986,7 +2070,7 @@ class MainWindow(QMainWindow):
         except OSError:
             pass
 
-        # Auto re-lock the rating pencil after saving
+        # Auto re-lock the rating pen after saving
         lock: LockButton = star_widget.property("lock_ref")
         if lock:
             lock.set_locked(True)
@@ -1997,13 +2081,14 @@ class MainWindow(QMainWindow):
         if item:
             self.table.setRowHidden(item.row(), not self._matches(song))
 
-        # Popup confirmation: rating saved directly into the file
+        # Inline toast — rating saved directly into the file
         stars = "★" * new_rating + "☆" * (5 - new_rating)
         if new_rating == 0:
-            msg = f"Rating removed for:\n{song.title}"
+            self._show_toast(f"Rating cleared  —  {song.title}", 3000, "info")
         else:
-            msg = f"Rating saved directly into file:\n{song.title}\n\n{stars}  ({new_rating}/5)"
-        QMessageBox.information(self, "Rating saved", msg)
+            self._show_toast(
+                f"✓  Rating saved into file:  {song.title}   {stars}  ({new_rating}/5)",
+                3500, "success")
 
 
 # ============================================================================
