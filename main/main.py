@@ -1275,13 +1275,11 @@ def _centered(widget: QWidget, right_pad: int = 8) -> QWidget:
 # ============================================================================
 COL_TITLE         = 0
 COL_TITLE_EDIT    = 1
-COL_ARTIST        = 2
-COL_ARTIST_EDIT   = 3
-COL_CATEGORY      = 4
-COL_CATEGORY_LOCK = 5
-COL_RATING        = 6
-COL_RATING_LOCK   = 7
-COL_COUNT         = 8
+COL_CATEGORY      = 2
+COL_CATEGORY_LOCK = 3
+COL_RATING        = 4
+COL_RATING_LOCK   = 5
+COL_COUNT         = 6
 
 ROW_HEIGHT = 38   # px – fits 20px lock icons with comfortable padding
 
@@ -1477,7 +1475,7 @@ class MainWindow(QMainWindow):
         search_icon = QLabel("🔍"); search_icon.setObjectName("subtleLabel")
         lay.addWidget(search_icon)
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search title or artist…")
+        self.search_box.setPlaceholderText("Search by title…")
         self.search_box.setFixedWidth(230)
         self.search_box.textChanged.connect(self._on_search_changed)
         lay.addWidget(self.search_box)
@@ -1557,7 +1555,7 @@ class MainWindow(QMainWindow):
     def _build_table(self) -> QWidget:
         self.table = QTableWidget(0, COL_COUNT)
         self.table.setHorizontalHeaderLabels(
-            ["Title", "Edit", "Artist", "Edit", "Category", "Edit", "Rating", "Edit"])
+            ["Title", "Edit", "Category", "Edit", "Rating", "Edit"])
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
@@ -1567,8 +1565,6 @@ class MainWindow(QMainWindow):
         h = self.table.horizontalHeader()
         h.setSectionResizeMode(COL_TITLE,         QHeaderView.Stretch)
         h.setSectionResizeMode(COL_TITLE_EDIT,    QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(COL_ARTIST,        QHeaderView.Stretch)
-        h.setSectionResizeMode(COL_ARTIST_EDIT,   QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_CATEGORY,      QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_CATEGORY_LOCK, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_RATING,        QHeaderView.ResizeToContents)
@@ -2047,8 +2043,7 @@ class MainWindow(QMainWindow):
         if self._filter_cat not in ("All", song.category):
             return False
         if self._filter_search and \
-                self._filter_search not in song.title.lower() and \
-                self._filter_search not in song.artist.lower():
+                self._filter_search not in song.title.lower():
             return False
         if self._filter_rating == -1 and song.rating != 0:
             return False   # "No rating" filter: only unrated songs
@@ -2088,8 +2083,6 @@ class MainWindow(QMainWindow):
         if item is not None:
             row = item.row()
             item.setText(song.title)
-            ai = self.table.item(row, COL_ARTIST)
-            if ai: ai.setText(song.artist)
             combo = self.table.cellWidget(row, COL_CATEGORY)
             if combo and combo.currentText() != song.category:
                 combo.blockSignals(True)
@@ -2110,8 +2103,7 @@ class MainWindow(QMainWindow):
 
         ti = QTableWidgetItem(song.title)
         ti.setData(Qt.UserRole, song.id)
-        self.table.setItem(row, COL_TITLE,  ti)
-        self.table.setItem(row, COL_ARTIST, QTableWidgetItem(song.artist))
+        self.table.setItem(row, COL_TITLE, ti)
         self.row_items[song.id] = ti
 
         # ── Title edit pen ──
@@ -2121,14 +2113,6 @@ class MainWindow(QMainWindow):
         title_lock.toggledLock.connect(
             lambda unlocked, s=song, lk=title_lock: self._on_title_edit_unlock(s, lk, unlocked))
         self.table.setCellWidget(row, COL_TITLE_EDIT, _centered(title_lock))
-
-        # ── Artist edit pen ──
-        artist_lock = LockButton(
-            "Green pen: artist is protected. Click to edit.",
-            "Red pen: artist editing active.")
-        artist_lock.toggledLock.connect(
-            lambda unlocked, s=song, lk=artist_lock: self._on_artist_edit_unlock(s, lk, unlocked))
-        self.table.setCellWidget(row, COL_ARTIST_EDIT, _centered(artist_lock))
 
         # ── Category combo ──
         cats = list_categories(self.root_path) if self.root_path else []
@@ -2197,12 +2181,34 @@ class MainWindow(QMainWindow):
     # Title / Artist inline editing
     # ------------------------------------------------------------------
     def _on_title_edit_unlock(self, song: Song, lock: "LockButton", unlocked: bool):
-        if not unlocked:
-            return
         item = self.row_items.get(song.id)
         if item is None:
             lock.set_locked(True); return
         row = item.row()
+
+        if not unlocked:
+            # Pen clicked back to green → close any open editor and commit
+            editor_widget = self.table.cellWidget(row, COL_TITLE)
+            if isinstance(editor_widget, QLineEdit):
+                new_title = editor_widget.text().strip() or song.title
+                self.table.removeCellWidget(row, COL_TITLE)
+                item.setText(new_title)
+                if new_title != song.title:
+                    old_path_str = str(song.path)
+                    ok, new_path = write_display_tags(song.path, new_title, song.artist)
+                    if ok:
+                        self.cache.pop(old_path_str, None)
+                        song.path  = new_path
+                        song.title = new_title
+                        self.player.notify_song_path_changed(song, new_path)
+                        self._sync_cache(song)
+                        self._set_info(f'\u2713  Title saved & file renamed: "{new_title}"', "success")
+                    else:
+                        item.setText(song.title)
+                        self._set_info("Could not rename file.", "error")
+            return
+
+        # Pen clicked to red → open inline editor
         editor = QLineEdit(song.title)
         editor.setObjectName("cellEditor")
         editor.selectAll()
@@ -2220,7 +2226,6 @@ class MainWindow(QMainWindow):
                 old_path_str = str(song.path)
                 ok, new_path = write_display_tags(song.path, new_title, song.artist)
                 if ok:
-                    # Update the song to point to the renamed file
                     self.cache.pop(old_path_str, None)
                     song.path  = new_path
                     song.title = new_title
@@ -2230,46 +2235,6 @@ class MainWindow(QMainWindow):
                 else:
                     item.setText(song.title)
                     self._set_info("Could not rename file.", "error")
-            lock.set_locked(True)
-
-        editor.returnPressed.connect(commit)
-        editor.editingFinished.connect(commit)
-
-    def _on_artist_edit_unlock(self, song: Song, lock: "LockButton", unlocked: bool):
-        if not unlocked:
-            return
-        item = self.row_items.get(song.id)
-        if item is None:
-            lock.set_locked(True); return
-        row = item.row()
-        artist_item = self.table.item(row, COL_ARTIST)
-        editor = QLineEdit(song.artist)
-        editor.setObjectName("cellEditor")
-        editor.selectAll()
-        self.table.setCellWidget(row, COL_ARTIST, editor)
-        editor.setFocus()
-        committed = [False]
-
-        def commit():
-            if committed[0]: return
-            committed[0] = True
-            new_artist = editor.text().strip()
-            self.table.removeCellWidget(row, COL_ARTIST)
-            if artist_item: artist_item.setText(new_artist)
-            if new_artist != song.artist:
-                ok, new_path = write_display_tags(song.path, song.title, new_artist)
-                if ok:
-                    if new_path != song.path:
-                        old_str = str(song.path)
-                        self.cache.pop(old_str, None)
-                        song.path = new_path
-                        self.player.notify_song_path_changed(song, new_path)
-                    song.artist = new_artist
-                    self._sync_cache(song)
-                    self._set_info(f'\u2713  Artist saved: "{new_artist}"', "success")
-                else:
-                    if artist_item: artist_item.setText(song.artist)
-                    self._set_info("Could not write artist to file.", "error")
             lock.set_locked(True)
 
         editor.returnPressed.connect(commit)
