@@ -57,33 +57,60 @@ SUPPORTED_EXTENSIONS = {".mp3",".flac",".ogg",".m4a",".mp4",".wav",".wma",".aac"
 
 
 def read_display_tags(path: Path) -> Tuple[str, str]:
-    title, artist = path.stem, ""
+    """
+    Title  = ALWAYS the physical filename (without extension).
+             This ensures the app always shows exactly what is on disk.
+             Renaming the file in the OS immediately changes the title.
+    Artist = from embedded audio tags (ID3 / Vorbis / MP4).
+    """
+    title  = path.stem   # always the physical filename
+    artist = ""
     try:
         audio = MutagenFile(path, easy=True)
         if audio and audio.tags:
-            t = audio.tags.get("title")
             a = audio.tags.get("artist")
-            if t: title  = t[0]
-            if a: artist = a[0]
+            if a:
+                artist = a[0]
     except Exception:
         pass
     return title, artist
 
 
-def write_display_tags(path: Path, title: str, artist: str) -> bool:
-    """Write title and artist directly into the audio file's tags. Returns True on success."""
+def write_display_tags(path: Path, title: str, artist: str) -> Tuple[bool, Path]:
+    """
+    Title  → physically RENAMES the file on disk (title = filename).
+    Artist → writes the artist tag into the audio file's metadata.
+
+    Returns (success, new_path). new_path may differ from the input path
+    if the file was renamed (title changed).
+    """
+    new_path = path
     try:
-        audio = MutagenFile(path, easy=True)
-        if audio is None:
-            return False
-        if audio.tags is None:
-            audio.add_tags()
-        audio.tags["title"]  = [title]
-        audio.tags["artist"] = [artist]
-        audio.save()
-        return True
+        # ── Rename file if title changed ──
+        current_stem = path.stem
+        if title and title != current_stem:
+            new_name = title + path.suffix
+            candidate = path.parent / new_name
+            # Avoid overwriting an existing file
+            if candidate.exists() and candidate.resolve() != path.resolve():
+                counter = 1
+                while candidate.exists():
+                    candidate = path.parent / f"{title} ({counter}){path.suffix}"
+                    counter += 1
+            os.rename(path, candidate)
+            new_path = candidate
+
+        # ── Write artist tag ──
+        audio = MutagenFile(new_path, easy=True)
+        if audio is not None:
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags["artist"] = [artist]
+            audio.save()
+
+        return True, new_path
     except Exception:
-        return False
+        return False, path
 
 
 def read_duration_seconds(path: Path) -> float:
@@ -2190,12 +2217,19 @@ class MainWindow(QMainWindow):
             self.table.removeCellWidget(row, COL_TITLE)
             item.setText(new_title)
             if new_title != song.title:
-                if write_display_tags(song.path, new_title, song.artist):
+                old_path_str = str(song.path)
+                ok, new_path = write_display_tags(song.path, new_title, song.artist)
+                if ok:
+                    # Update the song to point to the renamed file
+                    self.cache.pop(old_path_str, None)
+                    song.path  = new_path
                     song.title = new_title
+                    self.player.notify_song_path_changed(song, new_path)
                     self._sync_cache(song)
-                    self._set_info(f'\u2713  Title saved: "{new_title}"', "success")
+                    self._set_info(f'\u2713  Title saved & file renamed: "{new_title}"', "success")
                 else:
-                    self._set_info("Could not write title to file.", "error")
+                    item.setText(song.title)
+                    self._set_info("Could not rename file.", "error")
             lock.set_locked(True)
 
         editor.returnPressed.connect(commit)
@@ -2223,11 +2257,18 @@ class MainWindow(QMainWindow):
             self.table.removeCellWidget(row, COL_ARTIST)
             if artist_item: artist_item.setText(new_artist)
             if new_artist != song.artist:
-                if write_display_tags(song.path, song.title, new_artist):
+                ok, new_path = write_display_tags(song.path, song.title, new_artist)
+                if ok:
+                    if new_path != song.path:
+                        old_str = str(song.path)
+                        self.cache.pop(old_str, None)
+                        song.path = new_path
+                        self.player.notify_song_path_changed(song, new_path)
                     song.artist = new_artist
                     self._sync_cache(song)
                     self._set_info(f'\u2713  Artist saved: "{new_artist}"', "success")
                 else:
+                    if artist_item: artist_item.setText(song.artist)
                     self._set_info("Could not write artist to file.", "error")
             lock.set_locked(True)
 
