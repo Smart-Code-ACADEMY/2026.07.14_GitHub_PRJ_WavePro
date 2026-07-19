@@ -70,6 +70,22 @@ def read_display_tags(path: Path) -> Tuple[str, str]:
     return title, artist
 
 
+def write_display_tags(path: Path, title: str, artist: str) -> bool:
+    """Write title and artist directly into the audio file's tags. Returns True on success."""
+    try:
+        audio = MutagenFile(path, easy=True)
+        if audio is None:
+            return False
+        if audio.tags is None:
+            audio.add_tags()
+        audio.tags["title"]  = [title]
+        audio.tags["artist"] = [artist]
+        audio.save()
+        return True
+    except Exception:
+        return False
+
+
 def read_duration_seconds(path: Path) -> float:
     try:
         audio = MutagenFile(path)
@@ -383,28 +399,36 @@ class ScanWorker(QThread):
         start = time.monotonic()
         done  = 0
 
-        # ── Phase 1: cached songs (no tag reading, very fast) ──────────
+        # ── Phase 1: cached songs (no tag reading for most fields, very fast)
+        # IMPORTANT: title and artist are always re-read from the file, even
+        # for "unchanged" files. This guarantees the app always shows what is
+        # physically inside the audio file, regardless of whether the tags were
+        # changed externally (by another app, OS, etc.).
+        # Only rating and duration are taken from cache (they are either written
+        # by this app or rarely change externally).
         for p, _ in fast_items:
             cat, size, mtime = current[p]
-            # Was this a moved file? find original key if needed
             rec = old.get(p)
             if rec is None:
-                # moved: find original record
                 for old_p, new_p in moved_pairs:
                     if new_p == p:
-                        rec = old.get(old_p, {})
-                        break
+                        rec = old.get(old_p, {}); break
             if rec is None:
                 rec = {}
+            path_obj = Path(p)
+            # Always re-read title/artist from file
+            title, artist = read_display_tags(path_obj)
+            # Use cached rating and duration (reliable, expensive to re-read)
+            rating   = rec.get("rating", 0)
+            duration = rec.get("duration", 0.0)
             song = Song(
-                path=Path(p), category=cat,
-                title=rec.get("title", Path(p).stem),
-                artist=rec.get("artist", ""),
-                rating=rec.get("rating", 0),
-                duration=rec.get("duration", 0.0),
+                path=path_obj, category=cat,
+                title=title, artist=artist,
+                rating=rating, duration=duration,
                 id=rec.get("id") or uuid.uuid4().hex,
             )
-            new_cache[p] = {**rec, "size": size, "mtime": mtime, "id": song.id}
+            new_cache[p] = {**rec, "size": size, "mtime": mtime,
+                            "title": title, "artist": artist, "id": song.id}
             done += 1
             elapsed = time.monotonic() - start
             rate    = done / elapsed if elapsed > 0.001 else 0
@@ -1145,6 +1169,34 @@ QPushButton#starBtn {
 QPushButton#starBtn:hover  { background: rgba(255,255,255,0.08); border-radius:4px; }
 QPushButton#starBtn:disabled { background: transparent; color: #8e8e93; }
 
+/* Quick-filter toggle buttons (Collab / Cover) */
+QPushButton#quickFilterBtn {
+    background: #2c2c2e;
+    border: 1px solid #3a3a3c;
+    border-radius: 8px;
+    color: #8e8e93;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 0px 12px;
+}
+QPushButton#quickFilterBtn:hover { background: #3a3a3c; color: #f2f2f7; }
+QPushButton#quickFilterBtn:checked {
+    background: rgba(10,132,255,0.18);
+    border-color: #0a84ff;
+    color: #0a84ff;
+    font-weight: 600;
+}
+
+/* Inline cell editor */
+QLineEdit#cellEditor {
+    background: #1c1c1e;
+    border: 1px solid #0a84ff;
+    border-radius: 4px;
+    color: #f2f2f7;
+    font-size: 13px;
+    padding: 2px 6px;
+}
+
 QFrame#playerBar { background:#232325; border-top:1px solid #2c2c2e; }
 
 /* Path button in top bar */
@@ -1195,12 +1247,14 @@ def _centered(widget: QWidget, right_pad: int = 8) -> QWidget:
 # Column indices
 # ============================================================================
 COL_TITLE         = 0
-COL_ARTIST        = 1
-COL_CATEGORY      = 2
-COL_CATEGORY_LOCK = 3
-COL_RATING        = 4
-COL_RATING_LOCK   = 5
-COL_COUNT         = 6
+COL_TITLE_EDIT    = 1
+COL_ARTIST        = 2
+COL_ARTIST_EDIT   = 3
+COL_CATEGORY      = 4
+COL_CATEGORY_LOCK = 5
+COL_RATING        = 6
+COL_RATING_LOCK   = 7
+COL_COUNT         = 8
 
 ROW_HEIGHT = 38   # px – fits 20px lock icons with comfortable padding
 
@@ -1226,6 +1280,8 @@ class MainWindow(QMainWindow):
         self._filter_cat    = "All"
         self._filter_rating = 0      # 0 = show all
         self._filter_search = ""
+        self._filter_collab = False  # show only collab songs
+        self._filter_cover  = False  # show only cover songs
 
         self.scan_worker: Optional[ScanWorker] = None
         self.pending_rescan = False
@@ -1235,9 +1291,10 @@ class MainWindow(QMainWindow):
         self.player = PlayerController(self)
         self.watcher = QFileSystemWatcher(self)
         self.watcher.directoryChanged.connect(self._on_dir_changed)
+        self.watcher.fileChanged.connect(self._on_file_changed)
         self._rescan_timer = QTimer(self)
         self._rescan_timer.setSingleShot(True)
-        self._rescan_timer.setInterval(500)
+        self._rescan_timer.setInterval(600)
         self._rescan_timer.timeout.connect(self._start_scan)
 
         self._build_ui()
@@ -1433,6 +1490,27 @@ class MainWindow(QMainWindow):
 
         lay.addSpacing(16)
 
+        # ── Quick-filter toggle buttons: Collab / Cover ───────────────
+        def _toggle_btn(label: str, tooltip: str) -> QPushButton:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setToolTip(tooltip)
+            btn.setObjectName("quickFilterBtn")
+            btn.setFixedHeight(28)
+            return btn
+
+        self.collab_btn = _toggle_btn(
+            "Collab", "Show only songs whose title contains 'collab' (case-insensitive)")
+        self.collab_btn.toggled.connect(self._on_collab_toggled)
+        lay.addWidget(self.collab_btn)
+
+        self.cover_btn = _toggle_btn(
+            "Cover", "Show only songs whose title contains 'cover' (case-insensitive)")
+        self.cover_btn.toggled.connect(self._on_cover_toggled)
+        lay.addWidget(self.cover_btn)
+
+        lay.addSpacing(16)
+
         # ── Play filtered button ──────────────────────────────────────
         self.play_filtered_btn = QPushButton("▶  Play Filtered")
         self.play_filtered_btn.setObjectName("playFilteredButton")
@@ -1452,7 +1530,7 @@ class MainWindow(QMainWindow):
     def _build_table(self) -> QWidget:
         self.table = QTableWidget(0, COL_COUNT)
         self.table.setHorizontalHeaderLabels(
-            ["Title", "Artist", "Category", "Edit", "Rating", "Edit"])
+            ["Title", "Edit", "Artist", "Edit", "Category", "Edit", "Rating", "Edit"])
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
@@ -1461,7 +1539,9 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
         h = self.table.horizontalHeader()
         h.setSectionResizeMode(COL_TITLE,         QHeaderView.Stretch)
+        h.setSectionResizeMode(COL_TITLE_EDIT,    QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_ARTIST,        QHeaderView.Stretch)
+        h.setSectionResizeMode(COL_ARTIST_EDIT,   QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_CATEGORY,      QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_CATEGORY_LOCK, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_RATING,        QHeaderView.ResizeToContents)
@@ -1762,6 +1842,15 @@ class MainWindow(QMainWindow):
     def _on_dir_changed(self, _: str):
         self._rescan_timer.start()
 
+    def _on_file_changed(self, changed_path: str):
+        """Called when an individual audio file changes on disk.
+        Re-adds it to the watcher (some OS remove it after a change)
+        and triggers a rescan so tags are refreshed."""
+        # Re-watch the file (some filesystems stop watching after a modify)
+        if Path(changed_path).exists():
+            self.watcher.addPath(changed_path)
+        self._rescan_timer.start()
+
     # ------------------------------------------------------------------
     # Background scanning
     # ------------------------------------------------------------------
@@ -1795,6 +1884,9 @@ class MainWindow(QMainWindow):
     def _on_song_ready(self, song: Song):
         self._add_or_update(song)
         self._apply_filters()
+        # Watch individual file — any external change (tag edit, rename)
+        # will fire directoryChanged or fileChanged and trigger a rescan
+        self.watcher.addPath(str(song.path))
 
     def _on_total(self, total: int):
         self.progress_bar.setRange(0, max(1, total))
@@ -1898,6 +1990,14 @@ class MainWindow(QMainWindow):
         self._filter_search = txt.strip().lower()
         self._apply_filters()
 
+    def _on_collab_toggled(self, checked: bool):
+        self._filter_collab = checked
+        self._apply_filters()
+
+    def _on_cover_toggled(self, checked: bool):
+        self._filter_cover = checked
+        self._apply_filters()
+
     def _on_cat_filter_changed(self, txt: str):
         self._filter_cat = txt
         self._apply_filters()
@@ -1910,7 +2010,10 @@ class MainWindow(QMainWindow):
         self.search_box.blockSignals(True);  self.search_box.setText("");          self.search_box.blockSignals(False)
         self.cat_filter.blockSignals(True);  self.cat_filter.setCurrentText("All"); self.cat_filter.blockSignals(False)
         self.rat_filter.blockSignals(True);  self.rat_filter.setCurrentIndex(0);    self.rat_filter.blockSignals(False)
+        self.collab_btn.blockSignals(True);  self.collab_btn.setChecked(False);     self.collab_btn.blockSignals(False)
+        self.cover_btn.blockSignals(True);   self.cover_btn.setChecked(False);      self.cover_btn.blockSignals(False)
         self._filter_search = ""; self._filter_cat = "All"; self._filter_rating = 0
+        self._filter_collab = False; self._filter_cover = False
         self._apply_filters()
 
     def _matches(self, song: Song) -> bool:
@@ -1923,6 +2026,10 @@ class MainWindow(QMainWindow):
         if self._filter_rating == -1 and song.rating != 0:
             return False   # "No rating" filter: only unrated songs
         if self._filter_rating > 0 and song.rating < self._filter_rating:
+            return False
+        if self._filter_collab and "collab" not in song.title.lower():
+            return False
+        if self._filter_cover and "cover" not in song.title.lower():
             return False
         return True
 
@@ -1979,6 +2086,22 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, COL_TITLE,  ti)
         self.table.setItem(row, COL_ARTIST, QTableWidgetItem(song.artist))
         self.row_items[song.id] = ti
+
+        # ── Title edit pen ──
+        title_lock = LockButton(
+            "Green pen: title is protected. Click to edit.",
+            "Red pen: title editing active.")
+        title_lock.toggledLock.connect(
+            lambda unlocked, s=song, lk=title_lock: self._on_title_edit_unlock(s, lk, unlocked))
+        self.table.setCellWidget(row, COL_TITLE_EDIT, _centered(title_lock))
+
+        # ── Artist edit pen ──
+        artist_lock = LockButton(
+            "Green pen: artist is protected. Click to edit.",
+            "Red pen: artist editing active.")
+        artist_lock.toggledLock.connect(
+            lambda unlocked, s=song, lk=artist_lock: self._on_artist_edit_unlock(s, lk, unlocked))
+        self.table.setCellWidget(row, COL_ARTIST_EDIT, _centered(artist_lock))
 
         # ── Category combo ──
         cats = list_categories(self.root_path) if self.root_path else []
@@ -2043,6 +2166,89 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Category change → physical move
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Title / Artist inline editing
+    # ------------------------------------------------------------------
+    def _on_title_edit_unlock(self, song: Song, lock: "LockButton", unlocked: bool):
+        if not unlocked:
+            return
+        item = self.row_items.get(song.id)
+        if item is None:
+            lock.set_locked(True); return
+        row = item.row()
+        editor = QLineEdit(song.title)
+        editor.setObjectName("cellEditor")
+        editor.selectAll()
+        self.table.setCellWidget(row, COL_TITLE, editor)
+        editor.setFocus()
+        committed = [False]
+
+        def commit():
+            if committed[0]: return
+            committed[0] = True
+            new_title = editor.text().strip() or song.title
+            self.table.removeCellWidget(row, COL_TITLE)
+            item.setText(new_title)
+            if new_title != song.title:
+                if write_display_tags(song.path, new_title, song.artist):
+                    song.title = new_title
+                    self._sync_cache(song)
+                    self._set_info(f'\u2713  Title saved: "{new_title}"', "success")
+                else:
+                    self._set_info("Could not write title to file.", "error")
+            lock.set_locked(True)
+
+        editor.returnPressed.connect(commit)
+        editor.editingFinished.connect(commit)
+
+    def _on_artist_edit_unlock(self, song: Song, lock: "LockButton", unlocked: bool):
+        if not unlocked:
+            return
+        item = self.row_items.get(song.id)
+        if item is None:
+            lock.set_locked(True); return
+        row = item.row()
+        artist_item = self.table.item(row, COL_ARTIST)
+        editor = QLineEdit(song.artist)
+        editor.setObjectName("cellEditor")
+        editor.selectAll()
+        self.table.setCellWidget(row, COL_ARTIST, editor)
+        editor.setFocus()
+        committed = [False]
+
+        def commit():
+            if committed[0]: return
+            committed[0] = True
+            new_artist = editor.text().strip()
+            self.table.removeCellWidget(row, COL_ARTIST)
+            if artist_item: artist_item.setText(new_artist)
+            if new_artist != song.artist:
+                if write_display_tags(song.path, song.title, new_artist):
+                    song.artist = new_artist
+                    self._sync_cache(song)
+                    self._set_info(f'\u2713  Artist saved: "{new_artist}"', "success")
+                else:
+                    self._set_info("Could not write artist to file.", "error")
+            lock.set_locked(True)
+
+        editor.returnPressed.connect(commit)
+        editor.editingFinished.connect(commit)
+
+    def _sync_cache(self, song: Song):
+        """Update on-disk cache after any in-app change to a song."""
+        try:
+            st  = song.path.stat()
+            rec = self.cache.get(str(song.path), {})
+            rec.update({"size": st.st_size, "mtime": st.st_mtime,
+                        "title": song.title, "artist": song.artist,
+                        "rating": song.rating, "duration": song.duration,
+                        "id": song.id})
+            self.cache[str(song.path)] = rec
+            if self.root_path: save_cache(self.root_path, self.cache)
+        except OSError:
+            pass
+
+
     def _on_cat_combo(self, song: Song, combo: QComboBox, new_cat: str):
         if new_cat == song.category or not combo.isEnabled(): return
         if self.player.current_song() is song and self.player.is_playing():
