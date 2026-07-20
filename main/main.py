@@ -166,19 +166,39 @@ def read_rating(path: Path) -> int:
 
 
 def write_rating(path: Path, rating: int) -> bool:
-    """Write rating (0-5) directly into the audio file's own metadata."""
+    """Write rating (0-5) directly into the audio file's own metadata.
+
+    For MP3 files, writes BOTH:
+      - TXXX:RATING  (text "0"-"5", used by this app)
+      - POPM         (Popularimeter, 0-255 byte, used by Windows Properties)
+
+    Windows star-to-byte mapping:
+      0 stars = 0,  1 star = 1,  2 stars = 64,
+      3 stars = 128,  4 stars = 196,  5 stars = 255
+    """
     rating = _clamp(rating)
     ext = path.suffix.lower()
+
+    # Windows POPM byte values for each star level
+    _STAR_TO_POPM = {0: 0, 1: 1, 2: 64, 3: 128, 4: 196, 5: 255}
+
     try:
         if ext in (".mp3", ".wav", ".aac"):
             try:
                 id3 = ID3(path)
             except ID3NoHeaderError:
                 id3 = ID3()
+            # Remove old TXXX:RATING
             for f in [f for f in id3.getall("TXXX")
                       if getattr(f, "desc", "").upper() == RATING_TXXX_DESC]:
                 id3.delall(f"TXXX:{f.desc}")
+            # Write TXXX:RATING (for this app)
             id3.add(TXXX(encoding=3, desc=RATING_TXXX_DESC, text=[str(rating)]))
+            # Write POPM (for Windows Properties > Details > Rating)
+            from mutagen.id3 import POPM
+            id3.delall("POPM")
+            id3.add(POPM(email="Windows Media Player 9 Series",
+                         rating=_STAR_TO_POPM.get(rating, 0), count=0))
             id3.save(path)
             return True
         elif ext == ".flac":
@@ -1146,6 +1166,14 @@ QHeaderView::section {
     background:#1c1c1e; color:#8e8e93; border:none;
     border-bottom:1px solid #2c2c2e;
     padding:8px 6px; font-size:11px; font-weight:600; text-transform:uppercase; }
+QHeaderView::section:horizontal:hover { background:#2c2c2e; color:#f2f2f7; }
+
+/* Row number gutter (vertical header) — like PyCharm line numbers */
+QHeaderView::section:vertical {
+    background: #1c1c1e; color: #48484a; font-size: 10px; font-weight: 400;
+    font-family: "SF Mono","Consolas",monospace; border: none;
+    border-right: 1px solid #2c2c2e; padding: 0px 2px; }
+
 QTableWidget::item:selected { background:rgba(10,132,255,.22); }
 
 QComboBox {
@@ -1556,12 +1584,18 @@ class MainWindow(QMainWindow):
         self.table = QTableWidget(0, COL_COUNT)
         self.table.setHorizontalHeaderLabels(
             ["Title", "Edit", "Category", "Edit", "Rating", "Edit"])
-        self.table.verticalHeader().setVisible(False)
+        # Row numbers (like PyCharm line numbers) — always visible on the left
+        self.table.verticalHeader().setVisible(True)
+        self.table.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
+        self.table.verticalHeader().setFixedWidth(42)
+        self.table.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
+        # Enable sorting by clicking column headers
+        self.table.setSortingEnabled(True)
+        self.table.sortItems(COL_TITLE, Qt.AscendingOrder)
         h = self.table.horizontalHeader()
         h.setSectionResizeMode(COL_TITLE,         QHeaderView.Stretch)
         h.setSectionResizeMode(COL_TITLE_EDIT,    QHeaderView.ResizeToContents)
@@ -2097,6 +2131,7 @@ class MainWindow(QMainWindow):
             self._insert_row(song)
 
     def _insert_row(self, song: Song):
+        self.table.setSortingEnabled(False)
         row = self.table.rowCount()
         self.table.insertRow(row)
         self.table.setRowHeight(row, ROW_HEIGHT)
@@ -2154,6 +2189,7 @@ class MainWindow(QMainWindow):
         star.setProperty("lock_ref", rat_lock)
 
         self.table.setRowHidden(row, not self._matches(song))
+        self.table.setSortingEnabled(True)
 
     def _on_double_click(self, index):
         item = self.table.item(index.row(), COL_TITLE)
@@ -2214,11 +2250,9 @@ class MainWindow(QMainWindow):
         editor.selectAll()
         self.table.setCellWidget(row, COL_TITLE, editor)
         editor.setFocus()
-        committed = [False]
 
-        def commit():
-            if committed[0]: return
-            committed[0] = True
+        def commit_enter():
+            """Called only on Enter key — commits and re-locks the pen."""
             new_title = editor.text().strip() or song.title
             self.table.removeCellWidget(row, COL_TITLE)
             item.setText(new_title)
@@ -2237,8 +2271,8 @@ class MainWindow(QMainWindow):
                     self._set_info("Could not rename file.", "error")
             lock.set_locked(True)
 
-        editor.returnPressed.connect(commit)
-        editor.editingFinished.connect(commit)
+        # Only Enter commits — pen click is handled by the unlocked=False path above
+        editor.returnPressed.connect(commit_enter)
 
     def _sync_cache(self, song: Song):
         """Update on-disk cache after any in-app change to a song."""
@@ -2257,9 +2291,11 @@ class MainWindow(QMainWindow):
 
     def _on_cat_combo(self, song: Song, combo: QComboBox, new_cat: str):
         if new_cat == song.category or not combo.isEnabled(): return
+        self.table.setSortingEnabled(False)
         if self.player.current_song() is song and self.player.is_playing():
             self._show_toast("Pause the song first before moving it to another category.", 3500, "warning")
             combo.blockSignals(True); combo.setCurrentText(song.category); combo.blockSignals(False)
+            self.table.setSortingEnabled(True)
             return
 
         old_cat, old_path_str = song.category, str(song.path)
@@ -2268,51 +2304,36 @@ class MainWindow(QMainWindow):
         except SafeMoveError as e:
             self._show_toast(f"Move failed: {e}  —  Original was NOT modified.", 6000, "error")
             combo.blockSignals(True); combo.setCurrentText(old_cat); combo.blockSignals(False)
+            self.table.setSortingEnabled(True)
             return
 
         song.path = new_path; song.category = new_cat
         self.player.notify_song_path_changed(song, new_path)
-
-        rec = self.cache.pop(old_path_str, {})
-        try:
-            st = new_path.stat()
-            rec.update({"size": st.st_size, "mtime": st.st_mtime, "title": song.title,
-                        "artist": song.artist, "rating": song.rating,
-                        "duration": song.duration, "id": song.id})
-            self.cache[str(new_path)] = rec
-            if self.root_path: save_cache(self.root_path, self.cache)
-        except OSError:
-            pass
+        self._sync_cache(song)
+        self.cache.pop(old_path_str, None)
 
         lock: LockButton = combo.property("lock_ref")
         if lock: lock.set_locked(True)
         combo.setEnabled(False)
         self.table.setRowHidden(self.row_items[song.id].row(), not self._matches(song))
-        self._show_toast(f"✓  '{song.title}'  moved: {old_cat} → {new_cat}", 3500, "success")
+        self.table.setSortingEnabled(True)
+        self._show_toast(f"\u2713  '{song.title}'  moved: {old_cat} \u2192 {new_cat}", 3500, "success")
 
     # ------------------------------------------------------------------
     # Rating change → write directly into the audio file
     # ------------------------------------------------------------------
     def _on_rating(self, song: Song, star_widget: "StarRatingWidget", new_rating: int):
+        # Disable sorting so the song stays in its current row position
+        self.table.setSortingEnabled(False)
+
         if not write_rating(song.path, new_rating):
             self._show_toast(
-                f"Could not write rating into '{song.filename}' — format may not support it.",
+                f"Could not write rating into '{song.path.name}' — format may not support it.",
                 5000, "error")
+            self.table.setSortingEnabled(True)
             return
         song.rating = new_rating
-
-        # Keep cache in sync so next scan doesn't re-read this file
-        try:
-            st  = song.path.stat()
-            rec = self.cache.get(str(song.path), {})
-            rec.update({"size": st.st_size, "mtime": st.st_mtime,
-                        "title": song.title, "artist": song.artist,
-                        "rating": new_rating, "duration": song.duration,
-                        "id": song.id})
-            self.cache[str(song.path)] = rec
-            if self.root_path: save_cache(self.root_path, self.cache)
-        except OSError:
-            pass
+        self._sync_cache(song)
 
         # Auto re-lock the rating pen after saving
         lock: LockButton = star_widget.property("lock_ref")
@@ -2325,13 +2346,16 @@ class MainWindow(QMainWindow):
         if item:
             self.table.setRowHidden(item.row(), not self._matches(song))
 
+        # Re-enable sorting (position is preserved since we didn't change the sort key)
+        self.table.setSortingEnabled(True)
+
         # Inline toast — rating saved directly into the file
-        stars = "★" * new_rating + "☆" * (5 - new_rating)
+        stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
         if new_rating == 0:
             self._show_toast(f"Rating cleared  —  {song.title}", 3000, "info")
         else:
             self._show_toast(
-                f"✓  Rating saved into file:  {song.title}   {stars}  ({new_rating}/5)",
+                f"\u2713  Rating saved into file:  {song.title}   {stars}  ({new_rating}/5)",
                 3500, "success")
 
 
