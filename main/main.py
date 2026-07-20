@@ -124,6 +124,22 @@ def read_duration_seconds(path: Path) -> float:
 
 
 def read_rating(path: Path) -> int:
+    """Read rating (0-5) from audio file metadata.
+
+    For MP3: reads POPM frame first (what Windows Properties writes),
+    then falls back to TXXX:RATING (what this app writes).
+    This ensures ratings set via Windows Properties > Details > Rating
+    are correctly displayed in the app.
+    """
+    # POPM byte → star mapping (Windows standard)
+    def _popm_to_stars(byte_val: int) -> int:
+        if byte_val == 0:   return 0
+        if byte_val <= 31:  return 1
+        if byte_val <= 95:  return 2
+        if byte_val <= 159: return 3
+        if byte_val <= 223: return 4
+        return 5
+
     ext = path.suffix.lower()
     try:
         if ext in (".mp3", ".wav", ".aac"):
@@ -131,6 +147,11 @@ def read_rating(path: Path) -> int:
                 id3 = ID3(path)
             except ID3NoHeaderError:
                 return 0
+            # First try POPM (Windows Properties writes this)
+            popm_frames = id3.getall("POPM")
+            if popm_frames:
+                return _popm_to_stars(popm_frames[0].rating)
+            # Fall back to TXXX:RATING (this app's custom tag)
             for frame in id3.getall("TXXX"):
                 if getattr(frame, "desc", "").upper() == RATING_TXXX_DESC:
                     try:
@@ -465,8 +486,10 @@ class ScanWorker(QThread):
             path_obj = Path(p)
             # Always re-read title/artist from file
             title, artist = read_display_tags(path_obj)
-            # Use cached rating and duration (reliable, expensive to re-read)
-            rating   = rec.get("rating", 0)
+            # Always re-read rating from file so changes made via Windows
+            # Properties > Details > Rating are immediately visible.
+            # Only duration is taken from cache (expensive, rarely changes).
+            rating   = read_rating(path_obj)
             duration = rec.get("duration", 0.0)
             song = Song(
                 path=path_obj, category=cat,
@@ -1174,6 +1197,19 @@ QHeaderView::section:vertical {
     font-family: "SF Mono","Consolas",monospace; border: none;
     border-right: 1px solid #2c2c2e; padding: 0px 2px; }
 
+/* Corner widget (top-left where row numbers meet column headers) */
+QTableCornerButton::section {
+    background: #1c1c1e; border: none;
+    border-bottom: 1px solid #2c2c2e; border-right: 1px solid #2c2c2e; }
+
+/* Sort indicator arrow */
+QHeaderView::down-arrow { image: none; border: none;
+    border-left: 4px solid transparent; border-right: 4px solid transparent;
+    border-top: 5px solid #0a84ff; margin-right: 6px; }
+QHeaderView::up-arrow { image: none; border: none;
+    border-left: 4px solid transparent; border-right: 4px solid transparent;
+    border-bottom: 5px solid #0a84ff; margin-right: 6px; }
+
 QTableWidget::item:selected { background:rgba(10,132,255,.22); }
 
 QComboBox {
@@ -1597,6 +1633,7 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
         self.table.sortItems(COL_TITLE, Qt.AscendingOrder)
         h = self.table.horizontalHeader()
+        h.setSortIndicatorShown(True)   # show ▲/▼ arrow in sorted column
         h.setSectionResizeMode(COL_TITLE,         QHeaderView.Stretch)
         h.setSectionResizeMode(COL_TITLE_EDIT,    QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_CATEGORY,      QHeaderView.ResizeToContents)
@@ -2323,6 +2360,10 @@ class MainWindow(QMainWindow):
     # Rating change → write directly into the audio file
     # ------------------------------------------------------------------
     def _on_rating(self, song: Song, star_widget: "StarRatingWidget", new_rating: int):
+        # Save current selection and scroll position
+        item = self.row_items.get(song.id)
+        saved_row = item.row() if item else -1
+
         # Disable sorting so the song stays in its current row position
         self.table.setSortingEnabled(False)
 
@@ -2342,17 +2383,22 @@ class MainWindow(QMainWindow):
         star_widget.set_editable(False)
 
         # Re-evaluate row visibility (rating filter may now hide/show this song)
-        item = self.row_items.get(song.id)
         if item:
             self.table.setRowHidden(item.row(), not self._matches(song))
 
         # Re-enable sorting (position is preserved since we didn't change the sort key)
         self.table.setSortingEnabled(True)
 
+        # Restore selection to the same song row (may have shifted)
+        if item:
+            actual_row = item.row()
+            self.table.selectRow(actual_row)
+            self.table.scrollTo(self.table.model().index(actual_row, COL_TITLE))
+
         # Inline toast — rating saved directly into the file
         stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
         if new_rating == 0:
-            self._show_toast(f"Rating cleared  —  {song.title}", 3000, "info")
+            self._show_toast(f"Rating cleared  \u2014  {song.title}", 3000, "info")
         else:
             self._show_toast(
                 f"\u2713  Rating saved into file:  {song.title}   {stars}  ({new_rating}/5)",
