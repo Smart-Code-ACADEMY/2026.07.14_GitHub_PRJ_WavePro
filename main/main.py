@@ -1202,13 +1202,21 @@ QTableCornerButton::section {
     background: #1c1c1e; border: none;
     border-bottom: 1px solid #2c2c2e; border-right: 1px solid #2c2c2e; }
 
-/* Sort indicator arrow */
-QHeaderView::down-arrow { image: none; border: none;
-    border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-top: 5px solid #0a84ff; margin-right: 6px; }
-QHeaderView::up-arrow { image: none; border: none;
-    border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-bottom: 5px solid #0a84ff; margin-right: 6px; }
+/* Sort indicator arrow — blue triangle */
+QHeaderView::down-arrow {
+    subcontrol-position: center right;
+    width: 0; height: 0;
+    border-left: 5px solid transparent; border-right: 5px solid transparent;
+    border-top: 6px solid #0a84ff;
+    margin-right: 8px;
+}
+QHeaderView::up-arrow {
+    subcontrol-position: center right;
+    width: 0; height: 0;
+    border-left: 5px solid transparent; border-right: 5px solid transparent;
+    border-bottom: 6px solid #0a84ff;
+    margin-right: 8px;
+}
 
 QTableWidget::item:selected { background:rgba(10,132,255,.22); }
 
@@ -1608,6 +1616,32 @@ class MainWindow(QMainWindow):
         self.play_filtered_btn.clicked.connect(self._play_filtered)
         lay.addWidget(self.play_filtered_btn)
 
+        lay.addSpacing(12)
+
+        # ── Bulk edit (enabled when multiple songs are selected) ──────
+        bulk_lbl = QLabel("Bulk:")
+        bulk_lbl.setObjectName("subtleLabel")
+        lay.addWidget(bulk_lbl)
+
+        self.bulk_cat_combo = QComboBox()
+        self.bulk_cat_combo.setFixedWidth(130)
+        self.bulk_cat_combo.addItem("Move to…")
+        self.bulk_cat_combo.setToolTip("Move ALL selected songs to this category")
+        self.bulk_cat_combo.setEnabled(False)
+        self.bulk_cat_combo.activated.connect(self._on_bulk_category)
+        lay.addWidget(self.bulk_cat_combo)
+
+        self.bulk_rat_combo = QComboBox()
+        self.bulk_rat_combo.setFixedWidth(150)
+        self.bulk_rat_combo.addItem("Set rating\u2026", -99)
+        for n in range(6):
+            stars = "\u2605" * n + "\u2606" * (5 - n) if n else "\u2606\u2606\u2606\u2606\u2606  Clear"
+            self.bulk_rat_combo.addItem(f"{stars}  ({n})", n)
+        self.bulk_rat_combo.setToolTip("Set rating for ALL selected songs")
+        self.bulk_rat_combo.setEnabled(False)
+        self.bulk_rat_combo.activated.connect(self._on_bulk_rating)
+        lay.addWidget(self.bulk_rat_combo)
+
         lay.addStretch()
 
         reset_btn = QPushButton("Reset filters")
@@ -1620,11 +1654,12 @@ class MainWindow(QMainWindow):
         self.table = QTableWidget(0, COL_COUNT)
         self.table.setHorizontalHeaderLabels(
             ["Title", "Edit", "Category", "Edit", "Rating", "Edit"])
-        # Row numbers (like PyCharm line numbers) — always visible on the left
+        # Row numbers (queue numbers) — always visible on the left
         self.table.verticalHeader().setVisible(True)
         self.table.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
         self.table.verticalHeader().setFixedWidth(42)
         self.table.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
+        self.table.verticalHeader().setSectionsClickable(False)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1641,6 +1676,7 @@ class MainWindow(QMainWindow):
         h.setSectionResizeMode(COL_RATING,        QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_RATING_LOCK,   QHeaderView.ResizeToContents)
         self.table.doubleClicked.connect(self._on_double_click)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
         return self.table
 
     # ── player bar ────────────────────────────────────────────────────
@@ -2131,15 +2167,52 @@ class MainWindow(QMainWindow):
             item = self.row_items.get(sid)
             if item is not None:
                 self.table.setRowHidden(item.row(), not self._matches(song))
+        self._update_queue_numbers()
+
+    def _update_queue_numbers(self):
+        """Renumber visible rows 1,2,3... so Queue # always reflects the
+        current filtered view, not the original row index."""
+        vh = self.table.verticalHeader()
+        queue_num = 0
+        for visual in range(self.table.rowCount()):
+            if not self.table.isRowHidden(visual):
+                queue_num += 1
+                # Set the vertical header label for this row
+                vhi = self.table.verticalHeaderItem(visual)
+                if vhi is None:
+                    vhi = QTableWidgetItem()
+                    self.table.setVerticalHeaderItem(visual, vhi)
+                vhi.setText(str(queue_num))
+            else:
+                vhi = self.table.verticalHeaderItem(visual)
+                if vhi:
+                    vhi.setText("")
+
+    def _visible_songs_in_order(self) -> List[Song]:
+        """Return songs in their current visible table order (respects
+        sorting and filters). This is what the play queue should use."""
+        result = []
+        for row in range(self.table.rowCount()):
+            if self.table.isRowHidden(row):
+                continue
+            item = self.table.item(row, COL_TITLE)
+            if item is None:
+                continue
+            sid = item.data(Qt.UserRole)
+            song = self.songs_by_id.get(sid)
+            if song:
+                result.append(song)
+        return result
 
     def _filtered_songs(self) -> List[Song]:
-        return [s for s in self.songs_by_id.values() if self._matches(s)]
+        """Alias for visible songs in order."""
+        return self._visible_songs_in_order()
 
     # ------------------------------------------------------------------
     # Play filtered
     # ------------------------------------------------------------------
     def _play_filtered(self):
-        songs = self._filtered_songs()
+        songs = self._visible_songs_in_order()
         if not songs:
             self._show_toast("No songs match the current filter selection.", 3000, "warning")
             return
@@ -2228,11 +2301,115 @@ class MainWindow(QMainWindow):
         self.table.setRowHidden(row, not self._matches(song))
         self.table.setSortingEnabled(True)
 
+    # ------------------------------------------------------------------
+    # Selection & bulk operations
+    # ------------------------------------------------------------------
+    def _on_selection_changed(self):
+        """Enable bulk controls when 2+ songs are selected."""
+        sel_rows = set(idx.row() for idx in self.table.selectedIndexes())
+        multi = len(sel_rows) >= 2
+        self.bulk_cat_combo.setEnabled(multi)
+        self.bulk_rat_combo.setEnabled(multi)
+        if multi:
+            # Rebuild category list in bulk combo
+            cats = list_categories(self.root_path) if self.root_path else []
+            self.bulk_cat_combo.blockSignals(True)
+            self.bulk_cat_combo.clear()
+            self.bulk_cat_combo.addItem("Move to\u2026")
+            self.bulk_cat_combo.addItems(cats)
+            self.bulk_cat_combo.blockSignals(False)
+
+    def _selected_songs(self) -> List[Song]:
+        """Return songs from the currently selected rows."""
+        seen = set()
+        songs = []
+        for idx in self.table.selectedIndexes():
+            row = idx.row()
+            if row in seen:
+                continue
+            seen.add(row)
+            item = self.table.item(row, COL_TITLE)
+            if item is None:
+                continue
+            sid = item.data(Qt.UserRole)
+            song = self.songs_by_id.get(sid)
+            if song:
+                songs.append(song)
+        return songs
+
+    def _on_bulk_category(self, idx: int):
+        if idx <= 0:
+            return   # "Move to…" placeholder
+        new_cat = self.bulk_cat_combo.itemText(idx)
+        songs = self._selected_songs()
+        if not songs:
+            return
+        self.table.setSortingEnabled(False)
+        moved = 0
+        for song in songs:
+            if song.category == new_cat:
+                continue
+            if self.player.current_song() is song and self.player.is_playing():
+                continue
+            old_path_str = str(song.path)
+            try:
+                new_path = safe_move_song(song, self.root_path, new_cat)
+            except SafeMoveError:
+                continue
+            song.path = new_path
+            song.category = new_cat
+            self.player.notify_song_path_changed(song, new_path)
+            self.cache.pop(old_path_str, None)
+            self._sync_cache(song)
+            # Update the combo widget in the row
+            item = self.row_items.get(song.id)
+            if item:
+                combo = self.table.cellWidget(item.row(), COL_CATEGORY)
+                if combo:
+                    combo.blockSignals(True)
+                    combo.setCurrentText(new_cat)
+                    combo.blockSignals(False)
+            moved += 1
+        self.table.setSortingEnabled(True)
+        self.bulk_cat_combo.setCurrentIndex(0)
+        self._show_toast(f"\u2713  {moved} songs moved to '{new_cat}'", 3500, "success")
+
+    def _on_bulk_rating(self, idx: int):
+        if idx <= 0:
+            return   # "Set rating…" placeholder
+        new_rating = self.bulk_rat_combo.itemData(idx)
+        if new_rating is None or new_rating < 0:
+            return
+        songs = self._selected_songs()
+        if not songs:
+            return
+        self.table.setSortingEnabled(False)
+        count = 0
+        for song in songs:
+            if write_rating(song.path, new_rating):
+                song.rating = new_rating
+                self._sync_cache(song)
+                # Update the star widget
+                item = self.row_items.get(song.id)
+                if item:
+                    star_wrap = self.table.cellWidget(item.row(), COL_RATING)
+                    if star_wrap:
+                        star = star_wrap.findChild(StarRatingWidget)
+                        if star:
+                            star.set_rating(new_rating)
+                count += 1
+        self.table.setSortingEnabled(True)
+        self.bulk_rat_combo.setCurrentIndex(0)
+        stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
+        self._show_toast(
+            f"\u2713  Rating set to {stars} ({new_rating}/5) for {count} songs",
+            3500, "success")
+
     def _on_double_click(self, index):
         item = self.table.item(index.row(), COL_TITLE)
         if item is None: return
         song = self.songs_by_id.get(item.data(Qt.UserRole))
-        if song: self.player.play_song(song, queue=self._filtered_songs())
+        if song: self.player.play_song(song, queue=self._visible_songs_in_order())
 
     def _highlight(self, playing: Optional[Song]):
         if self._highlighted_id:
