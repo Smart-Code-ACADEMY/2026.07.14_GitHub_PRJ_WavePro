@@ -1838,6 +1838,28 @@ class MainWindow(QMainWindow):
         self.shuf_btn.clicked.connect(self._toggle_shuffle)
         ctrl.addWidget(self.shuf_btn)
 
+        ctrl.addSpacing(12)
+
+        # ── Navigation buttons: Focus / Top / Bottom ──────────────────
+        self.focus_btn = _circle_btn("◎", 30, "Scroll to currently playing song",
+                                     bg="#2c2c2e", fg="#8e8e93", font_size=14)
+        self.focus_btn.clicked.connect(self._scroll_to_playing)
+        ctrl.addWidget(self.focus_btn)
+
+        ctrl.addSpacing(2)
+
+        top_btn = _circle_btn("⤒", 26, "Scroll to top",
+                              bg="#2c2c2e", fg="#6e6e73", font_size=13)
+        top_btn.clicked.connect(self._scroll_to_top)
+        ctrl.addWidget(top_btn)
+
+        ctrl.addSpacing(2)
+
+        bottom_btn = _circle_btn("⤓", 26, "Scroll to bottom",
+                                 bg="#2c2c2e", fg="#6e6e73", font_size=13)
+        bottom_btn.clicked.connect(self._scroll_to_bottom)
+        ctrl.addWidget(bottom_btn)
+
         ctrl.addStretch(1)
 
         # ── Volume in a FIXED-WIDTH container so the icon change
@@ -1931,6 +1953,51 @@ class MainWindow(QMainWindow):
         self.lbl_pos.setText(_fmt_time(ms))
         dur = self.seek_slider.maximum()
         self.vu_meter.set_position(ms, max(1, dur))
+
+    # ------------------------------------------------------------------
+    # Navigation: Focus / Scroll Top / Scroll Bottom
+    # ------------------------------------------------------------------
+    _saved_scroll_pos: int = -1
+
+    def _scroll_to_playing(self):
+        """Toggle: scroll to currently playing song (without changing selection),
+        or return to the previous scroll position if pressed again."""
+        current = self.player.current_song()
+        if current is None:
+            return
+        item = self.row_items.get(current.id)
+        if item is None:
+            return
+
+        current_scroll = self.table.verticalScrollBar().value()
+        target_row = item.row()
+
+        if self._saved_scroll_pos >= 0:
+            # Return to saved position
+            self.table.verticalScrollBar().setValue(self._saved_scroll_pos)
+            self._saved_scroll_pos = -1
+            self.focus_btn.setStyleSheet(
+                "QToolButton{background:#2c2c2e;border:none;border-radius:15px;"
+                "color:#8e8e93;font-size:14px;font-weight:600;}"
+                "QToolButton:hover{background:#3a3a3c;color:#ffffff;}"
+            )
+        else:
+            # Save current position and scroll to playing song
+            self._saved_scroll_pos = current_scroll
+            self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+            self.focus_btn.setStyleSheet(
+                "QToolButton{background:#1a3a5c;border:none;border-radius:15px;"
+                "color:#0a84ff;font-size:14px;font-weight:700;}"
+                "QToolButton:hover{background:#234a70;}"
+            )
+
+    def _scroll_to_top(self):
+        """Scroll to the first visible row."""
+        self.table.scrollToTop()
+
+    def _scroll_to_bottom(self):
+        """Scroll to the last visible row."""
+        self.table.scrollToBottom()
 
     def _cycle_repeat(self):
         """Cycle: Off → All → Reverse → One → Off"""
@@ -2051,9 +2118,11 @@ class MainWindow(QMainWindow):
     def _on_song_ready(self, song: Song):
         self._add_or_update(song)
         self._apply_filters()
-        # Watch individual file — any external change (tag edit, rename)
-        # will fire directoryChanged or fileChanged and trigger a rescan
         self.watcher.addPath(str(song.path))
+        # Keep UI responsive — process pending events every 25 songs
+        self._song_ready_count = getattr(self, '_song_ready_count', 0) + 1
+        if self._song_ready_count % 25 == 0:
+            QApplication.processEvents()
 
     def _on_total(self, total: int):
         self.progress_bar.setRange(0, max(1, total))
@@ -2415,7 +2484,7 @@ class MainWindow(QMainWindow):
         self._set_info(f"Moving {len(songs)} files to '{new_cat}'\u2026", "loading", auto_reset=False)
 
         moved = 0
-        for song in songs:
+        for i, song in enumerate(songs):
             if song.category == new_cat:
                 continue
             if self.player.current_song() is song and self.player.is_playing():
@@ -2446,6 +2515,8 @@ class MainWindow(QMainWindow):
                     combo.setCurrentText(new_cat)
                     combo.blockSignals(False)
             moved += 1
+            if (i + 1) % 30 == 0:
+                QApplication.processEvents()
 
         if self.root_path:
             save_cache(self.root_path, self.cache)
@@ -2476,10 +2547,9 @@ class MainWindow(QMainWindow):
         self._set_info(f"Writing rating to {len(songs)} files\u2026", "loading", auto_reset=False)
 
         count = 0
-        for song in songs:
+        for i, song in enumerate(songs):
             if write_rating(song.path, new_rating):
                 song.rating = new_rating
-                # Update cache dict in memory (no disk write per song)
                 try:
                     st = song.path.stat()
                     self.cache[str(song.path)] = {
@@ -2497,6 +2567,9 @@ class MainWindow(QMainWindow):
                         if star:
                             star.set_rating(new_rating)
                 count += 1
+            # Keep UI responsive during large bulk operations
+            if (i + 1) % 30 == 0:
+                QApplication.processEvents()
 
         # Save cache ONCE at the end
         if self.root_path:
