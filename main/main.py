@@ -42,7 +42,6 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QProgressBar, QPushButton, QSlider,
-    QStyledItemDelegate,
     QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -693,43 +692,6 @@ class PlayerController(QObject):
 # ============================================================================
 # ============================================================================
 # Star-colored combo box delegate
-# ============================================================================
-class StarItemDelegate(QStyledItemDelegate):
-    """Custom delegate that renders ★ in yellow and everything else in gray
-    inside a QComboBox dropdown list."""
-
-    _YELLOW = QColor("#FFD60A")
-    _GRAY   = QColor("#8e8e93")
-
-    def paint(self, painter, option, index):
-        # Let Qt draw the selection highlight / hover background
-        self.initStyleOption(option, index)
-        painter.save()
-
-        # Draw background (selection, hover)
-        if option.state & 0x8000:  # State_Selected
-            painter.fillRect(option.rect, QColor("#2c2c2e"))
-        elif option.state & 0x2000:  # State_MouseOver
-            painter.fillRect(option.rect, QColor("#232325"))
-
-        text = index.data(Qt.DisplayRole) or ""
-        x = option.rect.x() + 8
-        y_center = option.rect.center().y()
-        painter.setFont(option.font)
-
-        fm = painter.fontMetrics()
-        y_text = y_center + fm.ascent() // 2 - 1
-
-        for ch in text:
-            if ch == "\u2605":  # filled star → yellow
-                painter.setPen(self._YELLOW)
-            else:               # everything else → gray
-                painter.setPen(self._GRAY)
-            painter.drawText(x, y_text, ch)
-            x += fm.horizontalAdvance(ch)
-
-        painter.restore()
-
 
 # LockButton widget
 # ============================================================================
@@ -1254,7 +1216,9 @@ QComboBox:disabled { color:#5a5a5e; background:#232325; }
 QComboBox::drop-down { border:none; width:18px; }
 QComboBox QAbstractItemView {
     background:#2c2c2e; border:1px solid #3a3a3c;
-    selection-background-color:#0a84ff; color:#f2f2f7; outline:none; }
+    selection-background-color:#0a84ff; outline:none; }
+QComboBox QAbstractItemView::item {
+    color:#f2f2f7; padding:4px 8px; min-height:22px; }
 
 QScrollBar:vertical {
     background: transparent; width: 8px; margin: 2px 2px 2px 0;
@@ -1403,7 +1367,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Wave Pro - Music Studio  |  Developed by Ivan Sicaja \u00a9 2026. All rights reserved.")
-        self.resize(1200, 760)
+        self.resize(1300, 820)
 
         self.settings  = QSettings(ORG_NAME, APP_NAME)
         self.root_path: Optional[Path] = None
@@ -1464,10 +1428,10 @@ class MainWindow(QMainWindow):
         # Main bar row
         bar = QFrame(); bar.setObjectName("topBarInner")
         lay = QHBoxLayout(bar)
-        lay.setContentsMargins(14, 8, 14, 8); lay.setSpacing(10)
+        lay.setContentsMargins(14, 12, 14, 12); lay.setSpacing(10)
 
         title = QLabel("Wave Pro")
-        title.setObjectName("sectionTitle")
+        title.setStyleSheet("font-size:22px;font-weight:700;color:#fff;padding:2px 0;")
         lay.addWidget(title)
 
         self.path_btn = QPushButton("No folder")
@@ -1615,7 +1579,6 @@ class MainWindow(QMainWindow):
         lay.addWidget(rat_lbl)
         self.rat_filter = QComboBox()
         self.rat_filter.setFixedWidth(168)
-        self.rat_filter.setItemDelegate(StarItemDelegate(self.rat_filter))
         self.rat_filter.addItem("All ratings", 0)
         self.rat_filter.addItem("☆☆☆☆☆  No rating", -1)
         # 1★ = at least 1 star … 5★ = exactly 5 stars (max)
@@ -1628,6 +1591,8 @@ class MainWindow(QMainWindow):
         }
         for n, lbl in star_labels.items():
             self.rat_filter.addItem(lbl, n)
+            self.rat_filter.setItemData(
+                self.rat_filter.count() - 1, QColor("#FFD60A"), Qt.ForegroundRole)
         self.rat_filter.currentIndexChanged.connect(self._on_rat_filter_changed)
         lay.addWidget(self.rat_filter)
 
@@ -1693,11 +1658,13 @@ class MainWindow(QMainWindow):
 
         self.bulk_rat_combo = QComboBox()
         self.bulk_rat_combo.setFixedWidth(160)
-        self.bulk_rat_combo.setItemDelegate(StarItemDelegate(self.bulk_rat_combo))
         self.bulk_rat_combo.addItem("Set rating\u2026", -99)
         for n in range(6):
             stars = "\u2605" * n + "\u2606" * (5 - n) if n else "\u2606\u2606\u2606\u2606\u2606  Clear"
             self.bulk_rat_combo.addItem(f"{stars}  ({n})", n)
+            if n > 0:
+                self.bulk_rat_combo.setItemData(
+                    self.bulk_rat_combo.count() - 1, QColor("#FFD60A"), Qt.ForegroundRole)
 
         self.bulk_rat_combo.setToolTip("Set rating for ALL selected songs")
         self.bulk_rat_combo.setEnabled(False)
@@ -1738,7 +1705,7 @@ class MainWindow(QMainWindow):
         h.sortIndicatorChanged.connect(self._on_sort_changed)
         self._base_headers = ["Title", "Edit", "Category", "Edit", "Rating", "Edit"]
         # Set initial sort arrow
-        self.table.horizontalHeaderItem(COL_TITLE).setText("Title \u25b2")
+        self.table.horizontalHeaderItem(COL_TITLE).setText("Title \u25bc")
         h.setSectionResizeMode(COL_TITLE,         QHeaderView.Stretch)
         h.setSectionResizeMode(COL_TITLE_EDIT,    QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_CATEGORY,      QHeaderView.ResizeToContents)
@@ -2236,7 +2203,7 @@ class MainWindow(QMainWindow):
         """Update column headers with ▲/▼ sort arrows and rebuild play queue."""
         for i, base_name in enumerate(self._base_headers):
             if i == logical_index:
-                arrow = " ▲" if order == Qt.AscendingOrder else " ▼"
+                arrow = " ▼" if order == Qt.AscendingOrder else " ▲"
                 self.table.horizontalHeaderItem(i).setText(base_name + arrow)
             else:
                 self.table.horizontalHeaderItem(i).setText(base_name)
@@ -2733,8 +2700,10 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORG_NAME)
 
-    # Set app icon from assets (if available)
+    # Set app icon
     icon_path = Path("../assets/01_media/01_icons/icon.ico")
+    if not icon_path.exists():
+        icon_path = Path("assets/01_media/01_icons/icon.ico")
     if icon_path.exists():
         from PySide6.QtGui import QIcon
         app.setWindowIcon(QIcon(str(icon_path)))
