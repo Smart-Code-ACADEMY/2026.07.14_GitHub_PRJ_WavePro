@@ -42,11 +42,12 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QProgressBar, QPushButton, QSlider,
+    QStyledItemDelegate,
     QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
-ORG_NAME = "LocalMusicApps"
-APP_NAME  = "MusicLibrary"
+ORG_NAME = "WavePro"
+APP_NAME  = "Wave Pro - Music Studio"
 
 # ============================================================================
 # Metadata helpers
@@ -690,6 +691,46 @@ class PlayerController(QObject):
 
 
 # ============================================================================
+# ============================================================================
+# Star-colored combo box delegate
+# ============================================================================
+class StarItemDelegate(QStyledItemDelegate):
+    """Custom delegate that renders ★ in yellow and everything else in gray
+    inside a QComboBox dropdown list."""
+
+    _YELLOW = QColor("#FFD60A")
+    _GRAY   = QColor("#8e8e93")
+
+    def paint(self, painter, option, index):
+        # Let Qt draw the selection highlight / hover background
+        self.initStyleOption(option, index)
+        painter.save()
+
+        # Draw background (selection, hover)
+        if option.state & 0x8000:  # State_Selected
+            painter.fillRect(option.rect, QColor("#2c2c2e"))
+        elif option.state & 0x2000:  # State_MouseOver
+            painter.fillRect(option.rect, QColor("#232325"))
+
+        text = index.data(Qt.DisplayRole) or ""
+        x = option.rect.x() + 8
+        y_center = option.rect.center().y()
+        painter.setFont(option.font)
+
+        fm = painter.fontMetrics()
+        y_text = y_center + fm.ascent() // 2 - 1
+
+        for ch in text:
+            if ch == "\u2605":  # filled star → yellow
+                painter.setPen(self._YELLOW)
+            else:               # everything else → gray
+                painter.setPen(self._GRAY)
+            painter.drawText(x, y_text, ch)
+            x += fm.horizontalAdvance(ch)
+
+        painter.restore()
+
+
 # LockButton widget
 # ============================================================================
 class LockButton(QToolButton):
@@ -1202,21 +1243,7 @@ QTableCornerButton::section {
     background: #1c1c1e; border: none;
     border-bottom: 1px solid #2c2c2e; border-right: 1px solid #2c2c2e; }
 
-/* Sort indicator arrow — blue triangle */
-QHeaderView::down-arrow {
-    subcontrol-position: center right;
-    width: 0; height: 0;
-    border-left: 5px solid transparent; border-right: 5px solid transparent;
-    border-top: 6px solid #0a84ff;
-    margin-right: 8px;
-}
-QHeaderView::up-arrow {
-    subcontrol-position: center right;
-    width: 0; height: 0;
-    border-left: 5px solid transparent; border-right: 5px solid transparent;
-    border-bottom: 6px solid #0a84ff;
-    margin-right: 8px;
-}
+/* Sort indicator — handled via text ▲/▼ appended to header label */
 
 QTableWidget::item:selected { background:rgba(10,132,255,.22); }
 
@@ -1375,7 +1402,7 @@ ROW_HEIGHT = 38   # px – fits 20px lock icons with comfortable padding
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Music Library")
+        self.setWindowTitle("Wave Pro - Music Studio  |  Developed by Ivan Sicaja \u00a9 2026. All rights reserved.")
         self.resize(1200, 760)
 
         self.settings  = QSettings(ORG_NAME, APP_NAME)
@@ -1439,7 +1466,7 @@ class MainWindow(QMainWindow):
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(14, 8, 14, 8); lay.setSpacing(10)
 
-        title = QLabel("Music Library")
+        title = QLabel("Wave Pro")
         title.setObjectName("sectionTitle")
         lay.addWidget(title)
 
@@ -1588,6 +1615,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(rat_lbl)
         self.rat_filter = QComboBox()
         self.rat_filter.setFixedWidth(168)
+        self.rat_filter.setItemDelegate(StarItemDelegate(self.rat_filter))
         self.rat_filter.addItem("All ratings", 0)
         self.rat_filter.addItem("☆☆☆☆☆  No rating", -1)
         # 1★ = at least 1 star … 5★ = exactly 5 stars (max)
@@ -1600,8 +1628,6 @@ class MainWindow(QMainWindow):
         }
         for n, lbl in star_labels.items():
             self.rat_filter.addItem(lbl, n)
-            self.rat_filter.setItemData(
-                self.rat_filter.count() - 1, QColor("#FFD60A"), Qt.ForegroundRole)
         self.rat_filter.currentIndexChanged.connect(self._on_rat_filter_changed)
         lay.addWidget(self.rat_filter)
 
@@ -1667,13 +1693,12 @@ class MainWindow(QMainWindow):
 
         self.bulk_rat_combo = QComboBox()
         self.bulk_rat_combo.setFixedWidth(160)
+        self.bulk_rat_combo.setItemDelegate(StarItemDelegate(self.bulk_rat_combo))
         self.bulk_rat_combo.addItem("Set rating\u2026", -99)
         for n in range(6):
             stars = "\u2605" * n + "\u2606" * (5 - n) if n else "\u2606\u2606\u2606\u2606\u2606  Clear"
             self.bulk_rat_combo.addItem(f"{stars}  ({n})", n)
-            if n > 0:
-                self.bulk_rat_combo.setItemData(
-                    self.bulk_rat_combo.count() - 1, QColor("#FFD60A"), Qt.ForegroundRole)
+
         self.bulk_rat_combo.setToolTip("Set rating for ALL selected songs")
         self.bulk_rat_combo.setEnabled(False)
         self.bulk_rat_combo.activated.connect(self._on_bulk_rating)
@@ -1709,8 +1734,11 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
         self.table.sortItems(COL_TITLE, Qt.AscendingOrder)
         h = self.table.horizontalHeader()
-        h.setSortIndicatorShown(True)   # show ▲/▼ arrow in sorted column
-        h.sortIndicatorChanged.connect(lambda *_: self._rebuild_play_queue())
+        h.setSortIndicatorShown(False)  # we handle it via text ▲/▼
+        h.sortIndicatorChanged.connect(self._on_sort_changed)
+        self._base_headers = ["Title", "Edit", "Category", "Edit", "Rating", "Edit"]
+        # Set initial sort arrow
+        self.table.horizontalHeaderItem(COL_TITLE).setText("Title \u25b2")
         h.setSectionResizeMode(COL_TITLE,         QHeaderView.Stretch)
         h.setSectionResizeMode(COL_TITLE_EDIT,    QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_CATEGORY,      QHeaderView.ResizeToContents)
@@ -2204,6 +2232,17 @@ class MainWindow(QMainWindow):
             return False
         return True
 
+    def _on_sort_changed(self, logical_index: int, order):
+        """Update column headers with ▲/▼ sort arrows and rebuild play queue."""
+        for i, base_name in enumerate(self._base_headers):
+            if i == logical_index:
+                arrow = " ▲" if order == Qt.AscendingOrder else " ▼"
+                self.table.horizontalHeaderItem(i).setText(base_name + arrow)
+            else:
+                self.table.horizontalHeaderItem(i).setText(base_name)
+        self._rebuild_play_queue()
+        self._update_queue_numbers()
+
     def _apply_filters(self):
         for sid, song in self.songs_by_id.items():
             item = self.row_items.get(sid)
@@ -2448,6 +2487,7 @@ class MainWindow(QMainWindow):
         self.bulk_cat_combo.setCurrentIndex(0)
         self._update_queue_numbers()
         self.watcher.blockSignals(False)
+        self._rescan_timer.stop()
         self._set_info(
             f"\u2713  {moved} songs moved to '{new_cat}'",
             "success", duration_ms=3500)
@@ -2499,8 +2539,9 @@ class MainWindow(QMainWindow):
         self.bulk_rat_combo.setCurrentIndex(0)
         self._update_queue_numbers()
 
-        # Unblock watcher AFTER everything is done
+        # Unblock watcher and cancel any queued rescans
         self.watcher.blockSignals(False)
+        self._rescan_timer.stop()
 
         stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
         self._set_info(
@@ -2639,11 +2680,10 @@ class MainWindow(QMainWindow):
     # Rating change → write directly into the audio file
     # ------------------------------------------------------------------
     def _on_rating(self, song: Song, star_widget: "StarRatingWidget", new_rating: int):
-        # Save current selection and scroll position
         item = self.row_items.get(song.id)
-        saved_row = item.row() if item else -1
 
-        # Disable sorting so the song stays in its current row position
+        # Block watcher to prevent intermediate rescan
+        self.watcher.blockSignals(True)
         self.table.setSortingEnabled(False)
 
         if not write_rating(song.path, new_rating):
@@ -2665,10 +2705,12 @@ class MainWindow(QMainWindow):
         if item:
             self.table.setRowHidden(item.row(), not self._matches(song))
 
-        # Re-enable sorting (position is preserved since we didn't change the sort key)
+        # Re-enable sorting and unblock watcher
         self.table.setSortingEnabled(True)
+        self.watcher.blockSignals(False)
+        self._rescan_timer.stop()
 
-        # Restore selection to the same song row (may have shifted)
+        # Restore selection to the same song row
         if item:
             actual_row = item.row()
             self.table.selectRow(actual_row)
@@ -2689,6 +2731,14 @@ def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_QSS)
     app.setApplicationName(APP_NAME)
+    app.setOrganizationName(ORG_NAME)
+
+    # Set app icon from assets (if available)
+    icon_path = Path("../assets/01_media/01_icons/icon.ico")
+    if icon_path.exists():
+        from PySide6.QtGui import QIcon
+        app.setWindowIcon(QIcon(str(icon_path)))
+
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
