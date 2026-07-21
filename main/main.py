@@ -53,7 +53,8 @@ APP_NAME  = "Wave Pro - Music Studio"
 # ============================================================================
 RATING_TXXX_DESC = "RATING"
 MP4_RATING_ATOM  = "----:com.apple.iTunes:RATING"
-SUPPORTED_EXTENSIONS = {".mp3",".flac",".ogg",".m4a",".mp4",".wav",".wma",".aac",".oga"}
+SUPPORTED_EXTENSIONS = {".mp3",".flac",".ogg",".m4a",".mp4",".wav",".wma",".aac",".oga",".txt"}
+TODO_EXTENSIONS      = {".txt"}   # placeholder files, not playable
 
 
 def read_display_tags(path: Path) -> Tuple[str, str]:
@@ -677,6 +678,12 @@ class PlayerController(QObject):
     def _load(self, autoplay=False):
         song = self.current_song()
         if song is None: return
+        # Skip .txt placeholder files (To-Do items) — auto-advance to next
+        if song.path.suffix.lower() in (".txt",):
+            self.songChanged.emit(song)  # update UI to show the skipped title
+            if autoplay:
+                QTimer.singleShot(100, self.next)  # skip after a brief moment
+            return
         self._player.setSource(QUrl.fromLocalFile(str(song.path)))
         self.songChanged.emit(song)
         if autoplay: self._player.play()
@@ -1301,6 +1308,8 @@ QLabel#bulkEditTitle {
 }
 
 QFrame#playerBar { background:#232325; border-top:1px solid #2c2c2e; }
+QFrame#navStrip  { background:#1c1c1e; border-top:1px solid #2c2c2e;
+                   border-bottom:1px solid #2c2c2e; }
 
 /* Path button in top bar */
 QPushButton#pathBtn {
@@ -1355,7 +1364,8 @@ COL_CATEGORY      = 2
 COL_CATEGORY_LOCK = 3
 COL_RATING        = 4
 COL_RATING_LOCK   = 5
-COL_COUNT         = 6
+COL_DELETE        = 6
+COL_COUNT         = 7
 
 ROW_HEIGHT = 38   # px – fits 20px lock icons with comfortable padding
 
@@ -1416,7 +1426,61 @@ class MainWindow(QMainWindow):
         vlay.addWidget(self._build_top_bar())
         vlay.addWidget(self._build_filter_bar())
         vlay.addWidget(self._build_table(), stretch=1)
+        vlay.addWidget(self._build_nav_strip())
         vlay.addWidget(self._build_player_bar())
+
+    def _build_nav_strip(self) -> QWidget:
+        """Strip between table and player: Focus, Scroll Top/Bottom, Add To-Do."""
+        strip = QFrame()
+        strip.setObjectName("navStrip")
+        strip.setFixedHeight(32)
+        lay = QHBoxLayout(strip)
+        lay.setContentsMargins(14, 2, 14, 2)
+        lay.setSpacing(6)
+
+        def _nav_btn(text: str, tooltip: str, w: int = 28) -> QToolButton:
+            btn = QToolButton()
+            btn.setText(text)
+            btn.setToolTip(tooltip)
+            btn.setFixedSize(w, 24)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(
+                "QToolButton{background:#2c2c2e;border:none;border-radius:6px;"
+                "color:#8e8e93;font-size:12px;font-weight:600;}"
+                "QToolButton:hover{background:#3a3a3c;color:#f2f2f7;}"
+                "QToolButton:pressed{background:#232325;}"
+            )
+            return btn
+
+        top_btn = _nav_btn("⤒ Top", "Scroll to top of list", 50)
+        top_btn.clicked.connect(self._scroll_to_top)
+        lay.addWidget(top_btn)
+
+        self.focus_btn = _nav_btn("◎ Now", "Scroll to currently playing song", 58)
+        self.focus_btn.clicked.connect(self._scroll_to_playing)
+        lay.addWidget(self.focus_btn)
+
+        bottom_btn = _nav_btn("⤓ End", "Scroll to bottom of list", 50)
+        bottom_btn.clicked.connect(self._scroll_to_bottom)
+        lay.addWidget(bottom_btn)
+
+        lay.addStretch()
+
+        # ── Add To-Do placeholder button ──
+        add_todo_btn = QToolButton()
+        add_todo_btn.setText("+ To-Do")
+        add_todo_btn.setToolTip("Create a .txt placeholder for a song you want to download later")
+        add_todo_btn.setFixedHeight(24)
+        add_todo_btn.setCursor(Qt.PointingHandCursor)
+        add_todo_btn.setStyleSheet(
+            "QToolButton{background:rgba(10,132,255,0.12);border:1px solid rgba(10,132,255,0.3);"
+            "border-radius:6px;color:#0a84ff;font-size:11px;font-weight:600;padding:0 10px;}"
+            "QToolButton:hover{background:rgba(10,132,255,0.22);border-color:#0a84ff;}"
+        )
+        add_todo_btn.clicked.connect(self._add_todo)
+        lay.addWidget(add_todo_btn)
+
+        return strip
 
     # ── top bar (compact, everything inline) ─────────────────────────
     def _build_top_bar(self) -> QWidget:
@@ -1686,7 +1750,7 @@ class MainWindow(QMainWindow):
     def _build_table(self) -> QWidget:
         self.table = QTableWidget(0, COL_COUNT)
         self.table.setHorizontalHeaderLabels(
-            ["Title", "Edit", "Category", "Edit", "Rating", "Edit"])
+            ["Title", "Edit", "Category", "Edit", "Rating", "Edit", ""])
         # Row numbers (queue numbers) — always visible on the left
         self.table.verticalHeader().setVisible(True)
         self.table.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
@@ -1703,7 +1767,7 @@ class MainWindow(QMainWindow):
         h = self.table.horizontalHeader()
         h.setSortIndicatorShown(False)  # we handle it via text ▲/▼
         h.sortIndicatorChanged.connect(self._on_sort_changed)
-        self._base_headers = ["Title", "Edit", "Category", "Edit", "Rating", "Edit"]
+        self._base_headers = ["Title", "Edit", "Category", "Edit", "Rating", "Edit", ""]
         # Set initial sort arrow
         self.table.horizontalHeaderItem(COL_TITLE).setText("Title \u25bc")
         h.setSectionResizeMode(COL_TITLE,         QHeaderView.Stretch)
@@ -1712,6 +1776,7 @@ class MainWindow(QMainWindow):
         h.setSectionResizeMode(COL_CATEGORY_LOCK, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_RATING,        QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_RATING_LOCK,   QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(COL_DELETE,        QHeaderView.ResizeToContents)
         self.table.doubleClicked.connect(self._on_double_click)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         return self.table
@@ -1839,26 +1904,6 @@ class MainWindow(QMainWindow):
         ctrl.addWidget(self.shuf_btn)
 
         ctrl.addSpacing(12)
-
-        # ── Navigation buttons: Focus / Top / Bottom ──────────────────
-        self.focus_btn = _circle_btn("◎", 30, "Scroll to currently playing song",
-                                     bg="#2c2c2e", fg="#8e8e93", font_size=14)
-        self.focus_btn.clicked.connect(self._scroll_to_playing)
-        ctrl.addWidget(self.focus_btn)
-
-        ctrl.addSpacing(2)
-
-        top_btn = _circle_btn("⤒", 26, "Scroll to top",
-                              bg="#2c2c2e", fg="#6e6e73", font_size=13)
-        top_btn.clicked.connect(self._scroll_to_top)
-        ctrl.addWidget(top_btn)
-
-        ctrl.addSpacing(2)
-
-        bottom_btn = _circle_btn("⤓", 26, "Scroll to bottom",
-                                 bg="#2c2c2e", fg="#6e6e73", font_size=13)
-        bottom_btn.clicked.connect(self._scroll_to_bottom)
-        ctrl.addWidget(bottom_btn)
 
         ctrl.addStretch(1)
 
@@ -1998,6 +2043,73 @@ class MainWindow(QMainWindow):
     def _scroll_to_bottom(self):
         """Scroll to the last visible row."""
         self.table.scrollToBottom()
+
+    # ------------------------------------------------------------------
+    # To-Do placeholder & Delete
+    # ------------------------------------------------------------------
+    def _add_todo(self):
+        """Create a .txt placeholder file in a 'To-Do' category folder."""
+        if not self.root_path:
+            self._show_toast("Open a music folder first.", 3000, "warning")
+            return
+        todo_dir = self.root_path / "To-Do"
+        todo_dir.mkdir(exist_ok=True)
+
+        # Prompt for the song name
+        from PySide6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(
+            self, "Add To-Do", "Song name to download later:",
+            QLineEdit.Normal, "")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        # Create a .txt placeholder file
+        txt_path = todo_dir / f"{name}.txt"
+        counter = 1
+        while txt_path.exists():
+            txt_path = todo_dir / f"{name} ({counter}).txt"
+            counter += 1
+        txt_path.write_text(f"To-Do: {name}\n", encoding="utf-8")
+
+        self._show_toast(f"\u2713  To-Do added: \"{name}\"", 3000, "success")
+        # The file watcher will detect the new file and trigger a rescan
+
+    def _delete_song(self, song: Song):
+        """Delete the physical file and remove the song from the table."""
+        # Confirm deletion
+        reply = QMessageBox.question(
+            self, "Delete file",
+            f"Permanently delete this file?\n\n{song.path.name}\n\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        # Stop playback if this song is playing
+        if self.player.current_song() is song:
+            self.player._player.stop()
+
+        # Delete the physical file
+        try:
+            os.remove(song.path)
+        except OSError as e:
+            self._show_toast(f"Could not delete: {e}", 5000, "error")
+            return
+
+        # Remove from cache
+        self.cache.pop(str(song.path), None)
+        if self.root_path:
+            save_cache(self.root_path, self.cache)
+
+        # Remove from table
+        item = self.row_items.pop(song.id, None)
+        self.songs_by_id.pop(song.id, None)
+        if item is not None:
+            self.table.removeRow(item.row())
+
+        self._update_queue_numbers()
+        self._rebuild_play_queue()
+        self._show_toast(f"\u2713  Deleted: {song.title}", 3000, "success")
 
     def _cycle_repeat(self):
         """Cycle: Off → All → Reverse → One → Off"""
@@ -2428,6 +2540,19 @@ class MainWindow(QMainWindow):
 
         combo.setProperty("lock_ref", cat_lock)
         star.setProperty("lock_ref", rat_lock)
+
+        # ── Delete button ──
+        del_btn = QToolButton()
+        del_btn.setText("\u2716")   # ✖
+        del_btn.setToolTip("Delete this file permanently")
+        del_btn.setCursor(Qt.PointingHandCursor)
+        del_btn.setFixedSize(20, 20)
+        del_btn.setStyleSheet(
+            "QToolButton{background:transparent;border:none;color:#6e6e73;font-size:12px;}"
+            "QToolButton:hover{color:#FF453A;}"
+        )
+        del_btn.clicked.connect(lambda _=False, s=song: self._delete_song(s))
+        self.table.setCellWidget(row, COL_DELETE, _centered(del_btn, right_pad=6))
 
         self.table.setRowHidden(row, not self._matches(song))
         self.table.setSortingEnabled(True)
