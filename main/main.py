@@ -1296,6 +1296,19 @@ QLineEdit#cellEditor {
     padding: 2px 6px;
 }
 
+/* Bulk edit bar — visually separated from filters */
+QFrame#bulkEditBar {
+    background: #232325;
+    border-top: 1px solid #2c2c2e;
+    border-bottom: 1px solid #2c2c2e;
+}
+QLabel#bulkEditTitle {
+    color: #FF9F0A;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+
 QFrame#playerBar { background:#232325; border-top:1px solid #2c2c2e; }
 
 /* Path button in top bar */
@@ -1539,6 +1552,11 @@ class MainWindow(QMainWindow):
 
     # ── filter bar (Excel-style) ──────────────────────────────────────
     def _build_filter_bar(self) -> QWidget:
+        wrapper = QWidget()
+        outer = QVBoxLayout(wrapper)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
         bar = QFrame(); bar.setObjectName("filterBar")
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(12, 8, 12, 8); lay.setSpacing(8)
@@ -1609,30 +1627,46 @@ class MainWindow(QMainWindow):
         lay.addSpacing(16)
 
         # ── Play filtered button ──────────────────────────────────────
-        self.play_filtered_btn = QPushButton("▶  Play Filtered")
+        self.play_filtered_btn = QPushButton("\u25b6  Play Filtered")
         self.play_filtered_btn.setObjectName("playFilteredButton")
         self.play_filtered_btn.setToolTip(
             "Play all songs currently visible (respects active filters)")
         self.play_filtered_btn.clicked.connect(self._play_filtered)
         lay.addWidget(self.play_filtered_btn)
 
-        lay.addSpacing(12)
+        lay.addStretch()
 
-        # ── Bulk edit (enabled when multiple songs are selected) ──────
-        bulk_lbl = QLabel("Bulk:")
-        bulk_lbl.setObjectName("subtleLabel")
-        lay.addWidget(bulk_lbl)
+        reset_btn = QPushButton("Reset filters")
+        reset_btn.clicked.connect(self._reset_filters)
+        lay.addWidget(reset_btn)
+
+        outer.addWidget(bar)
+
+        # ── Bulk Edit row (separate line, visually distinct) ──────────
+        bulk_bar = QFrame()
+        bulk_bar.setObjectName("bulkEditBar")
+        bulk_lay = QHBoxLayout(bulk_bar)
+        bulk_lay.setContentsMargins(12, 4, 12, 4)
+        bulk_lay.setSpacing(10)
+
+        bulk_title = QLabel("BULK EDIT")
+        bulk_title.setObjectName("bulkEditTitle")
+        bulk_lay.addWidget(bulk_title)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.VLine)
+        sep.setStyleSheet("color:#3a3a3c;"); sep.setFixedHeight(20)
+        bulk_lay.addWidget(sep)
 
         self.bulk_cat_combo = QComboBox()
-        self.bulk_cat_combo.setFixedWidth(130)
-        self.bulk_cat_combo.addItem("Move to…")
+        self.bulk_cat_combo.setFixedWidth(140)
+        self.bulk_cat_combo.addItem("Move to\u2026")
         self.bulk_cat_combo.setToolTip("Move ALL selected songs to this category")
         self.bulk_cat_combo.setEnabled(False)
         self.bulk_cat_combo.activated.connect(self._on_bulk_category)
-        lay.addWidget(self.bulk_cat_combo)
+        bulk_lay.addWidget(self.bulk_cat_combo)
 
         self.bulk_rat_combo = QComboBox()
-        self.bulk_rat_combo.setFixedWidth(150)
+        self.bulk_rat_combo.setFixedWidth(160)
         self.bulk_rat_combo.addItem("Set rating\u2026", -99)
         for n in range(6):
             stars = "\u2605" * n + "\u2606" * (5 - n) if n else "\u2606\u2606\u2606\u2606\u2606  Clear"
@@ -1640,14 +1674,15 @@ class MainWindow(QMainWindow):
         self.bulk_rat_combo.setToolTip("Set rating for ALL selected songs")
         self.bulk_rat_combo.setEnabled(False)
         self.bulk_rat_combo.activated.connect(self._on_bulk_rating)
-        lay.addWidget(self.bulk_rat_combo)
+        bulk_lay.addWidget(self.bulk_rat_combo)
 
-        lay.addStretch()
+        self.bulk_status = QLabel("Select 2+ songs to enable")
+        self.bulk_status.setObjectName("subtleLabel")
+        bulk_lay.addWidget(self.bulk_status)
 
-        reset_btn = QPushButton("Reset filters")
-        reset_btn.clicked.connect(self._reset_filters)
-        lay.addWidget(reset_btn)
-        return bar
+        bulk_lay.addStretch()
+        outer.addWidget(bulk_bar)
+        return wrapper
 
     # ── song table ────────────────────────────────────────────────────
     def _build_table(self) -> QWidget:
@@ -1669,6 +1704,7 @@ class MainWindow(QMainWindow):
         self.table.sortItems(COL_TITLE, Qt.AscendingOrder)
         h = self.table.horizontalHeader()
         h.setSortIndicatorShown(True)   # show ▲/▼ arrow in sorted column
+        h.sortIndicatorChanged.connect(lambda *_: self._rebuild_play_queue())
         h.setSectionResizeMode(COL_TITLE,         QHeaderView.Stretch)
         h.setSectionResizeMode(COL_TITLE_EDIT,    QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_CATEGORY,      QHeaderView.ResizeToContents)
@@ -2168,6 +2204,20 @@ class MainWindow(QMainWindow):
             if item is not None:
                 self.table.setRowHidden(item.row(), not self._matches(song))
         self._update_queue_numbers()
+        self._rebuild_play_queue()
+
+    def _rebuild_play_queue(self):
+        """Rebuild the player's queue from the current visible table order.
+        Preserves the currently playing song's position in the new queue."""
+        current = self.player.current_song()
+        new_queue = self._visible_songs_in_order()
+        if not new_queue:
+            return
+        self.player._queue = new_queue
+        if current and current in new_queue:
+            self.player._index = new_queue.index(current)
+        elif new_queue:
+            self.player._index = max(0, min(self.player._index, len(new_queue) - 1))
 
     def _update_queue_numbers(self):
         """Renumber visible rows 1,2,3... so Queue # always reflects the
@@ -2311,13 +2361,15 @@ class MainWindow(QMainWindow):
         self.bulk_cat_combo.setEnabled(multi)
         self.bulk_rat_combo.setEnabled(multi)
         if multi:
-            # Rebuild category list in bulk combo
+            self.bulk_status.setText(f"{len(sel_rows)} songs selected")
             cats = list_categories(self.root_path) if self.root_path else []
             self.bulk_cat_combo.blockSignals(True)
             self.bulk_cat_combo.clear()
             self.bulk_cat_combo.addItem("Move to\u2026")
             self.bulk_cat_combo.addItems(cats)
             self.bulk_cat_combo.blockSignals(False)
+        else:
+            self.bulk_status.setText("Select 2+ songs to enable")
 
     def _selected_songs(self) -> List[Song]:
         """Return songs from the currently selected rows."""
@@ -2344,9 +2396,14 @@ class MainWindow(QMainWindow):
         songs = self._selected_songs()
         if not songs:
             return
+
+        self._rescan_timer.stop()
         self.table.setSortingEnabled(False)
+        self._set_info(f"Moving {len(songs)} files to '{new_cat}'\u2026", "loading", auto_reset=False)
+        app = QApplication.instance()
+
         moved = 0
-        for song in songs:
+        for i, song in enumerate(songs):
             if song.category == new_cat:
                 continue
             if self.player.current_song() is song and self.player.is_playing():
@@ -2361,7 +2418,6 @@ class MainWindow(QMainWindow):
             self.player.notify_song_path_changed(song, new_path)
             self.cache.pop(old_path_str, None)
             self._sync_cache(song)
-            # Update the combo widget in the row
             item = self.row_items.get(song.id)
             if item:
                 combo = self.table.cellWidget(item.row(), COL_CATEGORY)
@@ -2370,9 +2426,15 @@ class MainWindow(QMainWindow):
                     combo.setCurrentText(new_cat)
                     combo.blockSignals(False)
             moved += 1
+            if (i + 1) % 50 == 0 and app:
+                app.processEvents()
+
         self.table.setSortingEnabled(True)
         self.bulk_cat_combo.setCurrentIndex(0)
-        self._show_toast(f"\u2713  {moved} songs moved to '{new_cat}'", 3500, "success")
+        self._update_queue_numbers()
+        self._set_info(
+            f"\u2713  {moved} songs moved to '{new_cat}'",
+            "success", duration_ms=3500)
 
     def _on_bulk_rating(self, idx: int):
         if idx <= 0:
@@ -2383,13 +2445,18 @@ class MainWindow(QMainWindow):
         songs = self._selected_songs()
         if not songs:
             return
+
+        # Suppress file watcher to avoid triggering 1000+ individual rescans
+        self._rescan_timer.stop()
         self.table.setSortingEnabled(False)
+        self._set_info(f"Writing rating to {len(songs)} files\u2026", "loading", auto_reset=False)
+        app = QApplication.instance()
+
         count = 0
-        for song in songs:
+        for i, song in enumerate(songs):
             if write_rating(song.path, new_rating):
                 song.rating = new_rating
                 self._sync_cache(song)
-                # Update the star widget
                 item = self.row_items.get(song.id)
                 if item:
                     star_wrap = self.table.cellWidget(item.row(), COL_RATING)
@@ -2398,12 +2465,17 @@ class MainWindow(QMainWindow):
                         if star:
                             star.set_rating(new_rating)
                 count += 1
+            # Process events every 50 files to keep UI responsive
+            if (i + 1) % 50 == 0 and app:
+                app.processEvents()
+
         self.table.setSortingEnabled(True)
         self.bulk_rat_combo.setCurrentIndex(0)
+        self._update_queue_numbers()
         stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
-        self._show_toast(
-            f"\u2713  Rating set to {stars} ({new_rating}/5) for {count} songs",
-            3500, "success")
+        self._set_info(
+            f"\u2713  Rating {stars} ({new_rating}/5) set for {count} songs",
+            "success", duration_ms=3500)
 
     def _on_double_click(self, index):
         item = self.table.item(index.row(), COL_TITLE)
