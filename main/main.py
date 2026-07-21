@@ -1303,7 +1303,7 @@ QFrame#bulkEditBar {
     border-bottom: 1px solid #2c2c2e;
 }
 QLabel#bulkEditTitle {
-    color: #FF9F0A;
+    color: #0a84ff;
     font-size: 10px;
     font-weight: 700;
     letter-spacing: 1px;
@@ -1600,6 +1600,8 @@ class MainWindow(QMainWindow):
         }
         for n, lbl in star_labels.items():
             self.rat_filter.addItem(lbl, n)
+            self.rat_filter.setItemData(
+                self.rat_filter.count() - 1, QColor("#FFD60A"), Qt.ForegroundRole)
         self.rat_filter.currentIndexChanged.connect(self._on_rat_filter_changed)
         lay.addWidget(self.rat_filter)
 
@@ -1640,9 +1642,7 @@ class MainWindow(QMainWindow):
         reset_btn.clicked.connect(self._reset_filters)
         lay.addWidget(reset_btn)
 
-        outer.addWidget(bar)
-
-        # ── Bulk Edit row (separate line, visually distinct) ──────────
+        # ── Bulk Edit row (separate line above filters) ──────────────
         bulk_bar = QFrame()
         bulk_bar.setObjectName("bulkEditBar")
         bulk_lay = QHBoxLayout(bulk_bar)
@@ -1671,6 +1671,9 @@ class MainWindow(QMainWindow):
         for n in range(6):
             stars = "\u2605" * n + "\u2606" * (5 - n) if n else "\u2606\u2606\u2606\u2606\u2606  Clear"
             self.bulk_rat_combo.addItem(f"{stars}  ({n})", n)
+            if n > 0:
+                self.bulk_rat_combo.setItemData(
+                    self.bulk_rat_combo.count() - 1, QColor("#FFD60A"), Qt.ForegroundRole)
         self.bulk_rat_combo.setToolTip("Set rating for ALL selected songs")
         self.bulk_rat_combo.setEnabled(False)
         self.bulk_rat_combo.activated.connect(self._on_bulk_rating)
@@ -1681,7 +1684,10 @@ class MainWindow(QMainWindow):
         bulk_lay.addWidget(self.bulk_status)
 
         bulk_lay.addStretch()
+
+        # Add bulk bar FIRST (above), then filter bar (closer to songs)
         outer.addWidget(bulk_bar)
+        outer.addWidget(bar)
         return wrapper
 
     # ── song table ────────────────────────────────────────────────────
@@ -2391,19 +2397,19 @@ class MainWindow(QMainWindow):
 
     def _on_bulk_category(self, idx: int):
         if idx <= 0:
-            return   # "Move to…" placeholder
+            return
         new_cat = self.bulk_cat_combo.itemText(idx)
         songs = self._selected_songs()
         if not songs:
             return
 
+        self.watcher.blockSignals(True)
         self._rescan_timer.stop()
         self.table.setSortingEnabled(False)
         self._set_info(f"Moving {len(songs)} files to '{new_cat}'\u2026", "loading", auto_reset=False)
-        app = QApplication.instance()
 
         moved = 0
-        for i, song in enumerate(songs):
+        for song in songs:
             if song.category == new_cat:
                 continue
             if self.player.current_song() is song and self.player.is_playing():
@@ -2417,7 +2423,15 @@ class MainWindow(QMainWindow):
             song.category = new_cat
             self.player.notify_song_path_changed(song, new_path)
             self.cache.pop(old_path_str, None)
-            self._sync_cache(song)
+            try:
+                st = new_path.stat()
+                self.cache[str(new_path)] = {
+                    "size": st.st_size, "mtime": st.st_mtime,
+                    "title": song.title, "artist": song.artist,
+                    "rating": song.rating, "duration": song.duration,
+                    "id": song.id}
+            except OSError:
+                pass
             item = self.row_items.get(song.id)
             if item:
                 combo = self.table.cellWidget(item.row(), COL_CATEGORY)
@@ -2426,19 +2440,21 @@ class MainWindow(QMainWindow):
                     combo.setCurrentText(new_cat)
                     combo.blockSignals(False)
             moved += 1
-            if (i + 1) % 50 == 0 and app:
-                app.processEvents()
+
+        if self.root_path:
+            save_cache(self.root_path, self.cache)
 
         self.table.setSortingEnabled(True)
         self.bulk_cat_combo.setCurrentIndex(0)
         self._update_queue_numbers()
+        self.watcher.blockSignals(False)
         self._set_info(
             f"\u2713  {moved} songs moved to '{new_cat}'",
             "success", duration_ms=3500)
 
     def _on_bulk_rating(self, idx: int):
         if idx <= 0:
-            return   # "Set rating…" placeholder
+            return
         new_rating = self.bulk_rat_combo.itemData(idx)
         if new_rating is None or new_rating < 0:
             return
@@ -2446,17 +2462,26 @@ class MainWindow(QMainWindow):
         if not songs:
             return
 
-        # Suppress file watcher to avoid triggering 1000+ individual rescans
+        # Block ALL file-change signals to prevent repeated rescans
+        self.watcher.blockSignals(True)
         self._rescan_timer.stop()
         self.table.setSortingEnabled(False)
         self._set_info(f"Writing rating to {len(songs)} files\u2026", "loading", auto_reset=False)
-        app = QApplication.instance()
 
         count = 0
-        for i, song in enumerate(songs):
+        for song in songs:
             if write_rating(song.path, new_rating):
                 song.rating = new_rating
-                self._sync_cache(song)
+                # Update cache dict in memory (no disk write per song)
+                try:
+                    st = song.path.stat()
+                    self.cache[str(song.path)] = {
+                        "size": st.st_size, "mtime": st.st_mtime,
+                        "title": song.title, "artist": song.artist,
+                        "rating": new_rating, "duration": song.duration,
+                        "id": song.id}
+                except OSError:
+                    pass
                 item = self.row_items.get(song.id)
                 if item:
                     star_wrap = self.table.cellWidget(item.row(), COL_RATING)
@@ -2465,13 +2490,18 @@ class MainWindow(QMainWindow):
                         if star:
                             star.set_rating(new_rating)
                 count += 1
-            # Process events every 50 files to keep UI responsive
-            if (i + 1) % 50 == 0 and app:
-                app.processEvents()
+
+        # Save cache ONCE at the end
+        if self.root_path:
+            save_cache(self.root_path, self.cache)
 
         self.table.setSortingEnabled(True)
         self.bulk_rat_combo.setCurrentIndex(0)
         self._update_queue_numbers()
+
+        # Unblock watcher AFTER everything is done
+        self.watcher.blockSignals(False)
+
         stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
         self._set_info(
             f"\u2713  Rating {stars} ({new_rating}/5) set for {count} songs",
