@@ -600,55 +600,69 @@ class PlayerController(QObject):
         if not self._queue: return
         if self._repeat == RepeatMode.ONE:
             self._load(autoplay=True); return
-        if self._shuffle:
-            import random
-            candidates = [i for i in range(len(self._queue)) if i != self._index]
-            if candidates:
-                self._index = random.choice(candidates)
-            elif self._repeat in (RepeatMode.ALL, RepeatMode.REVERSE):
-                self._index = 0
+        start_idx = self._index
+        attempts = 0
+        while attempts < len(self._queue):
+            if self._shuffle:
+                import random
+                candidates = [i for i in range(len(self._queue)) if i != self._index]
+                if candidates:
+                    self._index = random.choice(candidates)
+                elif self._repeat in (RepeatMode.ALL, RepeatMode.REVERSE):
+                    self._index = 0
+                else:
+                    self._player.stop(); self.songChanged.emit(None); return
+            elif self._repeat == RepeatMode.REVERSE:
+                if self._index - 1 >= 0:
+                    self._index -= 1
+                else:
+                    self._player.stop(); self.songChanged.emit(None); return
             else:
-                self._player.stop(); self.songChanged.emit(None); return
-        elif self._repeat == RepeatMode.REVERSE:
-            # REVERSE: auto-advance goes backwards
-            if self._index - 1 >= 0:
-                self._index -= 1
-            else:
-                self._player.stop(); self.songChanged.emit(None); return
-        else:
-            if self._index + 1 < len(self._queue):
-                self._index += 1
-            elif self._repeat == RepeatMode.ALL:
-                self._index = 0
-            else:
-                self._player.stop(); self.songChanged.emit(None); return
-        self._load(autoplay=True)
+                if self._index + 1 < len(self._queue):
+                    self._index += 1
+                elif self._repeat == RepeatMode.ALL:
+                    self._index = 0
+                else:
+                    self._player.stop(); self.songChanged.emit(None); return
+            # Skip .txt placeholder files
+            song = self.current_song()
+            if song and song.path.suffix.lower() not in TODO_EXTENSIONS:
+                self._load(autoplay=True); return
+            attempts += 1
+        # All songs are .txt — nothing to play
+        self._player.stop(); self.songChanged.emit(None)
 
     def previous(self):
         if not self._queue: return
         if self._player.position() > 3000:
             self._player.setPosition(0); return
-        if self._shuffle:
-            import random
-            candidates = [i for i in range(len(self._queue)) if i != self._index]
-            if candidates:
-                self._index = random.choice(candidates)
+        attempts = 0
+        while attempts < len(self._queue):
+            if self._shuffle:
+                import random
+                candidates = [i for i in range(len(self._queue)) if i != self._index]
+                if candidates:
+                    self._index = random.choice(candidates)
+                else:
+                    self._index = 0
+            elif self._repeat == RepeatMode.REVERSE:
+                if self._index + 1 < len(self._queue):
+                    self._index += 1
+                else:
+                    self._index = len(self._queue) - 1
             else:
-                self._index = 0
-        elif self._repeat == RepeatMode.REVERSE:
-            # In REVERSE mode, "previous" goes forward
-            if self._index + 1 < len(self._queue):
-                self._index += 1
-            else:
-                self._index = len(self._queue) - 1
-        else:
-            if self._index - 1 >= 0:
-                self._index -= 1
-            elif self._repeat == RepeatMode.ALL:
-                self._index = len(self._queue) - 1
-            else:
-                self._index = 0
-        self._load(autoplay=True)
+                if self._index - 1 >= 0:
+                    self._index -= 1
+                elif self._repeat == RepeatMode.ALL:
+                    self._index = len(self._queue) - 1
+                else:
+                    self._index = 0
+            # Skip .txt placeholder files
+            song = self.current_song()
+            if song and song.path.suffix.lower() not in TODO_EXTENSIONS:
+                self._load(autoplay=True); return
+            attempts += 1
+        self._player.stop(); self.songChanged.emit(None)
 
     def seek(self, ms: int): self._player.setPosition(ms)
 
@@ -678,12 +692,10 @@ class PlayerController(QObject):
     def _load(self, autoplay=False):
         song = self.current_song()
         if song is None: return
-        # Skip .txt placeholder files (To-Do items) — auto-advance to next
-        if song.path.suffix.lower() in (".txt",):
-            self.songChanged.emit(song)  # update UI to show the skipped title
-            if autoplay:
-                QTimer.singleShot(100, self.next)  # skip after a brief moment
-            return
+        # .txt placeholder files can't play — skip silently
+        if song.path.suffix.lower() in TODO_EXTENSIONS:
+            self.songChanged.emit(song)   # update UI
+            return   # caller (next/prev) handles skipping
         self._player.setSource(QUrl.fromLocalFile(str(song.path)))
         self.songChanged.emit(song)
         if autoplay: self._player.play()
@@ -1430,7 +1442,7 @@ class MainWindow(QMainWindow):
         vlay.addWidget(self._build_player_bar())
 
     def _build_nav_strip(self) -> QWidget:
-        """Strip between table and player: Focus, Scroll Top/Bottom, Add To-Do."""
+        """Strip between table and player: To-Do (left), scroll buttons (right)."""
         strip = QFrame()
         strip.setObjectName("navStrip")
         strip.setFixedHeight(32)
@@ -1452,24 +1464,10 @@ class MainWindow(QMainWindow):
             )
             return btn
 
-        top_btn = _nav_btn("⤒ Top", "Scroll to top of list", 50)
-        top_btn.clicked.connect(self._scroll_to_top)
-        lay.addWidget(top_btn)
-
-        self.focus_btn = _nav_btn("◎ Now", "Scroll to currently playing song", 58)
-        self.focus_btn.clicked.connect(self._scroll_to_playing)
-        lay.addWidget(self.focus_btn)
-
-        bottom_btn = _nav_btn("⤓ End", "Scroll to bottom of list", 50)
-        bottom_btn.clicked.connect(self._scroll_to_bottom)
-        lay.addWidget(bottom_btn)
-
-        lay.addStretch()
-
-        # ── Add To-Do placeholder button ──
+        # ── To-Do on the LEFT ──
         add_todo_btn = QToolButton()
         add_todo_btn.setText("+ To-Do")
-        add_todo_btn.setToolTip("Create a .txt placeholder for a song you want to download later")
+        add_todo_btn.setToolTip("Create a .txt placeholder for a song to download later")
         add_todo_btn.setFixedHeight(24)
         add_todo_btn.setCursor(Qt.PointingHandCursor)
         add_todo_btn.setStyleSheet(
@@ -1479,6 +1477,21 @@ class MainWindow(QMainWindow):
         )
         add_todo_btn.clicked.connect(self._add_todo)
         lay.addWidget(add_todo_btn)
+
+        lay.addStretch()
+
+        # ── Scroll buttons on the RIGHT ──
+        top_btn = _nav_btn("\u2912 Top", "Scroll to top of list", 50)
+        top_btn.clicked.connect(self._scroll_to_top)
+        lay.addWidget(top_btn)
+
+        self.focus_btn = _nav_btn("\u25ce Now", "Scroll to currently playing song", 58)
+        self.focus_btn.clicked.connect(self._scroll_to_playing)
+        lay.addWidget(self.focus_btn)
+
+        bottom_btn = _nav_btn("\u2913 End", "Scroll to bottom of list", 50)
+        bottom_btn.clicked.connect(self._scroll_to_bottom)
+        lay.addWidget(bottom_btn)
 
         return strip
 
@@ -2048,23 +2061,37 @@ class MainWindow(QMainWindow):
     # To-Do placeholder & Delete
     # ------------------------------------------------------------------
     def _add_todo(self):
-        """Create a .txt placeholder file in a 'To-Do' category folder."""
+        """Create a .txt placeholder in a 'To-Do' subfolder."""
         if not self.root_path:
             self._show_toast("Open a music folder first.", 3000, "warning")
             return
+
+        # Auto-create To-Do subfolder if it doesn't exist
         todo_dir = self.root_path / "To-Do"
-        todo_dir.mkdir(exist_ok=True)
+        if not todo_dir.exists():
+            try:
+                todo_dir.mkdir(parents=True, exist_ok=True)
+                # Watch the new folder
+                self.watcher.addPath(str(todo_dir))
+                self._rebuild_cat_filter()
+            except OSError as e:
+                self._show_toast(f"Could not create To-Do folder: {e}", 5000, "error")
+                return
 
-        # Prompt for the song name
+        # Wider input dialog for long song names
         from PySide6.QtWidgets import QInputDialog
-        name, ok = QInputDialog.getText(
-            self, "Add To-Do", "Song name to download later:",
-            QLineEdit.Normal, "")
-        if not ok or not name.strip():
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle("Add To-Do")
+        dlg.setLabelText("Song name to download later:")
+        dlg.setTextValue("")
+        dlg.resize(500, dlg.height())   # wider dialog
+        if not dlg.exec():
             return
-        name = name.strip()
+        name = dlg.textValue().strip()
+        if not name:
+            return
 
-        # Create a .txt placeholder file
+        # Create the .txt placeholder file
         txt_path = todo_dir / f"{name}.txt"
         counter = 1
         while txt_path.exists():
@@ -2072,8 +2099,36 @@ class MainWindow(QMainWindow):
             counter += 1
         txt_path.write_text(f"To-Do: {name}\n", encoding="utf-8")
 
+        # Ask for rating (optional, quick)
+        ratings = ["No rating (0)", "\u2605 (1)", "\u2605\u2605 (2)",
+                    "\u2605\u2605\u2605 (3)", "\u2605\u2605\u2605\u2605 (4)",
+                    "\u2605\u2605\u2605\u2605\u2605 (5)"]
+        rat_str, ok = QInputDialog.getItem(
+            self, "Set Rating", f"Rating for \"{name}\":", ratings, 0, False)
+        if ok and rat_str:
+            rat_val = ratings.index(rat_str)
+        else:
+            rat_val = 0
+
+        # Immediately add the song to the table (don't wait for watcher)
+        song = Song(
+            path=txt_path, category="To-Do",
+            title=txt_path.stem, artist="",
+            rating=rat_val, duration=0.0)
+        self._add_or_update(song)
+        self.watcher.addPath(str(txt_path))
+
+        # Write rating into cache
+        self.cache[str(txt_path)] = {
+            "size": txt_path.stat().st_size, "mtime": txt_path.stat().st_mtime,
+            "title": song.title, "artist": "", "rating": rat_val,
+            "duration": 0.0, "id": song.id}
+        if self.root_path:
+            save_cache(self.root_path, self.cache)
+
+        self._rebuild_cat_filter()
+        self._apply_filters()
         self._show_toast(f"\u2713  To-Do added: \"{name}\"", 3000, "success")
-        # The file watcher will detect the new file and trigger a rescan
 
     def _delete_song(self, song: Song):
         """Delete the physical file and remove the song from the table."""
@@ -2813,32 +2868,43 @@ class MainWindow(QMainWindow):
 
     def _on_cat_combo(self, song: Song, combo: QComboBox, new_cat: str):
         if new_cat == song.category or not combo.isEnabled(): return
+
+        # Block watcher to prevent duplicate detection during move
+        self.watcher.blockSignals(True)
         self.table.setSortingEnabled(False)
+
         if self.player.current_song() is song and self.player.is_playing():
             self._show_toast("Pause the song first before moving it to another category.", 3500, "warning")
             combo.blockSignals(True); combo.setCurrentText(song.category); combo.blockSignals(False)
             self.table.setSortingEnabled(True)
+            self.watcher.blockSignals(False)
             return
 
         old_cat, old_path_str = song.category, str(song.path)
         try:
             new_path = safe_move_song(song, self.root_path, new_cat)
         except SafeMoveError as e:
-            self._show_toast(f"Move failed: {e}  —  Original was NOT modified.", 6000, "error")
+            self._show_toast(f"Move failed: {e}", 6000, "error")
             combo.blockSignals(True); combo.setCurrentText(old_cat); combo.blockSignals(False)
             self.table.setSortingEnabled(True)
+            self.watcher.blockSignals(False)
             return
 
+        # Update song data immediately
         song.path = new_path; song.category = new_cat
         self.player.notify_song_path_changed(song, new_path)
-        self._sync_cache(song)
         self.cache.pop(old_path_str, None)
+        self._sync_cache(song)
 
         lock: LockButton = combo.property("lock_ref")
         if lock: lock.set_locked(True)
         combo.setEnabled(False)
         self.table.setRowHidden(self.row_items[song.id].row(), not self._matches(song))
         self.table.setSortingEnabled(True)
+
+        # Unblock watcher and cancel any pending rescans
+        self.watcher.blockSignals(False)
+        self._rescan_timer.stop()
         self._show_toast(f"\u2713  '{song.title}'  moved: {old_cat} \u2192 {new_cat}", 3500, "success")
 
     # ------------------------------------------------------------------
