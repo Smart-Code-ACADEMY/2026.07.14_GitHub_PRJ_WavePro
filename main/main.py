@@ -1561,8 +1561,6 @@ class MainWindow(QMainWindow):
         info_lay.addWidget(self.song_count_label)
 
         self.changes_btn = QPushButton("View changes")
-        self.changes_btn.setEnabled(False)
-        self.changes_btn.setVisible(False)
         self.changes_btn.clicked.connect(self._show_changes)
         info_lay.addWidget(self.changes_btn)
 
@@ -2415,8 +2413,6 @@ class MainWindow(QMainWindow):
                 display += line + "\n"
 
         QMessageBox.information(self, "Change History", display)
-        self.changes_btn.setVisible(False)
-        self.changes_btn.setEnabled(False)
 
     def _changelog_path(self) -> Path:
         base = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
@@ -2477,46 +2473,82 @@ class MainWindow(QMainWindow):
         self._apply_filters()
 
     def _show_cat_checkboxes(self):
-        """Show a popup with checkboxes for each category."""
+        """Category filter popup: click name = select only that one,
+        use checkboxes for multi-select. Auto-applies on close."""
         from PySide6.QtWidgets import QMenu, QWidgetAction, QCheckBox
+
         menu = QMenu(self)
         menu.setStyleSheet(
-            "QMenu{background:#2c2c2e;border:1px solid #3a3a3c;border-radius:8px;padding:4px;}"
-            "QCheckBox{color:#f2f2f7;font-size:12px;padding:4px 8px;}"
-            "QCheckBox::indicator{width:14px;height:14px;border-radius:3px;"
-            "border:1px solid #5a5a5e;background:#1c1c1e;}"
-            "QCheckBox::indicator:checked{background:#0a84ff;border-color:#0a84ff;}"
+            "QMenu{background:#2c2c2e;border:1px solid #3a3a3c;"
+            "border-radius:8px;padding:6px 0;}"
         )
 
-        # "All" toggle
-        all_checked = all(self._cat_checks.get(c, True) for c in self._last_cats)
-        all_cb = QCheckBox("Select All")
-        all_cb.setChecked(all_checked)
-        wa = QWidgetAction(menu)
-        wa.setDefaultWidget(all_cb)
-        menu.addAction(wa)
+        cat_cbs: list = []
+
+        def _make_row(cat_name: str) -> QWidget:
+            """Each row: [checkbox] [clickable label]"""
+            row_w = QWidget()
+            row_lay = QHBoxLayout(row_w)
+            row_lay.setContentsMargins(10, 2, 10, 2)
+            row_lay.setSpacing(6)
+
+            cb = QCheckBox()
+            cb.setChecked(self._cat_checks.get(cat_name, True))
+            cb.setStyleSheet(
+                "QCheckBox::indicator{width:14px;height:14px;border-radius:3px;"
+                "border:1px solid #5a5a5e;background:#1c1c1e;}"
+                "QCheckBox::indicator:checked{background:#0a84ff;border-color:#0a84ff;}"
+            )
+            row_lay.addWidget(cb)
+
+            lbl = QPushButton(cat_name)
+            lbl.setStyleSheet(
+                "QPushButton{background:transparent;border:none;color:#f2f2f7;"
+                "font-size:12px;text-align:left;padding:4px 4px;}"
+                "QPushButton:hover{color:#0a84ff;}"
+            )
+            lbl.setCursor(Qt.PointingHandCursor)
+            # Click label = select ONLY this category
+            lbl.clicked.connect(lambda _=False, c=cat_name: _select_only(c))
+            row_lay.addWidget(lbl, stretch=1)
+
+            cat_cbs.append((cat_name, cb))
+            return row_w
+
+        def _select_only(cat_name: str):
+            """Select only one category and close the menu."""
+            for c in self._cat_checks:
+                self._cat_checks[c] = (c == cat_name)
+            menu.close()
+
+        # "All" row
+        all_w = QWidget()
+        all_lay = QHBoxLayout(all_w)
+        all_lay.setContentsMargins(10, 2, 10, 2)
+        all_btn = QPushButton("Select All")
+        all_btn.setStyleSheet(
+            "QPushButton{background:transparent;border:none;color:#0a84ff;"
+            "font-size:12px;font-weight:600;text-align:left;padding:4px 4px;}"
+            "QPushButton:hover{color:#3399ff;}")
+        all_btn.setCursor(Qt.PointingHandCursor)
+        all_btn.clicked.connect(lambda: [cb.setChecked(True) for _, cb in cat_cbs])
+        all_lay.addWidget(all_btn)
+        wa_all = QWidgetAction(menu)
+        wa_all.setDefaultWidget(all_w)
+        menu.addAction(wa_all)
         menu.addSeparator()
 
-        cat_cbs = []
+        # One row per category
         for cat in self._last_cats:
-            cb = QCheckBox(cat)
-            cb.setChecked(self._cat_checks.get(cat, True))
-            a = QWidgetAction(menu)
-            a.setDefaultWidget(cb)
-            menu.addAction(a)
-            cat_cbs.append((cat, cb))
+            wa = QWidgetAction(menu)
+            wa.setDefaultWidget(_make_row(cat))
+            menu.addAction(wa)
 
-        def toggle_all(state):
-            for _, cb in cat_cbs:
-                cb.setChecked(state)
-
-        all_cb.toggled.connect(toggle_all)
-
-        # Show the popup below the button
+        # Show popup
         menu.exec(self.cat_filter_btn.mapToGlobal(
             self.cat_filter_btn.rect().bottomLeft()))
 
-        # Read checked states
+        # Read checkbox states after popup closes
         for cat, cb in cat_cbs:
             self._cat_checks[cat] = cb.isChecked()
 
