@@ -2066,32 +2066,111 @@ class MainWindow(QMainWindow):
             self._show_toast("Open a music folder first.", 3000, "warning")
             return
 
+        # Block watcher to prevent duplicate detection
+        self.watcher.blockSignals(True)
+
         # Auto-create To-Do subfolder if it doesn't exist
         todo_dir = self.root_path / "To-Do"
         if not todo_dir.exists():
             try:
                 todo_dir.mkdir(parents=True, exist_ok=True)
-                # Watch the new folder
                 self.watcher.addPath(str(todo_dir))
                 self._rebuild_cat_filter()
             except OSError as e:
+                self.watcher.blockSignals(False)
                 self._show_toast(f"Could not create To-Do folder: {e}", 5000, "error")
                 return
 
-        # Wider input dialog for long song names
-        from PySide6.QtWidgets import QInputDialog
-        dlg = QInputDialog(self)
+        # Build autocomplete word list from existing song titles
+        existing_titles = [s.title for s in self.songs_by_id.values()]
+
+        # ── Custom dialog: name input + autocomplete + star rating ────
+        from PySide6.QtWidgets import QDialog, QCompleter
+        dlg = QDialog(self)
         dlg.setWindowTitle("Add To-Do")
-        dlg.setLabelText("Song name to download later:")
-        dlg.setTextValue("")
-        dlg.resize(500, dlg.height())   # wider dialog
+        dlg.setFixedWidth(650)
+        dlg_lay = QVBoxLayout(dlg)
+        dlg_lay.setContentsMargins(20, 16, 20, 16)
+        dlg_lay.setSpacing(12)
+
+        lbl = QLabel("Song name to download later:")
+        lbl.setStyleSheet("font-size:13px;")
+        dlg_lay.addWidget(lbl)
+
+        name_input = QLineEdit()
+        name_input.setPlaceholderText("Type song name...")
+        name_input.setMinimumHeight(32)
+        # Autocomplete from existing titles (case-insensitive)
+        completer = QCompleter(existing_titles, dlg)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        completer.setMaxVisibleItems(5)
+        name_input.setCompleter(completer)
+        dlg_lay.addWidget(name_input)
+
+        # Star rating — 5 clickable buttons
+        rat_row = QHBoxLayout()
+        rat_label = QLabel("Rating:")
+        rat_label.setStyleSheet("font-size:12px;color:#8e8e93;")
+        rat_row.addWidget(rat_label)
+        todo_rating = [0]   # mutable so inner functions can modify
+
+        star_btns = []
+        for i in range(5):
+            sb = QPushButton("\u2606")
+            sb.setObjectName("starBtn")
+            sb.setFixedSize(30, 30)
+            sb.setCursor(Qt.PointingHandCursor)
+            star_btns.append(sb)
+            rat_row.addWidget(sb)
+
+        def _update_todo_stars(rating):
+            todo_rating[0] = rating
+            for j, b in enumerate(star_btns):
+                filled = j < rating
+                color = "#FFD60A" if filled else "#8e8e93"
+                char = "\u2605" if filled else "\u2606"
+                b.setText(char)
+                b.setStyleSheet(
+                    f"QPushButton#starBtn{{border:none;background:transparent;"
+                    f"color:{color};font-size:20px;}}"
+                    f"QPushButton#starBtn:hover{{background:rgba(255,255,255,0.08);"
+                    f"border-radius:4px;}}")
+
+        for i in range(5):
+            star_btns[i].clicked.connect(
+                lambda _=False, idx=i: _update_todo_stars(
+                    0 if todo_rating[0] == idx + 1 else idx + 1))
+
+        _update_todo_stars(0)
+        rat_row.addStretch()
+        dlg_lay.addLayout(rat_row)
+
+        # OK / Cancel buttons
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(cancel_btn)
+        ok_btn = QPushButton("Create To-Do")
+        ok_btn.setObjectName("accentButton")
+        ok_btn.clicked.connect(dlg.accept)
+        ok_btn.setDefault(True)
+        btn_row.addWidget(ok_btn)
+        dlg_lay.addLayout(btn_row)
+
+        name_input.setFocus()
         if not dlg.exec():
-            return
-        name = dlg.textValue().strip()
-        if not name:
+            self.watcher.blockSignals(False)
             return
 
-        # Create the .txt placeholder file
+        name = name_input.text().strip()
+        if not name:
+            self.watcher.blockSignals(False)
+            return
+        rat_val = todo_rating[0]
+
+        # Create exactly ONE .txt placeholder file
         txt_path = todo_dir / f"{name}.txt"
         counter = 1
         while txt_path.exists():
@@ -2099,32 +2178,29 @@ class MainWindow(QMainWindow):
             counter += 1
         txt_path.write_text(f"To-Do: {name}\n", encoding="utf-8")
 
-        # Ask for rating (optional, quick)
-        ratings = ["No rating (0)", "\u2605 (1)", "\u2605\u2605 (2)",
-                    "\u2605\u2605\u2605 (3)", "\u2605\u2605\u2605\u2605 (4)",
-                    "\u2605\u2605\u2605\u2605\u2605 (5)"]
-        rat_str, ok = QInputDialog.getItem(
-            self, "Set Rating", f"Rating for \"{name}\":", ratings, 0, False)
-        if ok and rat_str:
-            rat_val = ratings.index(rat_str)
-        else:
-            rat_val = 0
-
-        # Immediately add the song to the table (don't wait for watcher)
+        # Add to table immediately (single entry, no watcher duplicate)
         song = Song(
             path=txt_path, category="To-Do",
             title=txt_path.stem, artist="",
             rating=rat_val, duration=0.0)
         self._add_or_update(song)
-        self.watcher.addPath(str(txt_path))
 
-        # Write rating into cache
+        # Cache
+        st = txt_path.stat()
         self.cache[str(txt_path)] = {
-            "size": txt_path.stat().st_size, "mtime": txt_path.stat().st_mtime,
+            "size": st.st_size, "mtime": st.st_mtime,
             "title": song.title, "artist": "", "rating": rat_val,
             "duration": 0.0, "id": song.id}
         if self.root_path:
             save_cache(self.root_path, self.cache)
+
+        self._rebuild_cat_filter()
+        self._apply_filters()
+
+        # Unblock watcher and cancel any pending rescans
+        self.watcher.blockSignals(False)
+        self._rescan_timer.stop()
+        self._show_toast(f"\u2713  To-Do added: \"{name}\"", 3000, "success")
 
         self._rebuild_cat_filter()
         self._apply_filters()
