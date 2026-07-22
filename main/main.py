@@ -952,7 +952,7 @@ class VUMeter(QWidget):
             # Base level: pseudo-random but deterministic per second
             import random
             rng = random.Random(int(t * 4))   # changes 4× per second
-            base = rng.uniform(0.35, 0.90)
+            base = rng.uniform(0.12, 0.55)
 
             # Add fast variation
             vary_L = 0.5 + 0.5 * math.sin(t * 7.3 + 0.0)
@@ -1640,14 +1640,15 @@ class MainWindow(QMainWindow):
 
         lay.addSpacing(16)
 
-        # Category filter
+        # Category filter — checkbox-based multi-select
         cat_lbl = QLabel("Category:"); cat_lbl.setObjectName("subtleLabel")
         lay.addWidget(cat_lbl)
-        self.cat_filter = QComboBox()
-        self.cat_filter.setFixedWidth(155)
-        self.cat_filter.addItem("All")
-        self.cat_filter.currentTextChanged.connect(self._on_cat_filter_changed)
-        lay.addWidget(self.cat_filter)
+        self.cat_filter_btn = QPushButton("All")
+        self.cat_filter_btn.setFixedWidth(155)
+        self.cat_filter_btn.setToolTip("Click to select/deselect categories")
+        self.cat_filter_btn.clicked.connect(self._show_cat_checkboxes)
+        lay.addWidget(self.cat_filter_btn)
+        self._cat_checks: Dict[str, bool] = {}   # category → checked
 
         lay.addSpacing(16)
 
@@ -2108,43 +2109,7 @@ class MainWindow(QMainWindow):
         name_input.setCompleter(completer)
         dlg_lay.addWidget(name_input)
 
-        # Star rating — 5 clickable buttons
-        rat_row = QHBoxLayout()
-        rat_label = QLabel("Rating:")
-        rat_label.setStyleSheet("font-size:12px;color:#8e8e93;")
-        rat_row.addWidget(rat_label)
-        todo_rating = [0]   # mutable so inner functions can modify
-
-        star_btns = []
-        for i in range(5):
-            sb = QPushButton("\u2606")
-            sb.setObjectName("starBtn")
-            sb.setFixedSize(30, 30)
-            sb.setCursor(Qt.PointingHandCursor)
-            star_btns.append(sb)
-            rat_row.addWidget(sb)
-
-        def _update_todo_stars(rating):
-            todo_rating[0] = rating
-            for j, b in enumerate(star_btns):
-                filled = j < rating
-                color = "#FFD60A" if filled else "#8e8e93"
-                char = "\u2605" if filled else "\u2606"
-                b.setText(char)
-                b.setStyleSheet(
-                    f"QPushButton#starBtn{{border:none;background:transparent;"
-                    f"color:{color};font-size:20px;}}"
-                    f"QPushButton#starBtn:hover{{background:rgba(255,255,255,0.08);"
-                    f"border-radius:4px;}}")
-
-        for i in range(5):
-            star_btns[i].clicked.connect(
-                lambda _=False, idx=i: _update_todo_stars(
-                    0 if todo_rating[0] == idx + 1 else idx + 1))
-
-        _update_todo_stars(0)
-        rat_row.addStretch()
-        dlg_lay.addLayout(rat_row)
+        # No rating for To-Do items (they are placeholders, not songs)
 
         # OK / Cancel buttons
         btn_row = QHBoxLayout()
@@ -2168,7 +2133,7 @@ class MainWindow(QMainWindow):
         if not name:
             self.watcher.blockSignals(False)
             return
-        rat_val = todo_rating[0]
+        rat_val = 0  # To-Do items have no rating
 
         # Create exactly ONE .txt placeholder file
         txt_path = todo_dir / f"{name}.txt"
@@ -2201,6 +2166,7 @@ class MainWindow(QMainWindow):
         self.watcher.blockSignals(False)
         self._rescan_timer.stop()
         self._show_toast(f"\u2713  To-Do added: \"{name}\"", 3000, "success")
+        self._log_change("TODO", name, "To-Do placeholder created")
 
         self._rebuild_cat_filter()
         self._apply_filters()
@@ -2241,6 +2207,7 @@ class MainWindow(QMainWindow):
         self._update_queue_numbers()
         self._rebuild_play_queue()
         self._show_toast(f"\u2713  Deleted: {song.title}", 3000, "success")
+        self._log_change("DEL", song.title, str(song.path))
 
     def _cycle_repeat(self):
         """Cycle: Off → All → Reverse → One → Off"""
@@ -2419,22 +2386,52 @@ class MainWindow(QMainWindow):
                            "warning", auto_reset=True, duration_ms=5000)
 
     def _show_changes(self):
+        """Show change history from CSV log."""
+        log_path = self._changelog_path()
         lines = []
-        if self.last_added:
-            lines.append(f"Added ({len(self.last_added)}):")
-            lines += [f"  + {t}" for t in self.last_added[:50]]
-            if len(self.last_added) > 50:
-                lines.append(f"  … and {len(self.last_added)-50} more")
-        if self.last_removed:
-            if lines: lines.append("")
-            lines.append(f"Removed ({len(self.last_removed)}):")
-            lines += [f"  - {t}" for t in self.last_removed[:50]]
-            if len(self.last_removed) > 50:
-                lines.append(f"  … and {len(self.last_removed)-50} more")
-        if not lines: lines.append("No recent additions or removals.")
-        QMessageBox.information(self, "Recent library changes", "\n".join(lines))
+        if log_path.is_file():
+            try:
+                with open(log_path, "r", encoding="utf-8") as f:
+                    rows = f.readlines()[-100:]
+                lines = [r.strip() for r in rows if r.strip()]
+            except Exception:
+                pass
+        if not lines:
+            lines = ["No changes recorded yet."]
+
+        display = "CHANGE HISTORY (last 100 entries)\n" + "=" * 50 + "\n\n"
+        icons = {"ADD": "+", "DEL": "\u2716", "MOVE": "\u2192",
+                 "RATING": "\u2605", "RENAME": "\u270E", "TODO": "\u2610"}
+        for line in reversed(lines):
+            parts = line.split(",", 3)
+            if len(parts) >= 3:
+                ts, action, title = parts[0], parts[1], parts[2]
+                detail = parts[3] if len(parts) > 3 else ""
+                icon = icons.get(action, "\u2022")
+                display += f"{ts}  {icon} [{action}]  {title}"
+                if detail: display += f"  \u2014  {detail}"
+                display += "\n"
+            else:
+                display += line + "\n"
+
+        QMessageBox.information(self, "Change History", display)
         self.changes_btn.setVisible(False)
         self.changes_btn.setEnabled(False)
+
+    def _changelog_path(self) -> Path:
+        base = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+        if not base: base = str(Path.home() / ".music_library_app")
+        bp = Path(base); bp.mkdir(parents=True, exist_ok=True)
+        return bp / "changelog.csv"
+
+    def _log_change(self, action: str, title: str, detail: str = ""):
+        """Append to CSV changelog. Actions: ADD, DEL, MOVE, RATING, RENAME, TODO"""
+        try:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(self._changelog_path(), "a", encoding="utf-8") as f:
+                f.write(f"{ts},{action},{title},{detail}\n")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Category filter dropdown
@@ -2444,14 +2441,16 @@ class MainWindow(QMainWindow):
         if cats == self._last_cats: return
         self._last_cats = cats
 
-        prev = self.cat_filter.currentText()
-        self.cat_filter.blockSignals(True)
-        self.cat_filter.clear()
-        self.cat_filter.addItem("All")
-        for c in cats: self.cat_filter.addItem(c)
-        self.cat_filter.setCurrentText(prev if prev in cats else "All")
-        self.cat_filter.blockSignals(False)
-        self._filter_cat = self.cat_filter.currentText()
+        # Initialize checkboxes — all checked by default (= "All")
+        for c in cats:
+            if c not in self._cat_checks:
+                self._cat_checks[c] = True
+        # Remove categories that no longer exist
+        for c in list(self._cat_checks):
+            if c not in cats:
+                del self._cat_checks[c]
+
+        self._update_cat_btn_label()
 
         # update every row's combo
         for sid, item in self.row_items.items():
@@ -2477,9 +2476,61 @@ class MainWindow(QMainWindow):
         self._filter_cover = checked
         self._apply_filters()
 
-    def _on_cat_filter_changed(self, txt: str):
-        self._filter_cat = txt
+    def _show_cat_checkboxes(self):
+        """Show a popup with checkboxes for each category."""
+        from PySide6.QtWidgets import QMenu, QWidgetAction, QCheckBox
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu{background:#2c2c2e;border:1px solid #3a3a3c;border-radius:8px;padding:4px;}"
+            "QCheckBox{color:#f2f2f7;font-size:12px;padding:4px 8px;}"
+            "QCheckBox::indicator{width:14px;height:14px;border-radius:3px;"
+            "border:1px solid #5a5a5e;background:#1c1c1e;}"
+            "QCheckBox::indicator:checked{background:#0a84ff;border-color:#0a84ff;}"
+        )
+
+        # "All" toggle
+        all_checked = all(self._cat_checks.get(c, True) for c in self._last_cats)
+        all_cb = QCheckBox("Select All")
+        all_cb.setChecked(all_checked)
+        wa = QWidgetAction(menu)
+        wa.setDefaultWidget(all_cb)
+        menu.addAction(wa)
+        menu.addSeparator()
+
+        cat_cbs = []
+        for cat in self._last_cats:
+            cb = QCheckBox(cat)
+            cb.setChecked(self._cat_checks.get(cat, True))
+            a = QWidgetAction(menu)
+            a.setDefaultWidget(cb)
+            menu.addAction(a)
+            cat_cbs.append((cat, cb))
+
+        def toggle_all(state):
+            for _, cb in cat_cbs:
+                cb.setChecked(state)
+
+        all_cb.toggled.connect(toggle_all)
+
+        # Show the popup below the button
+        menu.exec(self.cat_filter_btn.mapToGlobal(
+            self.cat_filter_btn.rect().bottomLeft()))
+
+        # Read checked states
+        for cat, cb in cat_cbs:
+            self._cat_checks[cat] = cb.isChecked()
+
+        self._update_cat_btn_label()
         self._apply_filters()
+
+    def _update_cat_btn_label(self):
+        checked = [c for c, v in self._cat_checks.items() if v]
+        if len(checked) == len(self._last_cats) or not checked:
+            self.cat_filter_btn.setText("All")
+        elif len(checked) == 1:
+            self.cat_filter_btn.setText(checked[0])
+        else:
+            self.cat_filter_btn.setText(f"{len(checked)} selected")
 
     def _on_rat_filter_changed(self, idx: int):
         self._filter_rating = self.rat_filter.itemData(idx)
@@ -2487,17 +2538,23 @@ class MainWindow(QMainWindow):
 
     def _reset_filters(self):
         self.search_box.blockSignals(True);  self.search_box.setText("");          self.search_box.blockSignals(False)
-        self.cat_filter.blockSignals(True);  self.cat_filter.setCurrentText("All"); self.cat_filter.blockSignals(False)
         self.rat_filter.blockSignals(True);  self.rat_filter.setCurrentIndex(0);    self.rat_filter.blockSignals(False)
         self.collab_btn.blockSignals(True);  self.collab_btn.setChecked(False);     self.collab_btn.blockSignals(False)
         self.cover_btn.blockSignals(True);   self.cover_btn.setChecked(False);      self.cover_btn.blockSignals(False)
-        self._filter_search = ""; self._filter_cat = "All"; self._filter_rating = 0
+        self._filter_search = ""; self._filter_rating = 0
         self._filter_collab = False; self._filter_cover = False
+        # Reset all category checkboxes to checked
+        for c in self._cat_checks:
+            self._cat_checks[c] = True
+        self._update_cat_btn_label()
         self._apply_filters()
 
     def _matches(self, song: Song) -> bool:
-        if self._filter_cat not in ("All", song.category):
-            return False
+        # Category checkbox filter
+        checked_cats = [c for c, v in self._cat_checks.items() if v]
+        if checked_cats and len(checked_cats) < len(self._last_cats):
+            if song.category not in checked_cats:
+                return False
         if self._filter_search and \
                 self._filter_search not in song.title.lower():
             return False
@@ -2671,6 +2728,13 @@ class MainWindow(QMainWindow):
 
         combo.setProperty("lock_ref", cat_lock)
         star.setProperty("lock_ref", rat_lock)
+
+        # ── Disable editing for To-Do items (placeholders, not songs) ──
+        is_todo = song.path.suffix.lower() in TODO_EXTENSIONS
+        if is_todo:
+            cat_lock.setVisible(False)
+            rat_lock.setVisible(False)
+            combo.setEnabled(False)
 
         # ── Delete button ──
         del_btn = QToolButton()
@@ -2892,6 +2956,7 @@ class MainWindow(QMainWindow):
                         self.player.notify_song_path_changed(song, new_path)
                         self._sync_cache(song)
                         self._set_info(f'\u2713  Title saved & file renamed: "{new_title}"', "success")
+                        self._log_change("RENAME", new_title, f"was: {song.title}")
                     else:
                         item.setText(song.title)
                         self._set_info("Could not rename file.", "error")
@@ -2982,6 +3047,7 @@ class MainWindow(QMainWindow):
         self.watcher.blockSignals(False)
         self._rescan_timer.stop()
         self._show_toast(f"\u2713  '{song.title}'  moved: {old_cat} \u2192 {new_cat}", 3500, "success")
+        self._log_change("MOVE", song.title, f"{old_cat} -> {new_cat}")
 
     # ------------------------------------------------------------------
     # Rating change → write directly into the audio file
@@ -3031,6 +3097,7 @@ class MainWindow(QMainWindow):
             self._show_toast(
                 f"\u2713  Rating saved into file:  {song.title}   {stars}  ({new_rating}/5)",
                 3500, "success")
+            self._log_change("RATING", song.title, f"{new_rating}/5")
 
 
 # ============================================================================
