@@ -13,7 +13,7 @@ pip install pyinstaller
 cd "C:\User..."
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 4. Create a standalone executable with icon
-pyinstaller --onefile --windowed --name InstaFlow --icon=..\assets\01_media\01_icons\icon.ico --distpath publish --workpath publish\build --specpath publish main\main.py
+pyinstaller --onefile --windowed --name WavePro --icon=..\assets\01_media\01_icons\icon.ico --distpath publish --workpath publish\build --specpath publish main\main.py
 
 5. Optional for removing non necessary files -> run in pycharm terminal
 Get-ChildItem -Path .\publish -Recurse | Where-Object { $_.Extension -ne '.exe' } | Remove-Item -Force -Recurse
