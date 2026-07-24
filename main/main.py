@@ -1367,17 +1367,27 @@ def _centered(widget: QWidget, right_pad: int = 8) -> QWidget:
     return w
 
 
+def _split_title(title: str) -> Tuple[str, str]:
+    """Split a song title at the first ' - ' into (artist, song_name).
+    If no dash found, returns ('', title)."""
+    if " - " in title:
+        parts = title.split(" - ", 1)
+        return parts[0].strip(), parts[1].strip()
+    return "", title
+
+
 # ============================================================================
 # Column indices
 # ============================================================================
-COL_TITLE         = 0
-COL_TITLE_EDIT    = 1
-COL_CATEGORY      = 2
-COL_CATEGORY_LOCK = 3
-COL_RATING        = 4
-COL_RATING_LOCK   = 5
-COL_DELETE        = 6
-COL_COUNT         = 7
+COL_ARTIST        = 0
+COL_SONGNAME      = 1
+COL_NAME_EDIT     = 2
+COL_CATEGORY      = 3
+COL_CATEGORY_LOCK = 4
+COL_RATING        = 5
+COL_RATING_LOCK   = 6
+COL_DELETE        = 7
+COL_COUNT         = 8
 
 ROW_HEIGHT = 38   # px – fits 20px lock icons with comfortable padding
 
@@ -1762,7 +1772,7 @@ class MainWindow(QMainWindow):
     def _build_table(self) -> QWidget:
         self.table = QTableWidget(0, COL_COUNT)
         self.table.setHorizontalHeaderLabels(
-            ["Title", "Edit", "Category", "Edit", "Rating", "Edit", ""])
+            ["Artist", "Song Name", "Edit", "Category", "Edit", "Rating", "Edit", ""])
         # Row numbers (queue numbers) — always visible on the left
         self.table.verticalHeader().setVisible(True)
         self.table.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
@@ -1775,15 +1785,16 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         # Enable sorting by clicking column headers
         self.table.setSortingEnabled(True)
-        self.table.sortItems(COL_TITLE, Qt.AscendingOrder)
+        self.table.sortItems(COL_ARTIST, Qt.AscendingOrder)
         h = self.table.horizontalHeader()
         h.setSortIndicatorShown(False)  # we handle it via text ▲/▼
         h.sortIndicatorChanged.connect(self._on_sort_changed)
-        self._base_headers = ["Title", "Edit", "Category", "Edit", "Rating", "Edit", ""]
+        self._base_headers = ["Artist", "Song Name", "Edit", "Category", "Edit", "Rating", "Edit", ""]
         # Set initial sort arrow
-        self.table.horizontalHeaderItem(COL_TITLE).setText("Title \u25bc")
-        h.setSectionResizeMode(COL_TITLE,         QHeaderView.Stretch)
-        h.setSectionResizeMode(COL_TITLE_EDIT,    QHeaderView.ResizeToContents)
+        self.table.horizontalHeaderItem(COL_ARTIST).setText("Artist \u25bc")
+        h.setSectionResizeMode(COL_ARTIST,        QHeaderView.Stretch)
+        h.setSectionResizeMode(COL_SONGNAME,      QHeaderView.Stretch)
+        h.setSectionResizeMode(COL_NAME_EDIT,     QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_CATEGORY,      QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_CATEGORY_LOCK, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(COL_RATING,        QHeaderView.ResizeToContents)
@@ -2621,9 +2632,11 @@ class MainWindow(QMainWindow):
         if checked_cats and len(checked_cats) < len(self._last_cats):
             if song.category not in checked_cats:
                 return False
-        if self._filter_search and \
-                self._filter_search not in song.title.lower():
-            return False
+        if self._filter_search:
+            artist_part, song_part = _split_title(song.title)
+            combined = song.title.lower()
+            if self._filter_search not in combined:
+                return False
         if self._filter_rating == -1 and song.rating != 0:
             return False   # "No rating" filter: only unrated songs
         if self._filter_rating > 0 and song.rating < self._filter_rating:
@@ -2692,7 +2705,7 @@ class MainWindow(QMainWindow):
         for row in range(self.table.rowCount()):
             if self.table.isRowHidden(row):
                 continue
-            item = self.table.item(row, COL_TITLE)
+            item = self.table.item(row, COL_ARTIST)
             if item is None:
                 continue
             sid = item.data(Qt.UserRole)
@@ -2723,7 +2736,10 @@ class MainWindow(QMainWindow):
         item = self.row_items.get(song.id)
         if item is not None:
             row = item.row()
-            item.setText(song.title)
+            artist_part, song_part = _split_title(song.title)
+            item.setText(artist_part)
+            sn_item = self.table.item(row, COL_SONGNAME)
+            if sn_item: sn_item.setText(song_part)
             combo = self.table.cellWidget(row, COL_CATEGORY)
             if combo and combo.currentText() != song.category:
                 combo.blockSignals(True)
@@ -2743,18 +2759,23 @@ class MainWindow(QMainWindow):
         self.table.insertRow(row)
         self.table.setRowHeight(row, ROW_HEIGHT)
 
-        ti = QTableWidgetItem(song.title)
+        artist_part, song_part = _split_title(song.title)
+
+        ti = QTableWidgetItem(artist_part)
         ti.setData(Qt.UserRole, song.id)
-        self.table.setItem(row, COL_TITLE, ti)
+        self.table.setItem(row, COL_ARTIST, ti)
         self.row_items[song.id] = ti
 
-        # ── Title edit pen ──
-        title_lock = LockButton(
-            "Green pen: title is protected. Click to edit.",
-            "Red pen: title editing active.")
-        title_lock.toggledLock.connect(
-            lambda unlocked, s=song, lk=title_lock: self._on_title_edit_unlock(s, lk, unlocked))
-        self.table.setCellWidget(row, COL_TITLE_EDIT, _centered(title_lock))
+        sn = QTableWidgetItem(song_part)
+        self.table.setItem(row, COL_SONGNAME, sn)
+
+        # ── Name edit pen (edits both artist + song name) ──
+        name_lock = LockButton(
+            "Green pen: name is protected. Click to edit.",
+            "Red pen: name editing active.")
+        name_lock.toggledLock.connect(
+            lambda unlocked, s=song, lk=name_lock: self._on_title_edit_unlock(s, lk, unlocked))
+        self.table.setCellWidget(row, COL_NAME_EDIT, _centered(name_lock))
 
         # ── Category combo ──
         cats = list_categories(self.root_path) if self.root_path else []
@@ -2847,7 +2868,7 @@ class MainWindow(QMainWindow):
             if row in seen:
                 continue
             seen.add(row)
-            item = self.table.item(row, COL_TITLE)
+            item = self.table.item(row, COL_ARTIST)
             if item is None:
                 continue
             sid = item.data(Qt.UserRole)
@@ -2975,7 +2996,7 @@ class MainWindow(QMainWindow):
             "success", duration_ms=3500)
 
     def _on_double_click(self, index):
-        item = self.table.item(index.row(), COL_TITLE)
+        item = self.table.item(index.row(), COL_ARTIST)
         if item is None: return
         song = self.songs_by_id.get(item.data(Qt.UserRole))
         if song: self.player.play_song(song, queue=self._visible_songs_in_order())
@@ -3004,59 +3025,88 @@ class MainWindow(QMainWindow):
         if item is None:
             lock.set_locked(True); return
         row = item.row()
+        old_artist, old_songname = _split_title(song.title)
 
-        if not unlocked:
-            # Pen clicked back to green → close any open editor and commit
-            editor_widget = self.table.cellWidget(row, COL_TITLE)
-            if isinstance(editor_widget, QLineEdit):
-                new_title = editor_widget.text().strip() or song.title
-                self.table.removeCellWidget(row, COL_TITLE)
-                item.setText(new_title)
-                if new_title != song.title:
-                    old_path_str = str(song.path)
-                    ok, new_path = write_display_tags(song.path, new_title, song.artist)
-                    if ok:
-                        self.cache.pop(old_path_str, None)
-                        song.path  = new_path
-                        song.title = new_title
-                        self.player.notify_song_path_changed(song, new_path)
-                        self._sync_cache(song)
-                        self._set_info(f'\u2713  Title saved & file renamed: "{new_title}"', "success")
-                        self._log_change("RENAME", new_title, f"was: {song.title}")
-                    else:
-                        item.setText(song.title)
-                        self._set_info("Could not rename file.", "error")
-            return
+        def _commit_name(new_artist: str, new_songname: str):
+            """Combine artist + song name, rename file if changed."""
+            if new_artist and new_songname:
+                new_title = f"{new_artist} - {new_songname}"
+            elif new_songname:
+                new_title = new_songname
+            else:
+                new_title = song.title
 
-        # Pen clicked to red → open inline editor
-        editor = QLineEdit(song.title)
-        editor.setObjectName("cellEditor")
-        editor.selectAll()
-        self.table.setCellWidget(row, COL_TITLE, editor)
-        editor.setFocus()
+            # Update display
+            a_part, s_part = _split_title(new_title)
+            item.setText(a_part)
+            sn_item = self.table.item(row, COL_SONGNAME)
+            if sn_item: sn_item.setText(s_part)
 
-        def commit_enter():
-            """Called only on Enter key — commits and re-locks the pen."""
-            new_title = editor.text().strip() or song.title
-            self.table.removeCellWidget(row, COL_TITLE)
-            item.setText(new_title)
             if new_title != song.title:
                 old_path_str = str(song.path)
+                old_title = song.title
                 ok, new_path = write_display_tags(song.path, new_title, song.artist)
                 if ok:
                     self.cache.pop(old_path_str, None)
-                    song.path  = new_path
+                    song.path = new_path
                     song.title = new_title
                     self.player.notify_song_path_changed(song, new_path)
                     self._sync_cache(song)
-                    self._set_info(f'\u2713  Title saved & file renamed: "{new_title}"', "success")
+                    self._set_info(f'\u2713  Renamed: "{new_title}"', "success")
+                    self._log_change("RENAME", new_title, f"was: {old_title}")
                 else:
-                    item.setText(song.title)
+                    # Revert display
+                    a2, s2 = _split_title(song.title)
+                    item.setText(a2)
+                    if sn_item: sn_item.setText(s2)
                     self._set_info("Could not rename file.", "error")
+
+        if not unlocked:
+            # Pen clicked back to green → close editors and commit
+            ed_artist = self.table.cellWidget(row, COL_ARTIST)
+            ed_song   = self.table.cellWidget(row, COL_SONGNAME)
+            new_a = ed_artist.text().strip() if isinstance(ed_artist, QLineEdit) else old_artist
+            new_s = ed_song.text().strip() if isinstance(ed_song, QLineEdit) else old_songname
+            self.table.removeCellWidget(row, COL_ARTIST)
+            self.table.removeCellWidget(row, COL_SONGNAME)
+            _commit_name(new_a, new_s or old_songname)
+            return
+
+        # Pen clicked to red → open editors in both columns
+        from PySide6.QtWidgets import QCompleter
+        existing = [s.title for s in self.songs_by_id.values()]
+
+        ed_a = QLineEdit(old_artist)
+        ed_a.setObjectName("cellEditor")
+        ed_a.setPlaceholderText("Artist...")
+        comp_a = QCompleter([_split_title(t)[0] for t in existing if _split_title(t)[0]], ed_a)
+        comp_a.setCaseSensitivity(Qt.CaseInsensitive)
+        comp_a.setFilterMode(Qt.MatchContains)
+        comp_a.setMaxVisibleItems(5)
+        ed_a.setCompleter(comp_a)
+        self.table.setCellWidget(row, COL_ARTIST, ed_a)
+
+        ed_s = QLineEdit(old_songname)
+        ed_s.setObjectName("cellEditor")
+        ed_s.setPlaceholderText("Song name...")
+        comp_s = QCompleter([_split_title(t)[1] for t in existing], ed_s)
+        comp_s.setCaseSensitivity(Qt.CaseInsensitive)
+        comp_s.setFilterMode(Qt.MatchContains)
+        comp_s.setMaxVisibleItems(5)
+        ed_s.setCompleter(comp_s)
+        self.table.setCellWidget(row, COL_SONGNAME, ed_s)
+        ed_a.setFocus()
+
+        def commit_enter():
+            new_a = ed_a.text().strip()
+            new_s = ed_s.text().strip() or old_songname
+            self.table.removeCellWidget(row, COL_ARTIST)
+            self.table.removeCellWidget(row, COL_SONGNAME)
+            _commit_name(new_a, new_s)
             lock.set_locked(True)
 
-        # Only Enter commits — pen click is handled by the unlocked=False path above
-        editor.returnPressed.connect(commit_enter)
+        ed_a.returnPressed.connect(lambda: ed_s.setFocus())  # Tab to song name
+        ed_s.returnPressed.connect(commit_enter)
 
     def _sync_cache(self, song: Song):
         """Update on-disk cache after any in-app change to a song."""
@@ -3080,19 +3130,22 @@ class MainWindow(QMainWindow):
         self.watcher.blockSignals(True)
         self.table.setSortingEnabled(False)
 
-        if self.player.current_song() is song and self.player.is_playing():
-            self._show_toast("Pause the song first before moving it to another category.", 3500, "warning")
-            combo.blockSignals(True); combo.setCurrentText(song.category); combo.blockSignals(False)
-            self.table.setSortingEnabled(True)
-            self.watcher.blockSignals(False)
-            return
-
         old_cat, old_path_str = song.category, str(song.path)
+
+        # If this song is currently playing: pause, save position, move, resume
+        was_playing = (self.player.current_song() is song and self.player.is_playing())
+        saved_pos = 0
+        if was_playing:
+            saved_pos = self.player._player.position()
+            self.player._player.pause()
+
         try:
             new_path = safe_move_song(song, self.root_path, new_cat)
         except SafeMoveError as e:
             self._show_toast(f"Move failed: {e}", 6000, "error")
             combo.blockSignals(True); combo.setCurrentText(old_cat); combo.blockSignals(False)
+            if was_playing:
+                self.player._player.play()
             self.table.setSortingEnabled(True)
             self.watcher.blockSignals(False)
             return
@@ -3102,6 +3155,12 @@ class MainWindow(QMainWindow):
         self.player.notify_song_path_changed(song, new_path)
         self.cache.pop(old_path_str, None)
         self._sync_cache(song)
+
+        # Resume playback from the same position at the new path
+        if was_playing:
+            self.player._player.setSource(QUrl.fromLocalFile(str(new_path)))
+            self.player._player.play()
+            QTimer.singleShot(100, lambda p=saved_pos: self.player._player.setPosition(p))
 
         lock: LockButton = combo.property("lock_ref")
         if lock: lock.set_locked(True)
@@ -3153,7 +3212,7 @@ class MainWindow(QMainWindow):
         if item:
             actual_row = item.row()
             self.table.selectRow(actual_row)
-            self.table.scrollTo(self.table.model().index(actual_row, COL_TITLE))
+            self.table.scrollTo(self.table.model().index(actual_row, COL_ARTIST))
 
         # Inline toast — rating saved directly into the file
         stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
