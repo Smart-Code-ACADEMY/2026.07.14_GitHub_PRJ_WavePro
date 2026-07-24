@@ -1420,6 +1420,7 @@ class MainWindow(QMainWindow):
         self.pending_rescan = False
         self.last_added:   List[str] = []
         self.last_removed: List[str] = []
+        self._pending_changes: List[tuple] = []  # queued changes for playing songs
 
         self.player = PlayerController(self)
         self.watcher = QFileSystemWatcher(self)
@@ -2011,9 +2012,11 @@ class MainWindow(QMainWindow):
         if song is None:
             self.lbl_now.setText("Nothing is playing")
         else:
-            ap = f"  ·  {song.artist}" if song.artist else ""
-            self.lbl_now.setText(f"{song.title}{ap}  ·  {song.category}")
+            artist_part, song_part = _split_title(song.title)
+            ap = f"{artist_part}  ·  " if artist_part else ""
+            self.lbl_now.setText(f"{ap}{song_part}  ·  {song.category}")
         self._highlight(song)
+        self._process_pending_changes()
 
     def _on_pos(self, ms: int):
         if not getattr(self, '_seek_dragging', False):
@@ -2021,6 +2024,69 @@ class MainWindow(QMainWindow):
         self.lbl_pos.setText(_fmt_time(ms))
         dur = self.seek_slider.maximum()
         self.vu_meter.set_position(ms, max(1, dur))
+
+    def _process_pending_changes(self):
+        """Execute queued changes for songs that are no longer playing."""
+        if not self._pending_changes:
+            return
+        current = self.player.current_song()
+        remaining = []
+        for action, song, detail in self._pending_changes:
+            if current is song and self.player.is_playing():
+                remaining.append((action, song, detail))
+                continue
+            # Song is no longer playing — execute the change
+            if action == "MOVE":
+                self.watcher.blockSignals(True)
+                old_cat, old_path_str = song.category, str(song.path)
+                try:
+                    new_path = safe_move_song(song, self.root_path, detail)
+                    song.path = new_path; song.category = detail
+                    self.cache.pop(old_path_str, None)
+                    self._sync_cache(song)
+                    # Update UI
+                    item = self.row_items.get(song.id)
+                    if item:
+                        combo = self.table.cellWidget(item.row(), COL_CATEGORY)
+                        if combo:
+                            combo.blockSignals(True)
+                            combo.setCurrentText(detail)
+                            combo.blockSignals(False)
+                        lock: LockButton = combo.property("lock_ref") if combo else None
+                        if lock: lock.set_locked(True)
+                        cat_sort = self.table.item(item.row(), COL_CATEGORY)
+                        if cat_sort: cat_sort.setText(detail)
+                        self.table.setRowHidden(item.row(), not self._matches(song))
+                    self._show_toast(
+                        f"\u2713  Queued move completed: '{song.title}' \u2192 {detail}",
+                        3000, "success")
+                    self._log_change("MOVE", song.title, f"{old_cat} -> {detail}")
+                except SafeMoveError as e:
+                    self._show_toast(f"Queued move failed: {e}", 5000, "error")
+                self.watcher.blockSignals(False)
+                self._rescan_timer.stop()
+
+            elif action == "RENAME":
+                self.watcher.blockSignals(True)
+                old_title = song.title
+                old_path_str = str(song.path)
+                ok, new_path = write_display_tags(song.path, detail, song.artist)
+                if ok:
+                    self.cache.pop(old_path_str, None)
+                    song.path = new_path; song.title = detail
+                    self._sync_cache(song)
+                    item = self.row_items.get(song.id)
+                    if item:
+                        a, s = _split_title(detail)
+                        item.setText(a)
+                        sn = self.table.item(item.row(), COL_SONGNAME)
+                        if sn: sn.setText(s)
+                    self._show_toast(f"\u2713  Queued rename: \"{detail}\"", 3000, "success")
+                    self._log_change("RENAME", detail, f"was: {old_title}")
+                self.watcher.blockSignals(False)
+                self._rescan_timer.stop()
+
+        self._pending_changes = remaining
 
     # ------------------------------------------------------------------
     # Navigation: Focus / Scroll Top / Scroll Bottom
@@ -2647,8 +2713,22 @@ class MainWindow(QMainWindow):
             return False
         return True
 
+    _last_sort_col = 0
+    _last_sort_order = Qt.AscendingOrder
+
     def _on_sort_changed(self, logical_index: int, order):
-        """Update column headers with ▲/▼ sort arrows and rebuild play queue."""
+        """Update headers with sort arrows. Block sorting on Edit/Delete columns."""
+        sortable = {COL_ARTIST, COL_SONGNAME, COL_CATEGORY, COL_RATING}
+        if logical_index not in sortable:
+            # Revert: don't sort on non-data columns
+            self.table.horizontalHeader().blockSignals(True)
+            self.table.sortItems(self._last_sort_col, self._last_sort_order)
+            self.table.horizontalHeader().blockSignals(False)
+            return
+
+        self._last_sort_col = logical_index
+        self._last_sort_order = order
+
         for i, base_name in enumerate(self._base_headers):
             if i == logical_index:
                 arrow = " ▼" if order == Qt.AscendingOrder else " ▲"
@@ -2784,6 +2864,9 @@ class MainWindow(QMainWindow):
         combo.setEnabled(False)
         combo.currentTextChanged.connect(
             lambda nc, s=song, c=combo: self._on_cat_combo(s, c, nc))
+        # Set hidden sort item BEFORE the widget (widget covers it visually)
+        cat_sort_item = QTableWidgetItem(song.category)
+        self.table.setItem(row, COL_CATEGORY, cat_sort_item)
         self.table.setCellWidget(row, COL_CATEGORY, combo)
 
         # ── Category lock ──
@@ -2803,6 +2886,10 @@ class MainWindow(QMainWindow):
         star.ratingChanged.connect(lambda nr, s=song, sw=star: self._on_rating(s, sw, nr))
         star_lay.addWidget(star)
         star_lay.addStretch()
+        # Set hidden sort item for rating (sort numerically by rating value)
+        rat_sort_item = QTableWidgetItem()
+        rat_sort_item.setData(Qt.DisplayRole, song.rating)
+        self.table.setItem(row, COL_RATING, rat_sort_item)
         self.table.setCellWidget(row, COL_RATING, star_wrapper)
 
         # ── Rating edit lock ──
@@ -3126,41 +3213,48 @@ class MainWindow(QMainWindow):
     def _on_cat_combo(self, song: Song, combo: QComboBox, new_cat: str):
         if new_cat == song.category or not combo.isEnabled(): return
 
-        # Block watcher to prevent duplicate detection during move
+        is_playing = (self.player.current_song() is song and self.player.is_playing())
+
+        if is_playing:
+            # Queue the category change — will execute when song stops playing
+            self._pending_changes.append(("MOVE", song, new_cat))
+
+            # Show pending indicator: spinning/loading style on the lock button
+            lock: LockButton = combo.property("lock_ref")
+            if lock:
+                lock.setText("\u23F3")   # ⏳ hourglass
+                lock.setStyleSheet(
+                    "QToolButton{background:transparent;border:none;"
+                    "color:#FF9F0A;font-size:13px;}")
+            combo.setEnabled(False)
+
+            self._show_toast(
+                f"\u23F3  Move queued: '{song.title}' → {new_cat}  (will apply when song finishes)",
+                4000, "warning")
+            return
+
+        # Not playing — move immediately
         self.watcher.blockSignals(True)
         self.table.setSortingEnabled(False)
 
         old_cat, old_path_str = song.category, str(song.path)
-
-        # If this song is currently playing: pause, save position, move, resume
-        was_playing = (self.player.current_song() is song and self.player.is_playing())
-        saved_pos = 0
-        if was_playing:
-            saved_pos = self.player._player.position()
-            self.player._player.pause()
-
         try:
             new_path = safe_move_song(song, self.root_path, new_cat)
         except SafeMoveError as e:
             self._show_toast(f"Move failed: {e}", 6000, "error")
             combo.blockSignals(True); combo.setCurrentText(old_cat); combo.blockSignals(False)
-            if was_playing:
-                self.player._player.play()
             self.table.setSortingEnabled(True)
             self.watcher.blockSignals(False)
             return
 
-        # Update song data immediately
         song.path = new_path; song.category = new_cat
         self.player.notify_song_path_changed(song, new_path)
         self.cache.pop(old_path_str, None)
         self._sync_cache(song)
 
-        # Resume playback from the same position at the new path
-        if was_playing:
-            self.player._player.setSource(QUrl.fromLocalFile(str(new_path)))
-            self.player._player.play()
-            QTimer.singleShot(100, lambda p=saved_pos: self.player._player.setPosition(p))
+        # Update sort item
+        cat_sort = self.table.item(self.row_items[song.id].row(), COL_CATEGORY)
+        if cat_sort: cat_sort.setText(new_cat)
 
         lock: LockButton = combo.property("lock_ref")
         if lock: lock.set_locked(True)
@@ -3168,7 +3262,6 @@ class MainWindow(QMainWindow):
         self.table.setRowHidden(self.row_items[song.id].row(), not self._matches(song))
         self.table.setSortingEnabled(True)
 
-        # Unblock watcher and cancel any pending rescans
         self.watcher.blockSignals(False)
         self._rescan_timer.stop()
         self._show_toast(f"\u2713  '{song.title}'  moved: {old_cat} \u2192 {new_cat}", 3500, "success")
@@ -3192,6 +3285,11 @@ class MainWindow(QMainWindow):
             return
         song.rating = new_rating
         self._sync_cache(song)
+
+        # Update hidden sort item for rating column
+        if item:
+            rat_sort = self.table.item(item.row(), COL_RATING)
+            if rat_sort: rat_sort.setData(Qt.DisplayRole, new_rating)
 
         # Auto re-lock the rating pen after saving
         lock: LockButton = star_widget.property("lock_ref")
