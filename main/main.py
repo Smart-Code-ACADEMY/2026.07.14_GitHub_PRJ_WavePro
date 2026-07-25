@@ -1367,6 +1367,20 @@ def _centered(widget: QWidget, right_pad: int = 8) -> QWidget:
     return w
 
 
+class _InvisibleSortItem(QTableWidgetItem):
+    """QTableWidgetItem with empty visible text but custom sort order.
+    The text is always empty (nothing shows), but __lt__ sorts by _sort_key."""
+    def __init__(self, sort_key=0):
+        super().__init__("")
+        self._sort_key = sort_key
+    def __lt__(self, other):
+        if isinstance(other, _InvisibleSortItem):
+            return self._sort_key < other._sort_key
+        return super().__lt__(other)
+    def set_sort_key(self, key):
+        self._sort_key = key
+
+
 def _split_title(title: str) -> Tuple[str, str]:
     """Split a song title at the first ' - ' into (artist, song_name).
     If no dash found, returns ('', title)."""
@@ -1415,6 +1429,8 @@ class MainWindow(QMainWindow):
         self._filter_search = ""
         self._filter_collab = False  # show only collab songs
         self._filter_cover  = False  # show only cover songs
+        self._filter_accordion = False  # show only songs with [A]
+        self._filter_christmas = False  # show only songs with [C#]
 
         self.scan_worker: Optional[ScanWorker] = None
         self.pending_rescan = False
@@ -1433,6 +1449,14 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._connect_player()
+
+        # Set window icon (shows in taskbar)
+        icon_path = Path("../assets/01_media/01_icons/icon.ico")
+        if not icon_path.exists():
+            icon_path = Path("assets/01_media/01_icons/icon.ico")
+        if icon_path.exists():
+            from PySide6.QtGui import QIcon
+            self.setWindowIcon(QIcon(str(icon_path)))
 
         last = self.settings.value("root_path", "")
         if last and Path(last).is_dir():
@@ -1703,6 +1727,16 @@ class MainWindow(QMainWindow):
             "Cover", "Show only songs whose title contains 'cover' (case-insensitive)")
         self.cover_btn.toggled.connect(self._on_cover_toggled)
         lay.addWidget(self.cover_btn)
+
+        self.accordion_btn = _toggle_btn(
+            "[A]", "Show only Accordion songs (title contains '[A]')")
+        self.accordion_btn.toggled.connect(self._on_accordion_toggled)
+        lay.addWidget(self.accordion_btn)
+
+        self.christmas_btn = _toggle_btn(
+            "[C#]", "Show only Christmas songs (title contains '[C#]')")
+        self.christmas_btn.toggled.connect(self._on_christmas_toggled)
+        lay.addWidget(self.christmas_btn)
 
         lay.addSpacing(16)
 
@@ -2030,9 +2064,10 @@ class MainWindow(QMainWindow):
         if not self._pending_changes:
             return
         current = self.player.current_song()
+        current_id = current.id if current else None
         remaining = []
         for action, song, detail in self._pending_changes:
-            if current is song and self.player.is_playing():
+            if current_id == song.id and self.player.is_playing():
                 remaining.append((action, song, detail))
                 continue
             # Song is no longer playing — execute the change
@@ -2052,8 +2087,10 @@ class MainWindow(QMainWindow):
                             combo.blockSignals(True)
                             combo.setCurrentText(detail)
                             combo.blockSignals(False)
-                        lock: LockButton = combo.property("lock_ref") if combo else None
-                        if lock: lock.set_locked(True)
+                        lock = combo.property("lock_ref") if combo else None
+                        if lock:
+                            lock.setEnabled(True)
+                            lock.set_locked(True)
                         cat_sort = self.table.item(item.row(), COL_CATEGORY)
                         if cat_sort: cat_sort.setText(detail)
                         self.table.setRowHidden(item.row(), not self._matches(song))
@@ -2081,6 +2118,13 @@ class MainWindow(QMainWindow):
                         item.setText(a)
                         sn = self.table.item(item.row(), COL_SONGNAME)
                         if sn: sn.setText(s)
+                        # Re-enable the name edit lock
+                        lock_w = self.table.cellWidget(item.row(), COL_NAME_EDIT)
+                        if lock_w:
+                            lk = lock_w.findChild(LockButton)
+                            if lk:
+                                lk.setEnabled(True)
+                                lk.set_locked(True)
                     self._show_toast(f"\u2713  Queued rename: \"{detail}\"", 3000, "success")
                     self._log_change("RENAME", detail, f"was: {old_title}")
                 self.watcher.blockSignals(False)
@@ -2413,14 +2457,15 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, max(1, total))
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
-        self._set_info(f"Loading  0 / {total} songs…", "loading", auto_reset=False)
+        verb = "Loading" if not self.songs_by_id else "Updating"
+        self._set_info(f"{verb}  0 / {total} songs…", "loading", auto_reset=False)
 
     def _on_progress(self, done: int, total: int, eta: Optional[float], name: str):
         self.progress_bar.setValue(done)
-        pct   = int(done / total * 100) if total else 100
-        eta_t = f"  –  ETA {_fmt_time(int(eta * 1000))}" if eta else ""
+        pct  = int(done / total * 100) if total else 100
+        verb = "Loading" if len(self.songs_by_id) < 2 else "Updating"
         self._set_info(
-            f"Loading  {done} / {total} songs  ({pct}%){eta_t}",
+            f"{verb}  {done} / {total} songs  ({pct}%)",
             "loading", auto_reset=False)
         if done % 50 == 0:
             self._rebuild_cat_filter()
@@ -2461,35 +2506,79 @@ class MainWindow(QMainWindow):
                            "warning", auto_reset=True, duration_ms=5000)
 
     def _show_changes(self):
-        """Show change history from CSV log."""
+        """Show change history + pending queue in a scrollable dialog with icons."""
+        from PySide6.QtWidgets import QDialog, QTextEdit
+
         log_path = self._changelog_path()
         lines = []
         if log_path.is_file():
             try:
                 with open(log_path, "r", encoding="utf-8") as f:
-                    rows = f.readlines()[-100:]
-                lines = [r.strip() for r in rows if r.strip()]
+                    lines = [r.strip() for r in f.readlines() if r.strip()]
             except Exception:
                 pass
+
+        icons = {
+            "ADD":    ("\u2795", "#30D158"),   # ➕ green
+            "DEL":    ("\u274C", "#FF453A"),   # ❌ red
+            "MOVE":   ("\u27A1", "#0a84ff"),   # ➡ blue
+            "RATING": ("\u2B50", "#FFD60A"),   # ⭐ yellow
+            "RENAME": ("\u270F", "#FF9F0A"),   # ✏ orange
+            "TODO":   ("\u2610", "#8e8e93"),   # ☐ gray
+        }
+
+        html = "<div style='font-family:SF Mono,Consolas,monospace;font-size:11px;'>"
+
+        # ── Pending queue (if any) ──
+        if self._pending_changes:
+            html += "<p style='color:#FF9F0A;font-weight:700;font-size:12px;'>\u23F3 PENDING QUEUE</p>"
+            for action, song, detail in self._pending_changes:
+                icon, color = icons.get(action, ("\u2022", "#8e8e93"))
+                html += (f"<p style='margin:2px 0;background:#2a1e0a;padding:4px 6px;border-radius:4px;'>"
+                         f"<span style='color:{color};font-size:13px;'>{icon}</span> "
+                         f"<span style='color:#FF9F0A;'>\u23F3 Waiting</span> "
+                         f"<span style='color:#f2f2f7;font-weight:600;'>{song.title}</span> "
+                         f"<span style='color:#8e8e93;'>\u2014 {detail}</span></p>")
+            html += "<hr style='border-color:#3a3a3c;'>"
+
+        # ── History ──
         if not lines:
-            lines = ["No changes recorded yet."]
+            html += "<p style='color:#8e8e93;'>No changes recorded yet.</p>"
+        else:
+            for line in reversed(lines):
+                parts = line.split(",", 3)
+                if len(parts) >= 3:
+                    ts, action, title = parts[0], parts[1], parts[2]
+                    detail = parts[3] if len(parts) > 3 else ""
+                    icon, color = icons.get(action, ("\u2022", "#8e8e93"))
+                    html += (f"<p style='margin:2px 0;'>"
+                             f"<span style='color:{color};font-size:13px;'>{icon}</span> "
+                             f"<span style='color:#6e6e73;'>{ts}</span> "
+                             f"<span style='color:#f2f2f7;font-weight:600;'>{title}</span>")
+                    if detail:
+                        html += f" <span style='color:#8e8e93;'>\u2014 {detail}</span>"
+                    html += "</p>"
+        html += "</div>"
 
-        display = "CHANGE HISTORY (last 100 entries)\n" + "=" * 50 + "\n\n"
-        icons = {"ADD": "+", "DEL": "\u2716", "MOVE": "\u2192",
-                 "RATING": "\u2605", "RENAME": "\u270E", "TODO": "\u2610"}
-        for line in reversed(lines):
-            parts = line.split(",", 3)
-            if len(parts) >= 3:
-                ts, action, title = parts[0], parts[1], parts[2]
-                detail = parts[3] if len(parts) > 3 else ""
-                icon = icons.get(action, "\u2022")
-                display += f"{ts}  {icon} [{action}]  {title}"
-                if detail: display += f"  \u2014  {detail}"
-                display += "\n"
-            else:
-                display += line + "\n"
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Change History")
+        dlg.setFixedSize(700, 400)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(12, 12, 12, 12)
 
-        QMessageBox.information(self, "Change History", display)
+        text_view = QTextEdit()
+        text_view.setReadOnly(True)
+        text_view.setHtml(html)
+        text_view.setStyleSheet(
+            "QTextEdit{background:#1c1c1e;border:1px solid #2c2c2e;"
+            "border-radius:6px;color:#f2f2f7;}")
+        lay.addWidget(text_view)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.close)
+        lay.addWidget(close_btn, alignment=Qt.AlignRight)
+
+        dlg.exec()
 
     def _changelog_path(self) -> Path:
         base = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
@@ -2547,6 +2636,14 @@ class MainWindow(QMainWindow):
 
     def _on_cover_toggled(self, checked: bool):
         self._filter_cover = checked
+        self._apply_filters()
+
+    def _on_accordion_toggled(self, checked: bool):
+        self._filter_accordion = checked
+        self._apply_filters()
+
+    def _on_christmas_toggled(self, checked: bool):
+        self._filter_christmas = checked
         self._apply_filters()
 
     def _show_cat_checkboxes(self):
@@ -2684,8 +2781,11 @@ class MainWindow(QMainWindow):
         self.rat_filter.blockSignals(True);  self.rat_filter.setCurrentIndex(0);    self.rat_filter.blockSignals(False)
         self.collab_btn.blockSignals(True);  self.collab_btn.setChecked(False);     self.collab_btn.blockSignals(False)
         self.cover_btn.blockSignals(True);   self.cover_btn.setChecked(False);      self.cover_btn.blockSignals(False)
+        self.accordion_btn.blockSignals(True); self.accordion_btn.setChecked(False); self.accordion_btn.blockSignals(False)
+        self.christmas_btn.blockSignals(True); self.christmas_btn.setChecked(False); self.christmas_btn.blockSignals(False)
         self._filter_search = ""; self._filter_rating = 0
         self._filter_collab = False; self._filter_cover = False
+        self._filter_accordion = False; self._filter_christmas = False
         # Reset all category checkboxes to checked
         for c in self._cat_checks:
             self._cat_checks[c] = True
@@ -2710,6 +2810,10 @@ class MainWindow(QMainWindow):
         if self._filter_collab and "collab" not in song.title.lower():
             return False
         if self._filter_cover and "cover" not in song.title.lower():
+            return False
+        if self._filter_accordion and "[a]" not in song.title.lower():
+            return False
+        if self._filter_christmas and "[c#]" not in song.title.lower():
             return False
         return True
 
@@ -2887,8 +2991,7 @@ class MainWindow(QMainWindow):
         star_lay.addWidget(star)
         star_lay.addStretch()
         # Set hidden sort item for rating (sort numerically by rating value)
-        rat_sort_item = QTableWidgetItem()
-        rat_sort_item.setData(Qt.DisplayRole, song.rating)
+        rat_sort_item = _InvisibleSortItem(song.rating)
         self.table.setItem(row, COL_RATING, rat_sort_item)
         self.table.setCellWidget(row, COL_RATING, star_wrapper)
 
@@ -3130,6 +3233,25 @@ class MainWindow(QMainWindow):
             if sn_item: sn_item.setText(s_part)
 
             if new_title != song.title:
+                # Check if song is currently playing
+                current = self.player.current_song()
+                is_active = (current is not None and current.id == song.id and
+                            (self.player.is_playing() or
+                             self.player._player.playbackState() != QMediaPlayer.StoppedState))
+
+                if is_active:
+                    # Queue the rename — will apply when song finishes
+                    self._pending_changes.append(("RENAME", song, new_title))
+                    lock.setText("\u23F3")   # ⏳
+                    lock.setStyleSheet(
+                        "QToolButton{background:transparent;border:none;"
+                        "color:#FF9F0A;font-size:13px;}")
+                    lock.setEnabled(False)
+                    self._show_toast(
+                        f"\u23F3  Rename queued: \"{new_title}\"  (will apply when song finishes)",
+                        4000, "warning")
+                    return
+
                 old_path_str = str(song.path)
                 old_title = song.title
                 ok, new_path = write_display_tags(song.path, new_title, song.artist)
@@ -3213,19 +3335,28 @@ class MainWindow(QMainWindow):
     def _on_cat_combo(self, song: Song, combo: QComboBox, new_cat: str):
         if new_cat == song.category or not combo.isEnabled(): return
 
-        is_playing = (self.player.current_song() is song and self.player.is_playing())
+        current = self.player.current_song()
+        is_active = (current is not None and current.id == song.id and
+                    (self.player.is_playing() or
+                     self.player._player.playbackState() != QMediaPlayer.StoppedState))
 
-        if is_playing:
+        if is_active:
             # Queue the category change — will execute when song stops playing
             self._pending_changes.append(("MOVE", song, new_cat))
 
-            # Show pending indicator: spinning/loading style on the lock button
+            # Update combo to show new category visually (queued)
+            combo.blockSignals(True)
+            combo.setCurrentText(new_cat)
+            combo.blockSignals(False)
+
+            # Show hourglass on lock button
             lock: LockButton = combo.property("lock_ref")
             if lock:
                 lock.setText("\u23F3")   # ⏳ hourglass
                 lock.setStyleSheet(
                     "QToolButton{background:transparent;border:none;"
                     "color:#FF9F0A;font-size:13px;}")
+                lock.setEnabled(False)
             combo.setEnabled(False)
 
             self._show_toast(
@@ -3289,7 +3420,8 @@ class MainWindow(QMainWindow):
         # Update hidden sort item for rating column
         if item:
             rat_sort = self.table.item(item.row(), COL_RATING)
-            if rat_sort: rat_sort.setData(Qt.DisplayRole, new_rating)
+            if isinstance(rat_sort, _InvisibleSortItem):
+                rat_sort.set_sort_key(new_rating)
 
         # Auto re-lock the rating pen after saving
         lock: LockButton = star_widget.property("lock_ref")
