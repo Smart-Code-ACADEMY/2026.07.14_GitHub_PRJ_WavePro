@@ -1599,6 +1599,11 @@ class MainWindow(QMainWindow):
         self.changes_btn.clicked.connect(self._show_changes)
         info_lay.addWidget(self.changes_btn)
 
+        self.pending_btn = QPushButton("Queue (0)")
+        self.pending_btn.setToolTip("Show pending changes waiting to be applied")
+        self.pending_btn.clicked.connect(self._show_pending)
+        info_lay.addWidget(self.pending_btn)
+
         outer.addWidget(self.info_bar)
 
         self._status_reset_timer = QTimer(self)
@@ -1734,7 +1739,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.accordion_btn)
 
         self.christmas_btn = _toggle_btn(
-            "[C#]", "Show only Christmas songs (title contains '[C#]')")
+            "[C]", "Show only Christmas songs (title contains '[C]')")
         self.christmas_btn.toggled.connect(self._on_christmas_toggled)
         lay.addWidget(self.christmas_btn)
 
@@ -2131,6 +2136,7 @@ class MainWindow(QMainWindow):
                 self._rescan_timer.stop()
 
         self._pending_changes = remaining
+        self._update_pending_btn()
 
     # ------------------------------------------------------------------
     # Navigation: Focus / Scroll Top / Scroll Bottom
@@ -2552,8 +2558,8 @@ class MainWindow(QMainWindow):
                     detail = parts[3] if len(parts) > 3 else ""
                     icon, color = icons.get(action, ("\u2022", "#8e8e93"))
                     html += (f"<p style='margin:2px 0;'>"
-                             f"<span style='color:{color};font-size:13px;'>{icon}</span> "
-                             f"<span style='color:#6e6e73;'>{ts}</span> "
+                             f"<span style='color:{color};font-size:13px;display:inline-block;width:20px;text-align:center;'>{icon}</span>"
+                             f"<span style='color:#6e6e73;'>{ts}</span>&nbsp;&nbsp;"
                              f"<span style='color:#f2f2f7;font-weight:600;'>{title}</span>")
                     if detail:
                         html += f" <span style='color:#8e8e93;'>\u2014 {detail}</span>"
@@ -2578,6 +2584,57 @@ class MainWindow(QMainWindow):
         close_btn.clicked.connect(dlg.close)
         lay.addWidget(close_btn, alignment=Qt.AlignRight)
 
+        dlg.exec()
+
+    def _update_pending_btn(self):
+        """Update the pending button text with current queue count."""
+        n = len(self._pending_changes)
+        self.pending_btn.setText(f"Queue ({n})")
+        if n > 0:
+            self.pending_btn.setStyleSheet(
+                "QPushButton{color:#FF9F0A;font-weight:600;}")
+        else:
+            self.pending_btn.setStyleSheet("")
+
+    def _show_pending(self):
+        """Show pending changes queue in a dialog."""
+        from PySide6.QtWidgets import QDialog, QTextEdit
+
+        icons = {
+            "MOVE":   ("\u27A1", "#0a84ff"),
+            "RENAME": ("\u270F", "#FF9F0A"),
+        }
+
+        html = "<div style='font-family:SF Mono,Consolas,monospace;font-size:12px;'>"
+        if not self._pending_changes:
+            html += "<p style='color:#8e8e93;'>No pending changes in queue.</p>"
+        else:
+            html += (f"<p style='color:#FF9F0A;font-weight:700;'>"
+                     f"\u23F3 {len(self._pending_changes)} pending change(s)</p><br>")
+            for action, song, detail in self._pending_changes:
+                icon, color = icons.get(action, ("\u2022", "#8e8e93"))
+                html += (f"<p style='margin:4px 0;'>"
+                         f"<span style='color:{color};font-size:14px;'>{icon}</span>"
+                         f"&nbsp;&nbsp;&nbsp;"
+                         f"<span style='color:#f2f2f7;font-weight:600;'>{song.title}</span> "
+                         f"<span style='color:#8e8e93;'>\u2014 {action}: {detail}</span></p>")
+        html += "</div>"
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Pending Queue ({len(self._pending_changes)})")
+        dlg.setFixedSize(600, 300)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(12, 12, 12, 12)
+
+        tv = QTextEdit()
+        tv.setReadOnly(True)
+        tv.setHtml(html)
+        tv.setStyleSheet("QTextEdit{background:#1c1c1e;border:1px solid #2c2c2e;border-radius:6px;}")
+        lay.addWidget(tv)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.close)
+        lay.addWidget(close_btn, alignment=Qt.AlignRight)
         dlg.exec()
 
     def _changelog_path(self) -> Path:
@@ -2813,7 +2870,7 @@ class MainWindow(QMainWindow):
             return False
         if self._filter_accordion and "[a]" not in song.title.lower():
             return False
-        if self._filter_christmas and "[c#]" not in song.title.lower():
+        if self._filter_christmas and "[c]" not in song.title.lower():
             return False
         return True
 
@@ -3015,12 +3072,12 @@ class MainWindow(QMainWindow):
 
         # ── Delete button ──
         del_btn = QToolButton()
-        del_btn.setText("\u2716")   # ✖
+        del_btn.setText("\U0001F5D1")   # 🗑 recycle bin
         del_btn.setToolTip("Delete this file permanently")
         del_btn.setCursor(Qt.PointingHandCursor)
-        del_btn.setFixedSize(20, 20)
+        del_btn.setFixedSize(22, 22)
         del_btn.setStyleSheet(
-            "QToolButton{background:transparent;border:none;color:#6e6e73;font-size:12px;}"
+            "QToolButton{background:transparent;border:none;color:#8e8e93;font-size:13px;}"
             "QToolButton:hover{color:#FF453A;}"
         )
         del_btn.clicked.connect(lambda _=False, s=song: self._delete_song(s))
@@ -3242,6 +3299,7 @@ class MainWindow(QMainWindow):
                 if is_active:
                     # Queue the rename — will apply when song finishes
                     self._pending_changes.append(("RENAME", song, new_title))
+                    self._update_pending_btn()
                     lock.setText("\u23F3")   # ⏳
                     lock.setStyleSheet(
                         "QToolButton{background:transparent;border:none;"
@@ -3341,8 +3399,12 @@ class MainWindow(QMainWindow):
                      self.player._player.playbackState() != QMediaPlayer.StoppedState))
 
         if is_active:
+            # Block watcher to prevent rescan from resetting the combo
+            self.watcher.blockSignals(True)
+
             # Queue the category change — will execute when song stops playing
             self._pending_changes.append(("MOVE", song, new_cat))
+            self._update_pending_btn()
 
             # Update combo to show new category visually (queued)
             combo.blockSignals(True)
@@ -3358,6 +3420,9 @@ class MainWindow(QMainWindow):
                     "color:#FF9F0A;font-size:13px;}")
                 lock.setEnabled(False)
             combo.setEnabled(False)
+
+            self.watcher.blockSignals(False)
+            self._rescan_timer.stop()
 
             self._show_toast(
                 f"\u23F3  Move queued: '{song.title}' → {new_cat}  (will apply when song finishes)",
