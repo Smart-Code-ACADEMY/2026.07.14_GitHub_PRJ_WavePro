@@ -1437,6 +1437,7 @@ class MainWindow(QMainWindow):
         self.last_added:   List[str] = []
         self.last_removed: List[str] = []
         self._pending_changes: List[tuple] = []  # queued changes for playing songs
+        self._suppress_rescan = False  # when True, all rescans are blocked
 
         self.player = PlayerController(self)
         self.watcher = QFileSystemWatcher(self)
@@ -2077,7 +2078,7 @@ class MainWindow(QMainWindow):
                 continue
             # Song is no longer playing — execute the change
             if action == "MOVE":
-                self.watcher.blockSignals(True)
+                self._suppress_rescan = True; self.watcher.blockSignals(True)
                 old_cat, old_path_str = song.category, str(song.path)
                 try:
                     new_path = safe_move_song(song, self.root_path, detail)
@@ -2105,11 +2106,11 @@ class MainWindow(QMainWindow):
                     self._log_change("MOVE", song.title, f"{old_cat} -> {detail}")
                 except SafeMoveError as e:
                     self._show_toast(f"Queued move failed: {e}", 5000, "error")
-                self.watcher.blockSignals(False)
+                self._suppress_rescan = False; self.watcher.blockSignals(False)
                 self._rescan_timer.stop()
 
             elif action == "RENAME":
-                self.watcher.blockSignals(True)
+                self._suppress_rescan = True; self.watcher.blockSignals(True)
                 old_title = song.title
                 old_path_str = str(song.path)
                 ok, new_path = write_display_tags(song.path, detail, song.artist)
@@ -2132,7 +2133,7 @@ class MainWindow(QMainWindow):
                                 lk.set_locked(True)
                     self._show_toast(f"\u2713  Queued rename: \"{detail}\"", 3000, "success")
                     self._log_change("RENAME", detail, f"was: {old_title}")
-                self.watcher.blockSignals(False)
+                self._suppress_rescan = False; self.watcher.blockSignals(False)
                 self._rescan_timer.stop()
 
         self._pending_changes = remaining
@@ -2193,7 +2194,7 @@ class MainWindow(QMainWindow):
             return
 
         # Block watcher to prevent duplicate detection
-        self.watcher.blockSignals(True)
+        self._suppress_rescan = True; self.watcher.blockSignals(True)
 
         # Auto-create To-Do subfolder if it doesn't exist
         todo_dir = self.root_path / "To-Do"
@@ -2203,7 +2204,7 @@ class MainWindow(QMainWindow):
                 self.watcher.addPath(str(todo_dir))
                 self._rebuild_cat_filter()
             except OSError as e:
-                self.watcher.blockSignals(False)
+                self._suppress_rescan = False; self.watcher.blockSignals(False)
                 self._show_toast(f"Could not create To-Do folder: {e}", 5000, "error")
                 return
 
@@ -2251,12 +2252,12 @@ class MainWindow(QMainWindow):
 
         name_input.setFocus()
         if not dlg.exec():
-            self.watcher.blockSignals(False)
+            self._suppress_rescan = False; self.watcher.blockSignals(False)
             return
 
         name = name_input.text().strip()
         if not name:
-            self.watcher.blockSignals(False)
+            self._suppress_rescan = False; self.watcher.blockSignals(False)
             return
         rat_val = 0  # To-Do items have no rating
 
@@ -2288,7 +2289,7 @@ class MainWindow(QMainWindow):
         self._apply_filters()
 
         # Unblock watcher and cancel any pending rescans
-        self.watcher.blockSignals(False)
+        self._suppress_rescan = False; self.watcher.blockSignals(False)
         self._rescan_timer.stop()
         self._show_toast(f"\u2713  To-Do added: \"{name}\"", 3000, "success")
         self._log_change("TODO", name, "To-Do placeholder created")
@@ -2409,16 +2410,14 @@ class MainWindow(QMainWindow):
         self._start_scan()
 
     def _on_dir_changed(self, _: str):
-        self._rescan_timer.start()
+        if not self._suppress_rescan:
+            self._rescan_timer.start()
 
     def _on_file_changed(self, changed_path: str):
-        """Called when an individual audio file changes on disk.
-        Re-adds it to the watcher (some OS remove it after a change)
-        and triggers a rescan so tags are refreshed."""
-        # Re-watch the file (some filesystems stop watching after a modify)
         if Path(changed_path).exists():
             self.watcher.addPath(changed_path)
-        self._rescan_timer.start()
+        if not self._suppress_rescan:
+            self._rescan_timer.start()
 
     # ------------------------------------------------------------------
     # Background scanning
@@ -2756,9 +2755,11 @@ class MainWindow(QMainWindow):
             "font-size:12px;font-weight:600;text-align:left;padding:2px;}"
             "QPushButton:hover{color:#3399ff;}")
         all_lbl.setCursor(Qt.PointingHandCursor)
-        all_lbl.clicked.connect(lambda: (
-            [cb.setChecked(True) for _, cb in cat_cbs],
-            _on_checkbox_toggled()))
+        def _select_all_and_close():
+            for c in self._cat_checks:
+                self._cat_checks[c] = True
+            menu.close()
+        all_lbl.clicked.connect(_select_all_and_close)
         all_lay.addWidget(all_lbl, stretch=1)
 
         wa_all = QWidgetAction(menu)
@@ -2973,6 +2974,23 @@ class MainWindow(QMainWindow):
     # Table rows (incremental)
     # ------------------------------------------------------------------
     def _add_or_update(self, song: Song):
+        # ── Deduplication: if a song with the same PATH already exists
+        # under a different ID, merge into the existing entry ──
+        existing_id = None
+        for sid, s in self.songs_by_id.items():
+            if s.path == song.path and sid != song.id:
+                existing_id = sid
+                break
+        if existing_id:
+            # Merge: update existing song, discard the new ID
+            old_song = self.songs_by_id[existing_id]
+            old_song.title = song.title
+            old_song.artist = song.artist
+            old_song.rating = song.rating
+            old_song.category = song.category
+            old_song.duration = song.duration
+            song = old_song   # use the existing object
+
         self.songs_by_id[song.id] = song
         item = self.row_items.get(song.id)
         if item is not None:
@@ -2990,6 +3008,8 @@ class MainWindow(QMainWindow):
             if star_wrapper:
                 star = star_wrapper.findChild(StarRatingWidget)
                 if star: star.set_rating(song.rating)
+            cat_sort = self.table.item(row, COL_CATEGORY)
+            if cat_sort: cat_sort.setText(song.category)
             self.table.setRowHidden(row, not self._matches(song))
         else:
             self._insert_row(song)
@@ -3132,7 +3152,7 @@ class MainWindow(QMainWindow):
         if not songs:
             return
 
-        self.watcher.blockSignals(True)
+        self._suppress_rescan = True; self.watcher.blockSignals(True)
         self._rescan_timer.stop()
         self.table.setSortingEnabled(False)
         self._set_info(f"Moving {len(songs)} files to '{new_cat}'\u2026", "loading", auto_reset=False)
@@ -3178,7 +3198,7 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
         self.bulk_cat_combo.setCurrentIndex(0)
         self._update_queue_numbers()
-        self.watcher.blockSignals(False)
+        self._suppress_rescan = False; self.watcher.blockSignals(False)
         self._rescan_timer.stop()
         self._set_info(
             f"\u2713  {moved} songs moved to '{new_cat}'",
@@ -3195,7 +3215,7 @@ class MainWindow(QMainWindow):
             return
 
         # Block ALL file-change signals to prevent repeated rescans
-        self.watcher.blockSignals(True)
+        self._suppress_rescan = True; self.watcher.blockSignals(True)
         self._rescan_timer.stop()
         self.table.setSortingEnabled(False)
         self._set_info(f"Writing rating to {len(songs)} files\u2026", "loading", auto_reset=False)
@@ -3234,7 +3254,7 @@ class MainWindow(QMainWindow):
         self._update_queue_numbers()
 
         # Unblock watcher and cancel any queued rescans
-        self.watcher.blockSignals(False)
+        self._suppress_rescan = False; self.watcher.blockSignals(False)
         self._rescan_timer.stop()
 
         stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
@@ -3400,7 +3420,7 @@ class MainWindow(QMainWindow):
 
         if is_active:
             # Block watcher to prevent rescan from resetting the combo
-            self.watcher.blockSignals(True)
+            self._suppress_rescan = True; self.watcher.blockSignals(True)
 
             # Queue the category change — will execute when song stops playing
             self._pending_changes.append(("MOVE", song, new_cat))
@@ -3421,7 +3441,7 @@ class MainWindow(QMainWindow):
                 lock.setEnabled(False)
             combo.setEnabled(False)
 
-            self.watcher.blockSignals(False)
+            self._suppress_rescan = False; self.watcher.blockSignals(False)
             self._rescan_timer.stop()
 
             self._show_toast(
@@ -3430,7 +3450,7 @@ class MainWindow(QMainWindow):
             return
 
         # Not playing — move immediately
-        self.watcher.blockSignals(True)
+        self._suppress_rescan = True; self.watcher.blockSignals(True)
         self.table.setSortingEnabled(False)
 
         old_cat, old_path_str = song.category, str(song.path)
@@ -3440,7 +3460,7 @@ class MainWindow(QMainWindow):
             self._show_toast(f"Move failed: {e}", 6000, "error")
             combo.blockSignals(True); combo.setCurrentText(old_cat); combo.blockSignals(False)
             self.table.setSortingEnabled(True)
-            self.watcher.blockSignals(False)
+            self._suppress_rescan = False; self.watcher.blockSignals(False)
             return
 
         song.path = new_path; song.category = new_cat
@@ -3458,7 +3478,7 @@ class MainWindow(QMainWindow):
         self.table.setRowHidden(self.row_items[song.id].row(), not self._matches(song))
         self.table.setSortingEnabled(True)
 
-        self.watcher.blockSignals(False)
+        self._suppress_rescan = False; self.watcher.blockSignals(False)
         self._rescan_timer.stop()
         self._show_toast(f"\u2713  '{song.title}'  moved: {old_cat} \u2192 {new_cat}", 3500, "success")
         self._log_change("MOVE", song.title, f"{old_cat} -> {new_cat}")
@@ -3470,7 +3490,7 @@ class MainWindow(QMainWindow):
         item = self.row_items.get(song.id)
 
         # Block watcher to prevent intermediate rescan
-        self.watcher.blockSignals(True)
+        self._suppress_rescan = True; self.watcher.blockSignals(True)
         self.table.setSortingEnabled(False)
 
         if not write_rating(song.path, new_rating):
@@ -3500,7 +3520,7 @@ class MainWindow(QMainWindow):
 
         # Re-enable sorting and unblock watcher
         self.table.setSortingEnabled(True)
-        self.watcher.blockSignals(False)
+        self._suppress_rescan = False; self.watcher.blockSignals(False)
         self._rescan_timer.stop()
 
         # Restore selection to the same song row
