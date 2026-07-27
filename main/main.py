@@ -18,6 +18,7 @@ import os
 import shutil
 import sys
 import time
+import threading
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -58,13 +59,7 @@ TODO_EXTENSIONS      = {".txt"}   # placeholder files, not playable
 
 
 def read_display_tags(path: Path) -> Tuple[str, str]:
-    """
-    Title  = ALWAYS the physical filename (without extension).
-             This ensures the app always shows exactly what is on disk.
-             Renaming the file in the OS immediately changes the title.
-    Artist = from embedded audio tags (ID3 / Vorbis / MP4).
-    """
-    title  = path.stem   # always the physical filename
+    title  = path.stem
     artist = ""
     try:
         audio = MutagenFile(path, easy=True)
@@ -78,21 +73,12 @@ def read_display_tags(path: Path) -> Tuple[str, str]:
 
 
 def write_display_tags(path: Path, title: str, artist: str) -> Tuple[bool, Path]:
-    """
-    Title  → physically RENAMES the file on disk (title = filename).
-    Artist → writes the artist tag into the audio file's metadata.
-
-    Returns (success, new_path). new_path may differ from the input path
-    if the file was renamed (title changed).
-    """
     new_path = path
     try:
-        # ── Rename file if title changed ──
         current_stem = path.stem
         if title and title != current_stem:
             new_name = title + path.suffix
             candidate = path.parent / new_name
-            # Avoid overwriting an existing file
             if candidate.exists() and candidate.resolve() != path.resolve():
                 counter = 1
                 while candidate.exists():
@@ -101,7 +87,6 @@ def write_display_tags(path: Path, title: str, artist: str) -> Tuple[bool, Path]
             os.rename(path, candidate)
             new_path = candidate
 
-        # ── Write artist tag ──
         audio = MutagenFile(new_path, easy=True)
         if audio is not None:
             if audio.tags is None:
@@ -125,14 +110,6 @@ def read_duration_seconds(path: Path) -> float:
 
 
 def read_rating(path: Path) -> int:
-    """Read rating (0-5) from audio file metadata.
-
-    For MP3: reads POPM frame first (what Windows Properties writes),
-    then falls back to TXXX:RATING (what this app writes).
-    This ensures ratings set via Windows Properties > Details > Rating
-    are correctly displayed in the app.
-    """
-    # POPM byte → star mapping (Windows standard)
     def _popm_to_stars(byte_val: int) -> int:
         if byte_val == 0:   return 0
         if byte_val <= 31:  return 1
@@ -148,11 +125,9 @@ def read_rating(path: Path) -> int:
                 id3 = ID3(path)
             except ID3NoHeaderError:
                 return 0
-            # First try POPM (Windows Properties writes this)
             popm_frames = id3.getall("POPM")
             if popm_frames:
                 return _popm_to_stars(popm_frames[0].rating)
-            # Fall back to TXXX:RATING (this app's custom tag)
             for frame in id3.getall("TXXX"):
                 if getattr(frame, "desc", "").upper() == RATING_TXXX_DESC:
                     try:
@@ -188,20 +163,9 @@ def read_rating(path: Path) -> int:
 
 
 def write_rating(path: Path, rating: int) -> bool:
-    """Write rating (0-5) directly into the audio file's own metadata.
-
-    For MP3 files, writes BOTH:
-      - TXXX:RATING  (text "0"-"5", used by this app)
-      - POPM         (Popularimeter, 0-255 byte, used by Windows Properties)
-
-    Windows star-to-byte mapping:
-      0 stars = 0,  1 star = 1,  2 stars = 64,
-      3 stars = 128,  4 stars = 196,  5 stars = 255
-    """
     rating = _clamp(rating)
     ext = path.suffix.lower()
 
-    # Windows POPM byte values for each star level
     _STAR_TO_POPM = {0: 0, 1: 1, 2: 64, 3: 128, 4: 196, 5: 255}
 
     try:
@@ -210,13 +174,10 @@ def write_rating(path: Path, rating: int) -> bool:
                 id3 = ID3(path)
             except ID3NoHeaderError:
                 id3 = ID3()
-            # Remove old TXXX:RATING
             for f in [f for f in id3.getall("TXXX")
                       if getattr(f, "desc", "").upper() == RATING_TXXX_DESC]:
                 id3.delall(f"TXXX:{f.desc}")
-            # Write TXXX:RATING (for this app)
             id3.add(TXXX(encoding=3, desc=RATING_TXXX_DESC, text=[str(rating)]))
-            # Write POPM (for Windows Properties > Details > Rating)
             from mutagen.id3 import POPM
             id3.delall("POPM")
             id3.add(POPM(email="Windows Media Player 9 Series",
@@ -255,6 +216,19 @@ def write_rating(path: Path, rating: int) -> bool:
 
 def _clamp(v: int) -> int:
     return max(0, min(5, v))
+
+def _bg_write_rating(path: Path, rating: int):
+    """Write rating in background thread — GUI never blocks."""
+    threading.Thread(target=write_rating, args=(path, rating), daemon=True).start()
+
+def _bg_move_song(song, root, new_cat, callback):
+    def _do():
+        try:
+            new_path = safe_move_song(song, root, new_cat)
+            callback(new_path)
+        except Exception:
+            pass
+    threading.Thread(target=_do, daemon=True).start()
 
 
 def _safe_int(v) -> int:
@@ -451,11 +425,6 @@ class ScanWorker(QThread):
         truly_missing = [p for lst in missing_by_size.values() for p in lst]
         new_cache: Dict[str, dict] = {}
 
-        # Build the full ordered work list:
-        #   Phase 1 – cached/moved  (fast, no disk tag read)
-        #   Phase 2 – new/changed   (slow, must read tags from disk)
-        # We stream ALL of them one-by-one so the UI always shows live progress.
-
         fast_items: List[Tuple[str, bool]] = (
             [(p, False) for p in unchanged] +
             [(new_p, False) for _, new_p in moved_pairs]
@@ -468,13 +437,6 @@ class ScanWorker(QThread):
         start = time.monotonic()
         done  = 0
 
-        # ── Phase 1: cached songs (no tag reading for most fields, very fast)
-        # IMPORTANT: title and artist are always re-read from the file, even
-        # for "unchanged" files. This guarantees the app always shows what is
-        # physically inside the audio file, regardless of whether the tags were
-        # changed externally (by another app, OS, etc.).
-        # Only rating and duration are taken from cache (they are either written
-        # by this app or rarely change externally).
         for p, _ in fast_items:
             cat, size, mtime = current[p]
             rec = old.get(p)
@@ -486,16 +448,13 @@ class ScanWorker(QThread):
                 rec = {}
             path_obj = Path(p)
 
-            # OPTIMIZATION: if mtime matches cache, use cached data (no disk I/O)
-            # This makes re-opening the app near-instant for unchanged files.
-            # Only re-read from disk if the file was actually modified.
             cache_fresh = (rec.get("mtime") is not None
                           and abs(rec.get("mtime", 0) - mtime) < 1.0
                           and rec.get("size") == size
                           and "title" in rec)
 
             if cache_fresh:
-                title    = path_obj.stem   # title = always filename
+                title    = path_obj.stem
                 artist   = rec.get("artist", "")
                 rating   = rec.get("rating", 0)
                 duration = rec.get("duration", 0.0)
@@ -520,7 +479,6 @@ class ScanWorker(QThread):
             self.progressUpdate.emit(done, total, eta, song.title)
             self.songReady.emit(song)
 
-        # ── Phase 2: new/changed songs (reads tags from disk) ──────────
         for p in slow_items:
             cat, size, mtime = current[p]
             po = Path(p)
@@ -550,7 +508,6 @@ class ScanWorker(QThread):
             [new_cache.get(p, {}).get("title", Path(p).stem) for p in truly_added],
             [old[p].get("title", Path(p).stem) for p in truly_missing],
             len(moved_pairs),
-
         )
 
 
@@ -561,105 +518,7 @@ class RepeatMode(Enum):
     OFF     = 0
     ONE     = 1
     ALL     = 2
-    REVERSE = 3   # play all songs in reverse order
-
-
-class PlayerController(QObject):
-    """Manages playback queue, repeat, shuffle."""
-
-
-class PlayerController(QObject):
-    """Manages playback queue, repeat, shuffle."""
-
-
-class _FileOp:
-    """A single file operation to execute in the background."""
-    __slots__ = ("kind", "song_id", "args", "description")
-    def __init__(self, kind: str, song_id: str, args: dict, description: str):
-        self.kind = kind
-        self.song_id = song_id
-        self.args = args
-        self.description = description
-
-
-class BackgroundWorker(QThread):
-    """Processes file operations (move, rating, rename, delete) in a background
-    thread so the GUI never freezes. Operations are queued and processed FIFO."""
-    operationDone = Signal(str, str, bool, str)  # (kind, song_id, success, detail)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._ops: List[_FileOp] = []
-        self._running = True
-        from threading import Lock
-        self._lock = Lock()
-        self._has_work = False
-
-    def enqueue(self, op: "_FileOp"):
-        with self._lock:
-            self._ops.append(op)
-            self._has_work = True
-
-    def pending_count(self) -> int:
-        with self._lock:
-            return len(self._ops)
-
-    def pending_list(self) -> list:
-        with self._lock:
-            return [(op.kind, op.song_id, op.description) for op in self._ops]
-
-    def run(self):
-        while self._running:
-            op = None
-            with self._lock:
-                if self._ops:
-                    op = self._ops.pop(0)
-                else:
-                    self._has_work = False
-            if op is None:
-                self.msleep(100)
-                continue
-            try:
-                ok = False
-                detail = ""
-                if op.kind == "MOVE":
-                    src = Path(op.args["src"])
-                    root = Path(op.args["root"])
-                    new_cat = op.args["new_cat"]
-                    if src.is_file():
-                        # Create a minimal song-like object for safe_move_song
-                        class _MinSong:
-                            pass
-                        ms = _MinSong()
-                        ms.path = src
-                        ms.category = op.args.get("old_cat", "")
-                        new_path = safe_move_song(ms, root, new_cat)
-                        ok = True
-                        detail = str(new_path)
-                    else:
-                        ok = False
-                        detail = f"File not found: {src}"
-                elif op.kind == "RATING":
-                    ok = write_rating(Path(op.args["path"]), op.args["rating"])
-                    detail = str(op.args["rating"])
-                elif op.kind == "RENAME":
-                    ok_r, new_path = write_display_tags(
-                        Path(op.args["path"]), op.args["new_title"], op.args.get("artist",""))
-                    ok = ok_r
-                    detail = str(new_path)
-                elif op.kind == "DELETE":
-                    p = Path(op.args["path"])
-                    if p.is_file():
-                        os.remove(p)
-                    ok = True
-                    detail = op.args["path"]
-            except Exception as e:
-                ok = False
-                detail = str(e)
-            self.operationDone.emit(op.kind, op.song_id, ok, detail)
-
-    def stop(self):
-        self._running = False
+    REVERSE = 3
 
 
 class PlayerController(QObject):
@@ -704,6 +563,10 @@ class PlayerController(QObject):
         self.shuffleChanged.emit(enabled)
 
     def toggle_play_pause(self):
+        if self._index < 0 and self._queue:
+            self._index = 0
+            self._load(autoplay=True)
+            return
         if self._index < 0: return
         self._player.pause() if self.is_playing() else self._player.play()
 
@@ -735,12 +598,10 @@ class PlayerController(QObject):
                     self._index = 0
                 else:
                     self._player.stop(); self.songChanged.emit(None); return
-            # Skip .txt placeholder files
             song = self.current_song()
             if song and song.path.suffix.lower() not in TODO_EXTENSIONS:
                 self._load(autoplay=True); return
             attempts += 1
-        # All songs are .txt — nothing to play
         self._player.stop(); self.songChanged.emit(None)
 
     def previous(self):
@@ -768,7 +629,6 @@ class PlayerController(QObject):
                     self._index = len(self._queue) - 1
                 else:
                     self._index = 0
-            # Skip .txt placeholder files
             song = self.current_song()
             if song and song.path.suffix.lower() not in TODO_EXTENSIONS:
                 self._load(autoplay=True); return
@@ -803,10 +663,9 @@ class PlayerController(QObject):
     def _load(self, autoplay=False):
         song = self.current_song()
         if song is None: return
-        # .txt placeholder files can't play — skip silently
         if song.path.suffix.lower() in TODO_EXTENSIONS:
-            self.songChanged.emit(song)   # update UI
-            return   # caller (next/prev) handles skipping
+            self.songChanged.emit(song)
+            return
         self._player.setSource(QUrl.fromLocalFile(str(song.path)))
         self.songChanged.emit(song)
         if autoplay: self._player.play()
@@ -820,34 +679,18 @@ class PlayerController(QObject):
 
 
 # ============================================================================
-# ============================================================================
-# Star-colored combo box delegate
-
 # LockButton widget
 # ============================================================================
 class LockButton(QToolButton):
-    """
-    Minimal edit-permission indicator.
+    toggledLock = Signal(bool)
 
-    Green  =  locked / safe.   Shows a small pen icon in green.
-              Nothing can be changed by accident.
-
-    Red    =  unlocked / editing.  Same pen in red.
-              Attention: an important change is now possible.
-
-    Uses a simple pen glyph (✒ U+2712) which is clean, universally
-    recognised as "edit", and renders crisply at small sizes.
-    """
-    toggledLock = Signal(bool)   # True = now unlocked
-
-    # ✒  BLACK NIB — clean, minimal, universally understood as "edit"
     _ICON = "\u2712"
 
     _CSS_LOCKED = (
         "QToolButton{"
         "  background: transparent;"
         "  border: none;"
-        "  color: #30D158;"          # green = safe
+        "  color: #30D158;"
         "  font-size: 13px;"
         "  padding: 0px;"
         "}"
@@ -858,7 +701,7 @@ class LockButton(QToolButton):
         "QToolButton{"
         "  background: transparent;"
         "  border: none;"
-        "  color: #FF453A;"          # red = attention / editing active
+        "  color: #FF453A;"
         "  font-size: 13px;"
         "  padding: 0px;"
         "}"
@@ -900,16 +743,9 @@ class LockButton(QToolButton):
 
 
 class StarRatingWidget(QWidget):
-    """
-    5 stars always visible:
-    - No rating  → 5 clearly visible GRAY outline stars  ☆☆☆☆☆
-    - With rating → filled GREEN stars + gray empties     ★★★☆☆
-    Always directly clickable (no lock needed).
-    Clicking the same active star resets to 0.
-    """
     ratingChanged = Signal(int)
-    COLOR_FILLED = "#FFD60A"   # yellow
-    COLOR_EMPTY  = "#8e8e93"   # medium gray – clearly visible on dark background
+    COLOR_FILLED = "#FFD60A"
+    COLOR_EMPTY  = "#8e8e93"
 
     def __init__(self, rating: int = 0, parent=None):
         super().__init__(parent)
@@ -924,7 +760,6 @@ class StarRatingWidget(QWidget):
             btn.setFlat(True)
             btn.setFixedSize(26, 26)
             btn.setCursor(Qt.PointingHandCursor)
-            # Use objectName so our specific style beats the global QPushButton rule
             btn.setObjectName("starBtn")
             btn.clicked.connect(lambda _checked=False, idx=i: self._on_click(idx))
             lay.addWidget(btn)
@@ -948,7 +783,7 @@ class StarRatingWidget(QWidget):
             return
         new = idx + 1
         if new == self._rating:
-            new = 0   # click same active star → reset to 0
+            new = 0
         self._rating = new
         self._refresh()
         self.ratingChanged.emit(self._rating)
@@ -957,10 +792,8 @@ class StarRatingWidget(QWidget):
         for i, btn in enumerate(self._btns):
             filled = i < self._rating
             color  = self.COLOR_FILLED if filled else self.COLOR_EMPTY
-            char   = "\u2605" if filled else "\u2606"   # ★ / ☆
+            char   = "\u2605" if filled else "\u2606"
             btn.setText(char)
-            # Use !important-equivalent: very specific inline style
-            # The objectName selector #starBtn beats the global QPushButton rule
             btn.setStyleSheet(
                 f"QPushButton#starBtn {{"
                 f"  border: none;"
@@ -983,27 +816,9 @@ class StarRatingWidget(QWidget):
 
 
 # ============================================================================
-# Loading dialog – shown whenever new/changed files are being read
-# ============================================================================
-# ============================================================================
-# VU Meter widget – real-time dB level display
+# VU Meter widget
 # ============================================================================
 class VUMeter(QWidget):
-    """
-    Professional stereo VU meter (L / R bars).
-    Driven by a QTimer that reads the current playback position
-    and estimates the instantaneous level.  When a real audio
-    level probe is unavailable (Qt6 limitation without a custom
-    AudioSink), the meter simulates a realistic signal envelope
-    that tracks the song's current position.
-
-    The meter shows dBFS values from -60 dB (silence) to 0 dB (peak).
-    Colour zones:
-        -60 … -18 dB  →  green   (#30D158)
-        -18 …  -6 dB  →  yellow  (#FFD60A)
-         -6 …   0 dB  →  red     (#FF453A)
-    """
-
     _DB_MIN = -60.0
     _DB_MAX  =   0.0
 
@@ -1012,24 +827,20 @@ class VUMeter(QWidget):
         self.setMinimumSize(54, 60)
         self.setMaximumWidth(70)
 
-        # Current level for each channel, in dBFS (-60 … 0)
         self._level_L: float = self._DB_MIN
         self._level_R: float = self._DB_MIN
 
-        # Peak hold
         self._peak_L: float = self._DB_MIN
         self._peak_R: float = self._DB_MIN
         self._peak_L_age: int = 0
         self._peak_R_age: int = 0
 
-        # Decay parameters (called at ~30 fps)
-        self._decay_rate  = 3.5   # dB per frame
-        self._peak_hold   = 20    # frames before peak starts falling
+        self._decay_rate  = 3.5
+        self._peak_hold   = 20
         self._peak_decay  = 1.0
 
-        # Timer drives repaints
         self._timer = QTimer(self)
-        self._timer.setInterval(33)   # ~30 fps
+        self._timer.setInterval(33)
         self._timer.timeout.connect(self._tick)
         self._timer.start()
 
@@ -1037,11 +848,9 @@ class VUMeter(QWidget):
         self._pos_ms  = 0
         self._dur_ms  = 1
 
-        # Smooth state (0..1 linear power)
         self._smooth_L = 0.0
         self._smooth_R = 0.0
 
-    # ── Public API called by MainWindow ──────────────────────────────
     def set_playing(self, playing: bool):
         self._playing = playing
         if not playing:
@@ -1052,43 +861,32 @@ class VUMeter(QWidget):
         self._pos_ms = pos_ms
         self._dur_ms = max(1, dur_ms)
 
-    # ── Internal tick ─────────────────────────────────────────────────
     def _tick(self):
         if self._playing and self._dur_ms > 0:
-            # Simulate a signal that varies with playback position.
-            # Uses multiple sine waves at different frequencies to produce
-            # a realistic-looking level that changes over time.
             t = self._pos_ms / 1000.0
-
-            # Base level: pseudo-random but deterministic per second
             import random
-            rng = random.Random(int(t * 4))   # changes 4× per second
+            rng = random.Random(int(t * 4))
             base = rng.uniform(0.12, 0.55)
 
-            # Add fast variation
             vary_L = 0.5 + 0.5 * math.sin(t * 7.3 + 0.0)
             vary_R = 0.5 + 0.5 * math.sin(t * 6.1 + 1.1)
 
             target_L = base * (0.7 + 0.3 * vary_L)
             target_R = base * (0.7 + 0.3 * vary_R)
 
-            # Smooth (attack fast, release slow)
-            α_attack  = 0.5
-            α_release = 0.15
-            αL = α_attack if target_L > self._smooth_L else α_release
-            αR = α_attack if target_R > self._smooth_R else α_release
-            self._smooth_L += αL * (target_L - self._smooth_L)
-            self._smooth_R += αR * (target_R - self._smooth_R)
+            a_attack  = 0.5
+            a_release = 0.15
+            aL = a_attack if target_L > self._smooth_L else a_release
+            aR = a_attack if target_R > self._smooth_R else a_release
+            self._smooth_L += aL * (target_L - self._smooth_L)
+            self._smooth_R += aR * (target_R - self._smooth_R)
 
-            # Convert to dBFS
             self._level_L = self._linear_to_db(self._smooth_L)
             self._level_R = self._linear_to_db(self._smooth_R)
         else:
-            # Decay to silence
             self._level_L = max(self._DB_MIN, self._level_L - self._decay_rate)
             self._level_R = max(self._DB_MIN, self._level_R - self._decay_rate)
 
-        # Peak hold / decay
         for ch in ('L', 'R'):
             lvl = self._level_L if ch == 'L' else self._level_R
             peak_attr, age_attr = f'_peak_{ch}', f'_peak_{ch}_age'
@@ -1104,19 +902,17 @@ class VUMeter(QWidget):
 
         self.update()
 
-    # ── Painting ──────────────────────────────────────────────────────
     def paintEvent(self, _event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
 
-        # Background
         p.fillRect(0, 0, w, h, QColor("#1c1c1e"))
 
-        bar_w   = (w - 14) // 2    # width of each channel bar
-        gap     = 4                  # gap between L and R
-        label_h = 14                 # height reserved for "L" / "R" labels
-        bar_h   = h - label_h - 4   # usable bar height
+        bar_w   = (w - 14) // 2
+        gap     = 4
+        label_h = 14
+        bar_h   = h - label_h - 4
 
         x_L = 4
         x_R = x_L + bar_w + gap
@@ -1131,38 +927,32 @@ class VUMeter(QWidget):
     def _draw_channel(self, p: QPainter,
                       x: int, y: int, w: int, h: int,
                       level_db: float, peak_db: float, label: str):
-        # Draw track (background)
         p.fillRect(x, y, w, h, QColor("#2c2c2e"))
 
-        # Filled portion (bottom = _DB_MIN, top = _DB_MAX)
         frac  = self._db_to_frac(level_db)
         fill_h = max(0, int(frac * h))
         fill_y = y + h - fill_h
 
         if fill_h > 0:
-            # Gradient: green → yellow → red (bottom to top)
             grad = QLinearGradient(x, y + h, x, y)
-            grad.setColorAt(0.00, QColor("#30D158"))   # green
-            grad.setColorAt(0.65, QColor("#FFD60A"))   # yellow
-            grad.setColorAt(0.85, QColor("#FF9F0A"))   # orange
-            grad.setColorAt(1.00, QColor("#FF453A"))   # red
+            grad.setColorAt(0.00, QColor("#30D158"))
+            grad.setColorAt(0.65, QColor("#FFD60A"))
+            grad.setColorAt(0.85, QColor("#FF9F0A"))
+            grad.setColorAt(1.00, QColor("#FF453A"))
             from PySide6.QtGui import QBrush
             p.fillRect(x, fill_y, w, fill_h, QBrush(grad))
 
-        # Peak marker
         pk_frac = self._db_to_frac(peak_db)
         pk_y    = y + h - max(1, int(pk_frac * h))
         pk_color = QColor("#FF453A") if peak_db > -6 else QColor("#FFD60A") if peak_db > -18 else QColor("#30D158")
         p.fillRect(x, pk_y, w, 2, pk_color)
 
-        # dB label
         db_str = f"{level_db:.0f}"
         p.setPen(QColor("#8e8e93"))
         from PySide6.QtCore import QRect
         p.setFont(QFont("SF Mono, Consolas, monospace", 7))
         p.drawText(QRect(x, 0, w, 13), Qt.AlignCenter, db_str)
 
-        # Channel label (L / R) below the bar
         bar_bottom = y + h + 2
         p.setPen(QColor("#6e6e73"))
         p.setFont(QFont("", 8, QFont.Bold))
@@ -1177,7 +967,6 @@ class VUMeter(QWidget):
 
     @staticmethod
     def _db_to_frac(db: float) -> float:
-        """Map dB (-60…0) to fraction (0…1) with log scaling."""
         db = max(-60.0, min(0.0, db))
         return (db + 60.0) / 60.0
 
@@ -1194,7 +983,7 @@ class LoadingDialog(QDialog):
         lay.setContentsMargins(24, 20, 24, 20)
         lay.setSpacing(10)
 
-        self.title_lbl = QLabel("Loading music library…")
+        self.title_lbl = QLabel("Loading music library\u2026")
         self.title_lbl.setObjectName("subtleLabel")
         lay.addWidget(self.title_lbl)
 
@@ -1212,7 +1001,7 @@ class LoadingDialog(QDialog):
                         eta_s: Optional[float], name: str):
         pct = int(done / total * 100) if total else 0
         self.bar.setValue(pct)
-        self.count_lbl.setText(f"{done} of {total} songs  —  {pct}%")
+        self.count_lbl.setText(f"{done} of {total} songs  \u2014  {pct}%")
 
 
 # ============================================================================
@@ -1250,7 +1039,6 @@ QPushButton#playFilteredButton { background:#30d158; border-color:#30d158;
                                  color:#fff; font-weight:600; }
 QPushButton#playFilteredButton:hover { background:#4dde70; }
 
-/* ── Transport buttons ── */
 QPushButton#transportBtn {
     background: transparent;
     border: none;
@@ -1280,7 +1068,6 @@ QPushButton#transportBtnDim:hover {
     color: #aeaeb2;
 }
 
-/* Play/Pause – filled circle, prominent */
 QPushButton#playBtn {
     background: #ffffff;
     border: none;
@@ -1292,21 +1079,18 @@ QPushButton#playBtn {
 QPushButton#playBtn:hover  { background: #e5e5ea; }
 QPushButton#playBtn:pressed{ background: #c7c7cc; }
 
-/* Now-playing label */
 QLabel#nowPlayingLabel {
     color: #f2f2f7;
     font-size: 13px;
     font-weight: 500;
 }
 
-/* Time labels */
 QLabel#timeLabel {
     color: #8e8e93;
     font-size: 11px;
     font-family: "SF Mono", "Consolas", monospace;
 }
 
-/* Volume icon */
 QLabel#volIcon {
     color: #8e8e93;
     font-size: 14px;
@@ -1324,18 +1108,14 @@ QHeaderView::section {
     padding:8px 6px; font-size:11px; font-weight:600; text-transform:uppercase; }
 QHeaderView::section:horizontal:hover { background:#2c2c2e; color:#f2f2f7; }
 
-/* Row number gutter (vertical header) — like PyCharm line numbers */
 QHeaderView::section:vertical {
     background: #1c1c1e; color: #48484a; font-size: 10px; font-weight: 400;
     font-family: "SF Mono","Consolas",monospace; border: none;
     border-right: 1px solid #2c2c2e; padding: 0px 2px; }
 
-/* Corner widget (top-left where row numbers meet column headers) */
 QTableCornerButton::section {
     background: #1c1c1e; border: none;
     border-bottom: 1px solid #2c2c2e; border-right: 1px solid #2c2c2e; }
-
-/* Sort indicator — handled via text ▲/▼ appended to header label */
 
 QTableWidget::item:selected { background:rgba(10,132,255,.22); }
 
@@ -1375,7 +1155,6 @@ QProgressBar { background:#2c2c2e; border:1px solid #3a3a3c; border-radius:8px;
                text-align:center; color:#f2f2f7; height:18px; }
 QProgressBar::chunk { background:#0a84ff; border-radius:8px; }
 
-/* Star rating buttons – must override the global QPushButton rule */
 QPushButton#starBtn {
     border: none;
     background: transparent;
@@ -1389,7 +1168,6 @@ QPushButton#starBtn {
 QPushButton#starBtn:hover  { background: rgba(255,255,255,0.08); border-radius:4px; }
 QPushButton#starBtn:disabled { background: transparent; color: #8e8e93; }
 
-/* Quick-filter toggle buttons (Collab / Cover) */
 QPushButton#quickFilterBtn {
     background: #2c2c2e;
     border: 1px solid #3a3a3c;
@@ -1407,7 +1185,6 @@ QPushButton#quickFilterBtn:checked {
     font-weight: 600;
 }
 
-/* Inline cell editor */
 QLineEdit#cellEditor {
     background: #1c1c1e;
     border: 1px solid #0a84ff;
@@ -1417,7 +1194,6 @@ QLineEdit#cellEditor {
     padding: 2px 6px;
 }
 
-/* Bulk edit bar — visually separated from filters */
 QFrame#bulkEditBar {
     background: #232325;
     border-top: 1px solid #2c2c2e;
@@ -1434,7 +1210,6 @@ QFrame#playerBar { background:#232325; border-top:1px solid #2c2c2e; }
 QFrame#navStrip  { background:#1c1c1e; border-top:1px solid #2c2c2e;
                    border-bottom:1px solid #2c2c2e; }
 
-/* Path button in top bar */
 QPushButton#pathBtn {
     background: rgba(10,132,255,0.10);
     border: 1px solid rgba(10,132,255,0.30);
@@ -1450,7 +1225,6 @@ QPushButton#pathBtn:hover {
     border-color: #0a84ff;
 }
 
-/* Toast strip */
 QLabel#toastLabel { font-size: 12px; font-weight: 500; }
 
 QToolTip { background:#3a3a3c; color:#f2f2f7; border:1px solid #48484a;
@@ -1479,8 +1253,6 @@ def _centered(widget: QWidget, right_pad: int = 8) -> QWidget:
 
 
 class _InvisibleSortItem(QTableWidgetItem):
-    """QTableWidgetItem with empty visible text but custom sort order.
-    The text is always empty (nothing shows), but __lt__ sorts by _sort_key."""
     def __init__(self, sort_key=0):
         super().__init__("")
         self._sort_key = sort_key
@@ -1493,8 +1265,6 @@ class _InvisibleSortItem(QTableWidgetItem):
 
 
 def _split_title(title: str) -> Tuple[str, str]:
-    """Split a song title at the first ' - ' into (artist, song_name).
-    If no dash found, returns ('', title)."""
     if " - " in title:
         parts = title.split(" - ", 1)
         return parts[0].strip(), parts[1].strip()
@@ -1514,7 +1284,7 @@ COL_RATING_LOCK   = 6
 COL_DELETE        = 7
 COL_COUNT         = 8
 
-ROW_HEIGHT = 38   # px – fits 20px lock icons with comfortable padding
+ROW_HEIGHT = 38
 
 
 # ============================================================================
@@ -1534,21 +1304,20 @@ class MainWindow(QMainWindow):
         self._highlighted_id: Optional[str]        = None
         self._last_cats: List[str]                  = []
 
-        # active filter state
         self._filter_cat    = "All"
-        self._filter_rating = 0      # 0 = show all
+        self._filter_rating = 0
         self._filter_search = ""
-        self._filter_collab = False  # show only collab songs
-        self._filter_cover  = False  # show only cover songs
-        self._filter_accordion = False  # show only songs with [A]
-        self._filter_christmas = False  # show only songs with [C#]
+        self._filter_collab = False
+        self._filter_cover  = False
+        self._filter_accordion = False
+        self._filter_christmas = False
 
         self.scan_worker: Optional[ScanWorker] = None
         self.pending_rescan = False
         self.last_added:   List[str] = []
         self.last_removed: List[str] = []
-        self._pending_changes: List[tuple] = []  # queued changes for playing songs
-        self._suppress_rescan = False  # when True, all rescans are blocked
+        self._pending_changes: List[tuple] = []
+        self._suppress_rescan = False
 
         self.player = PlayerController(self)
 
@@ -1557,11 +1326,129 @@ class MainWindow(QMainWindow):
         self.watcher.fileChanged.connect(self._on_file_changed)
         self._rescan_timer = QTimer(self)
         self._rescan_timer.setSingleShot(True)
-        self._rescan_timer.setInterval(600)
+        # FIX: Increased from 600ms to 1500ms to reduce false rescans
+        # from our own file writes (rating, rename, move)
+        self._rescan_timer.setInterval(1500)
         self._rescan_timer.timeout.connect(self._start_scan)
 
         self._build_ui()
         self._connect_player()
+        self._setup_shortcuts()
+
+        # FIX: Restore last opened folder on startup ──────────────────
+        # (was previously in _shortcut_rating — wrong place)
+        last = self.settings.value("root_path", "")
+        if last and Path(last).is_dir():
+            QTimer.singleShot(0, lambda p=Path(last): self._set_root(p))
+
+    def _setup_shortcuts(self):
+        self._ctrl_w_active = False
+        self._ctrl_w_timer = QTimer(self)
+        self._ctrl_w_timer.setSingleShot(True)
+        self._ctrl_w_timer.setInterval(2000)
+        self._ctrl_w_timer.timeout.connect(lambda: setattr(self, '_ctrl_w_active', False))
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        mods = event.modifiers()
+
+        if mods == Qt.ControlModifier and key == Qt.Key_W:
+            self._ctrl_w_active = True
+            self._ctrl_w_timer.start()
+            self._show_toast("Wave Pro command mode activated (press next key)", 1500, "info")
+            event.accept()
+            return
+
+        if self._ctrl_w_active:
+            self._ctrl_w_active = False
+            self._ctrl_w_timer.stop()
+
+            if Qt.Key_0 <= key <= Qt.Key_5:
+                rating = key - Qt.Key_0
+                self._shortcut_rating(rating)
+                event.accept()
+                return
+
+            if key == Qt.Key_Right:
+                if self.player.current_song():
+                    self.player.seek(self.player._player.position() + 5000)
+                    self._show_toast("\u23e9  +5s", 1000, "info")
+                event.accept()
+                return
+            if key == Qt.Key_Left:
+                if self.player.current_song():
+                    self.player.seek(max(0, self.player._player.position() - 5000))
+                    self._show_toast("\u23ea  -5s", 1000, "info")
+                event.accept()
+                return
+
+            if key == Qt.Key_Space or key == Qt.Key_MediaPlay or key == Qt.Key_MediaPause:
+                self._shortcut_play_pause()
+                event.accept()
+                return
+
+            if key == Qt.Key_MediaNext or key == Qt.Key_N:
+                self.player.next()
+                event.accept()
+                return
+            if key == Qt.Key_MediaPrevious or key == Qt.Key_P:
+                self.player.previous()
+                event.accept()
+                return
+
+            if key == Qt.Key_Up or key == Qt.Key_VolumeUp:
+                self.vol_slider.setValue(min(100, self.vol_slider.value() + 5))
+                event.accept()
+                return
+            if key == Qt.Key_Down or key == Qt.Key_VolumeDown:
+                self.vol_slider.setValue(max(0, self.vol_slider.value() - 5))
+                event.accept()
+                return
+            if key == Qt.Key_M or key == Qt.Key_VolumeMute:
+                self.vol_slider.setValue(0 if self.vol_slider.value() > 0 else 80)
+                event.accept()
+                return
+
+        super().keyPressEvent(event)
+
+    def _shortcut_play_pause(self):
+        if self.player.current_song() is None:
+            songs = self._visible_songs_in_order()
+            if songs:
+                self.player.play_song(songs[0], queue=songs)
+        else:
+            self.player.toggle_play_pause()
+
+    def _shortcut_rating(self, rating: int):
+        song = self.player.current_song()
+        if song is None:
+            self._show_toast("No song playing.", 1500, "warning")
+            return
+        song.rating = rating
+        item = self.row_items.get(song.id)
+        if item:
+            rat_sort = self.table.item(item.row(), COL_RATING)
+            if isinstance(rat_sort, _InvisibleSortItem):
+                rat_sort.set_sort_key(rating)
+            star_wrap = self.table.cellWidget(item.row(), COL_RATING)
+            if star_wrap:
+                star = star_wrap.findChild(StarRatingWidget)
+                if star: star.set_rating(rating)
+        self._suppress_rescan = True
+        _bg_write_rating(song.path, rating)
+        try:
+            st = song.path.stat()
+            self.cache[str(song.path)] = {
+                "size": st.st_size, "mtime": st.st_mtime,
+                "title": song.title, "artist": song.artist,
+                "rating": rating, "duration": song.duration, "id": song.id}
+        except OSError: pass
+        # FIX: Increased from 500ms to 2500ms so bg thread finishes before
+        # watcher is re-enabled — prevents unnecessary full rescan
+        QTimer.singleShot(2500, lambda: setattr(self, '_suppress_rescan', False))
+        stars = "\u2605" * rating + "\u2606" * (5 - rating)
+        self._log_change("RATING", song.title, f"{rating}/5")
+        self._show_toast(f"\u2713  {stars} ({rating}/5) \u2014 {song.title}", 1500, "success")
 
         # Set window icon (shows in taskbar)
         icon_path = Path("../assets/01_media/01_icons/icon.ico")
@@ -1570,10 +1457,6 @@ class MainWindow(QMainWindow):
         if icon_path.exists():
             from PySide6.QtGui import QIcon
             self.setWindowIcon(QIcon(str(icon_path)))
-
-        last = self.settings.value("root_path", "")
-        if last and Path(last).is_dir():
-            self._set_root(Path(last))
 
     # ------------------------------------------------------------------
     # UI building
@@ -1590,7 +1473,6 @@ class MainWindow(QMainWindow):
         vlay.addWidget(self._build_player_bar())
 
     def _build_nav_strip(self) -> QWidget:
-        """Strip between table and player: To-Do (left), scroll buttons (right)."""
         strip = QFrame()
         strip.setObjectName("navStrip")
         strip.setFixedHeight(32)
@@ -1612,7 +1494,6 @@ class MainWindow(QMainWindow):
             )
             return btn
 
-        # ── To-Do on the LEFT ──
         add_todo_btn = QToolButton()
         add_todo_btn.setText("+ To-Do")
         add_todo_btn.setToolTip("Create a .txt placeholder for a song to download later")
@@ -1628,7 +1509,6 @@ class MainWindow(QMainWindow):
 
         lay.addStretch()
 
-        # ── Scroll buttons on the RIGHT ──
         top_btn = _nav_btn("\u2912 Top", "Scroll to top of list", 50)
         top_btn.clicked.connect(self._scroll_to_top)
         lay.addWidget(top_btn)
@@ -1643,14 +1523,12 @@ class MainWindow(QMainWindow):
 
         return strip
 
-    # ── top bar (compact, everything inline) ─────────────────────────
     def _build_top_bar(self) -> QWidget:
         wrapper = QWidget(); wrapper.setObjectName("topBar")
         outer = QVBoxLayout(wrapper)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Main bar row
         bar = QFrame(); bar.setObjectName("topBarInner")
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(14, 12, 14, 12); lay.setSpacing(10)
@@ -1669,15 +1547,12 @@ class MainWindow(QMainWindow):
 
         lay.addStretch()
 
-        refresh_btn = QPushButton("\u21BA  Refresh")
+        refresh_btn = QPushButton("\u21ba  Refresh")
         refresh_btn.clicked.connect(self._start_scan)
         lay.addWidget(refresh_btn)
 
         outer.addWidget(bar)
 
-        # Permanent status strip — always visible, never a popup.
-        # This is the single place where ALL status info appears:
-        # loading progress, confirmations, warnings, errors.
         self.info_bar = QFrame()
         self.info_bar.setObjectName("infoBar")
         self.info_bar.setFixedHeight(32)
@@ -1685,7 +1560,7 @@ class MainWindow(QMainWindow):
         info_lay.setContentsMargins(16, 0, 16, 0)
         info_lay.setSpacing(10)
 
-        self.status_dot = QLabel("\u25CF")
+        self.status_dot = QLabel("\u25cf")
         self.status_dot.setFixedWidth(12)
         self.status_dot.setAlignment(Qt.AlignCenter)
         self.status_dot.setStyleSheet("color:#48484a;font-size:8px;")
@@ -1762,14 +1637,11 @@ class MainWindow(QMainWindow):
                        auto_reset=True, duration_ms=duration_ms)
 
     def _set_status(self, txt: str):
-        """Legacy helper — routes to _set_info."""
         if "Loading" in txt or "Importing" in txt or "Checking" in txt:
             self._set_info(txt, "loading", auto_reset=False)
         else:
             self._set_info(txt, "idle", auto_reset=False)
 
-
-    # ── filter bar (Excel-style) ──────────────────────────────────────
     def _build_filter_bar(self) -> QWidget:
         wrapper = QWidget()
         outer = QVBoxLayout(wrapper)
@@ -1780,18 +1652,16 @@ class MainWindow(QMainWindow):
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(12, 8, 12, 8); lay.setSpacing(8)
 
-        # Search
-        search_icon = QLabel("🔍"); search_icon.setObjectName("subtleLabel")
+        search_icon = QLabel("\U0001f50d"); search_icon.setObjectName("subtleLabel")
         lay.addWidget(search_icon)
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search by title…")
+        self.search_box.setPlaceholderText("Search by title\u2026")
         self.search_box.setFixedWidth(230)
         self.search_box.textChanged.connect(self._on_search_changed)
         lay.addWidget(self.search_box)
 
         lay.addSpacing(16)
 
-        # Category filter — checkbox-based multi-select
         cat_lbl = QLabel("Category:"); cat_lbl.setObjectName("subtleLabel")
         lay.addWidget(cat_lbl)
         self.cat_filter_btn = QPushButton("All")
@@ -1799,24 +1669,22 @@ class MainWindow(QMainWindow):
         self.cat_filter_btn.setToolTip("Click to select/deselect categories")
         self.cat_filter_btn.clicked.connect(self._show_cat_checkboxes)
         lay.addWidget(self.cat_filter_btn)
-        self._cat_checks: Dict[str, bool] = {}   # category → checked
+        self._cat_checks: Dict[str, bool] = {}
 
         lay.addSpacing(16)
 
-        # Rating filter — exact star values, max = 5, NOT "5+"
         rat_lbl = QLabel("Min. Rating:"); rat_lbl.setObjectName("subtleLabel")
         lay.addWidget(rat_lbl)
         self.rat_filter = QComboBox()
         self.rat_filter.setFixedWidth(168)
         self.rat_filter.addItem("All ratings", 0)
-        self.rat_filter.addItem("☆☆☆☆☆  No rating", -1)
-        # 1★ = at least 1 star … 5★ = exactly 5 stars (max)
+        self.rat_filter.addItem("\u2606\u2606\u2606\u2606\u2606  No rating", -1)
         star_labels = {
-            1: "★☆☆☆☆  (1 star)",
-            2: "★★☆☆☆  (2 stars)",
-            3: "★★★☆☆  (3 stars)",
-            4: "★★★★☆  (4 stars)",
-            5: "★★★★★  (5 stars)",
+            1: "\u2605\u2606\u2606\u2606\u2606  (1 star)",
+            2: "\u2605\u2605\u2606\u2606\u2606  (2 stars)",
+            3: "\u2605\u2605\u2605\u2606\u2606  (3 stars)",
+            4: "\u2605\u2605\u2605\u2605\u2606  (4 stars)",
+            5: "\u2605\u2605\u2605\u2605\u2605  (5 stars)",
         }
         for n, lbl in star_labels.items():
             self.rat_filter.addItem(lbl, n)
@@ -1827,7 +1695,6 @@ class MainWindow(QMainWindow):
 
         lay.addSpacing(16)
 
-        # ── Quick-filter toggle buttons: Collab / Cover ───────────────
         def _toggle_btn(label: str, tooltip: str) -> QPushButton:
             btn = QPushButton(label)
             btn.setCheckable(True)
@@ -1858,7 +1725,6 @@ class MainWindow(QMainWindow):
 
         lay.addSpacing(16)
 
-        # ── Play filtered button ──────────────────────────────────────
         self.play_filtered_btn = QPushButton("\u25b6  Play Filtered")
         self.play_filtered_btn.setObjectName("playFilteredButton")
         self.play_filtered_btn.setToolTip(
@@ -1872,7 +1738,6 @@ class MainWindow(QMainWindow):
         reset_btn.clicked.connect(self._reset_filters)
         lay.addWidget(reset_btn)
 
-        # ── Bulk Edit row (separate line above filters) ──────────────
         bulk_bar = QFrame()
         bulk_bar.setObjectName("bulkEditBar")
         bulk_lay = QHBoxLayout(bulk_bar)
@@ -1910,7 +1775,7 @@ class MainWindow(QMainWindow):
         self.bulk_rat_combo.activated.connect(self._on_bulk_rating)
         bulk_lay.addWidget(self.bulk_rat_combo)
 
-        self.bulk_del_btn = QPushButton("\U0001F5D1  Delete")
+        self.bulk_del_btn = QPushButton("\U0001f5d1  Delete")
         self.bulk_del_btn.setToolTip("Delete ALL selected songs permanently")
         self.bulk_del_btn.setEnabled(False)
         self.bulk_del_btn.setStyleSheet(
@@ -1924,17 +1789,14 @@ class MainWindow(QMainWindow):
 
         bulk_lay.addStretch()
 
-        # Add bulk bar FIRST (above), then filter bar (closer to songs)
         outer.addWidget(bulk_bar)
         outer.addWidget(bar)
         return wrapper
 
-    # ── song table ────────────────────────────────────────────────────
     def _build_table(self) -> QWidget:
         self.table = QTableWidget(0, COL_COUNT)
         self.table.setHorizontalHeaderLabels(
             ["Artist", "Song Name", "Edit", "Category", "Edit", "Rating", "Edit", ""])
-        # Row numbers (queue numbers) — always visible on the left
         self.table.verticalHeader().setVisible(True)
         self.table.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
         self.table.verticalHeader().setFixedWidth(42)
@@ -1944,14 +1806,12 @@ class MainWindow(QMainWindow):
         self.table.setShowGrid(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        # Enable sorting by clicking column headers
         self.table.setSortingEnabled(True)
         self.table.sortItems(COL_ARTIST, Qt.AscendingOrder)
         h = self.table.horizontalHeader()
-        h.setSortIndicatorShown(False)  # we handle it via text ▲/▼
+        h.setSortIndicatorShown(False)
         h.sortIndicatorChanged.connect(self._on_sort_changed)
         self._base_headers = ["Artist", "Song Name", "Edit", "Category", "Edit", "Rating", "Edit", ""]
-        # Set initial sort arrow
         self.table.horizontalHeaderItem(COL_ARTIST).setText("Artist \u25bc")
         h.setSectionResizeMode(COL_ARTIST,        QHeaderView.Stretch)
         h.setSectionResizeMode(COL_SONGNAME,      QHeaderView.Stretch)
@@ -1965,7 +1825,6 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         return self.table
 
-    # ── player bar ────────────────────────────────────────────────────
     def _build_player_bar(self) -> QWidget:
         bar = QFrame()
         bar.setObjectName("playerBar")
@@ -1974,15 +1833,12 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(16, 6, 16, 8)
         outer.setSpacing(12)
 
-        # ── VU Meter (always visible, left side) ──────────────────────
         self.vu_meter = VUMeter()
         outer.addWidget(self.vu_meter)
 
-        # ── Main controls (centre + right) ────────────────────────────
         main_col = QVBoxLayout()
         main_col.setSpacing(4)
 
-        # ── Seek row ──────────────────────────────────────────────────
         seek_row = QHBoxLayout()
         seek_row.setSpacing(8)
 
@@ -1991,11 +1847,9 @@ class MainWindow(QMainWindow):
         self.lbl_pos.setFixedWidth(36)
         self.lbl_pos.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-        # Seek slider — clickable anywhere on the track
         self.seek_slider = QSlider(Qt.Horizontal)
         self.seek_slider.setRange(0, 0)
         self.seek_slider.setObjectName("seekSlider")
-        # Make the slider jump to the clicked position (not just drag)
         self.seek_slider.setStyle(self.seek_slider.style())
         self.seek_slider.mousePressEvent = self._seek_mouse_press
         self.seek_slider.sliderMoved.connect(self.player.seek)
@@ -2012,11 +1866,9 @@ class MainWindow(QMainWindow):
         seek_row.addWidget(self.lbl_dur)
         main_col.addLayout(seek_row)
 
-        # ── Controls row ──────────────────────────────────────────────
         ctrl = QHBoxLayout()
         ctrl.setSpacing(0)
 
-        # Now-playing info (left)
         self.lbl_now = QLabel("Nothing is playing")
         self.lbl_now.setObjectName("nowPlayingLabel")
         self.lbl_now.setMinimumWidth(180)
@@ -2025,7 +1877,6 @@ class MainWindow(QMainWindow):
 
         ctrl.addStretch(1)
 
-        # ── All transport buttons: white-circle style ─────────────────
         def _circle_btn(text: str, size: int, tooltip: str,
                         bg: str = "#2c2c2e", fg: str = "#f2f2f7",
                         font_size: int = 15) -> QToolButton:
@@ -2042,24 +1893,21 @@ class MainWindow(QMainWindow):
             )
             return btn
 
-        # ── Repeat (4-state cycle: Off → All → Reverse → One) ────────
-        self.rep_btn = _circle_btn("↻", 36, "Repeat: Off",
+        self.rep_btn = _circle_btn("\u21bb", 36, "Repeat: Off",
                                    bg="#2c2c2e", fg="#8e8e93", font_size=16)
         self.rep_btn.clicked.connect(self._cycle_repeat)
         ctrl.addWidget(self.rep_btn)
 
         ctrl.addSpacing(8)
 
-        # ── Prev ──────────────────────────────────────────────────────
-        prev_btn = _circle_btn("⏮", 40, "Previous", font_size=17)
+        prev_btn = _circle_btn("\u23ee", 40, "Previous", font_size=17)
         prev_btn.clicked.connect(self.player.previous)
         ctrl.addWidget(prev_btn)
 
         ctrl.addSpacing(6)
 
-        # ── Play / Pause (largest, white) ─────────────────────────────
         self.pp_btn = QToolButton()
-        self.pp_btn.setText("▶")
+        self.pp_btn.setText("\u25b6")
         self.pp_btn.setFixedSize(50, 50)
         self.pp_btn.setToolTip("Play / Pause")
         self.pp_btn.setCursor(Qt.PointingHandCursor)
@@ -2069,20 +1917,18 @@ class MainWindow(QMainWindow):
             "QToolButton:hover{background:#e5e5ea;}"
             "QToolButton:pressed{background:#c7c7cc;}"
         )
-        self.pp_btn.clicked.connect(self.player.toggle_play_pause)
+        self.pp_btn.clicked.connect(self._shortcut_play_pause)
         ctrl.addWidget(self.pp_btn)
 
         ctrl.addSpacing(6)
 
-        # ── Next ──────────────────────────────────────────────────────
-        next_btn = _circle_btn("⏭", 40, "Next", font_size=17)
+        next_btn = _circle_btn("\u23ed", 40, "Next", font_size=17)
         next_btn.clicked.connect(self.player.next)
         ctrl.addWidget(next_btn)
 
         ctrl.addSpacing(8)
 
-        # ── Shuffle – right of Next ────────────────────────────────────
-        self.shuf_btn = _circle_btn("⇄", 36, "Shuffle: Off",
+        self.shuf_btn = _circle_btn("\u21c4", 36, "Shuffle: Off",
                                     bg="#2c2c2e", fg="#8e8e93", font_size=16)
         self.shuf_btn.clicked.connect(self._toggle_shuffle)
         ctrl.addWidget(self.shuf_btn)
@@ -2091,15 +1937,13 @@ class MainWindow(QMainWindow):
 
         ctrl.addStretch(1)
 
-        # ── Volume in a FIXED-WIDTH container so the icon change
-        #    (🔇/🔉/🔊) never shifts the transport buttons ────────────
         vol_container = QFrame()
         vol_container.setFixedWidth(130)
         vol_layout = QHBoxLayout(vol_container)
         vol_layout.setContentsMargins(0, 0, 0, 0)
         vol_layout.setSpacing(4)
 
-        self.vol_icon = QLabel("🔊")
+        self.vol_icon = QLabel("\U0001f50a")
         self.vol_icon.setObjectName("volIcon")
         self.vol_icon.setFixedWidth(22)
         self.vol_icon.setAlignment(Qt.AlignCenter)
@@ -2119,20 +1963,16 @@ class MainWindow(QMainWindow):
         outer.addLayout(main_col, stretch=1)
         return bar
 
-    # track whether user is dragging the slider
     _seek_dragging: bool = False
 
     def _seek_mouse_press(self, event):
-        """Make a click anywhere on the seek bar jump to that position."""
         if event.button() == Qt.LeftButton and self.seek_slider.maximum() > 0:
-            # Calculate the value corresponding to the click position
             slider = self.seek_slider
             ratio  = event.position().x() / slider.width()
             value  = int(ratio * slider.maximum())
             value  = max(slider.minimum(), min(slider.maximum(), value))
             slider.setValue(value)
             self.player.seek(value)
-        # Also call the default handler so the handle follows
         QSlider.mousePressEvent(self.seek_slider, event)
 
     def _on_seek_pressed(self):
@@ -2145,11 +1985,11 @@ class MainWindow(QMainWindow):
     def _on_volume_changed(self, value: int):
         self.player.set_volume(value)
         if value == 0:
-            self.vol_icon.setText("🔇")
+            self.vol_icon.setText("\U0001f507")
         elif value < 40:
-            self.vol_icon.setText("🔉")
+            self.vol_icon.setText("\U0001f509")
         else:
-            self.vol_icon.setText("🔊")
+            self.vol_icon.setText("\U0001f50a")
 
     # ------------------------------------------------------------------
     # Player wiring
@@ -2166,15 +2006,15 @@ class MainWindow(QMainWindow):
             lambda playing: self.vu_meter.set_playing(playing))
 
     def _on_playback_state(self, playing: bool):
-        self.pp_btn.setText("⏸" if playing else "▶")
+        self.pp_btn.setText("\u23f8" if playing else "\u25b6")
 
     def _on_song_changed(self, song: Optional[Song]):
         if song is None:
             self.lbl_now.setText("Nothing is playing")
         else:
             artist_part, song_part = _split_title(song.title)
-            ap = f"{artist_part}  ·  " if artist_part else ""
-            self.lbl_now.setText(f"{ap}{song_part}  ·  {song.category}")
+            ap = f"{artist_part}  \u00b7  " if artist_part else ""
+            self.lbl_now.setText(f"{ap}{song_part}  \u00b7  {song.category}")
         self._highlight(song)
         self._process_pending_changes()
 
@@ -2186,7 +2026,6 @@ class MainWindow(QMainWindow):
         self.vu_meter.set_position(ms, max(1, dur))
 
     def _process_pending_changes(self):
-        """Execute queued changes for songs that are no longer playing."""
         if not self._pending_changes:
             return
         current = self.player.current_song()
@@ -2196,7 +2035,6 @@ class MainWindow(QMainWindow):
             if current_id == song.id and self.player.is_playing():
                 remaining.append((action, song, detail))
                 continue
-            # Song is no longer playing — execute the change
             if action == "MOVE":
                 self._suppress_rescan = True; self.watcher.blockSignals(True)
                 old_cat, old_path_str = song.category, str(song.path)
@@ -2205,7 +2043,6 @@ class MainWindow(QMainWindow):
                     song.path = new_path; song.category = detail
                     self.cache.pop(old_path_str, None)
                     self._sync_cache(song)
-                    # Update UI
                     item = self.row_items.get(song.id)
                     if item:
                         combo = self.table.cellWidget(item.row(), COL_CATEGORY)
@@ -2244,7 +2081,6 @@ class MainWindow(QMainWindow):
                         item.setText(a)
                         sn = self.table.item(item.row(), COL_SONGNAME)
                         if sn: sn.setText(s)
-                        # Re-enable the name edit lock
                         lock_w = self.table.cellWidget(item.row(), COL_NAME_EDIT)
                         if lock_w:
                             lk = lock_w.findChild(LockButton)
@@ -2260,12 +2096,11 @@ class MainWindow(QMainWindow):
         self._update_pending_btn()
 
     # ------------------------------------------------------------------
-    # Navigation: Focus / Scroll Top / Scroll Bottom
+    # Navigation
     # ------------------------------------------------------------------
     _saved_scroll_pos: int = -1
 
     def _scroll_to_playing(self):
-        """Scroll to currently playing song. Press again to return."""
         current = self.player.current_song()
         if current is None:
             self._show_toast("No song is currently playing.", 2000, "warning")
@@ -2275,7 +2110,6 @@ class MainWindow(QMainWindow):
             return
 
         if self._saved_scroll_pos >= 0:
-            # Return to saved position
             self.table.verticalScrollBar().setValue(self._saved_scroll_pos)
             self._saved_scroll_pos = -1
             self.focus_btn.setStyleSheet(
@@ -2284,10 +2118,8 @@ class MainWindow(QMainWindow):
                 "QToolButton:hover{background:#3a3a3c;color:#f2f2f7;}"
             )
         else:
-            # Save position and scroll to playing song
             self._saved_scroll_pos = self.table.verticalScrollBar().value()
             row = item.row()
-            # Use scrollTo with model index — works even without selection
             idx = self.table.model().index(row, COL_ARTIST)
             self.table.scrollTo(idx, QAbstractItemView.PositionAtCenter)
             self.focus_btn.setStyleSheet(
@@ -2297,26 +2129,21 @@ class MainWindow(QMainWindow):
             )
 
     def _scroll_to_top(self):
-        """Scroll to the first visible row."""
         self.table.scrollToTop()
 
     def _scroll_to_bottom(self):
-        """Scroll to the last visible row."""
         self.table.scrollToBottom()
 
     # ------------------------------------------------------------------
-    # To-Do placeholder & Delete
+    # To-Do & Delete
     # ------------------------------------------------------------------
     def _add_todo(self):
-        """Create a .txt placeholder in a 'To-Do' subfolder."""
         if not self.root_path:
             self._show_toast("Open a music folder first.", 3000, "warning")
             return
 
-        # Block watcher to prevent duplicate detection
         self._suppress_rescan = True; self.watcher.blockSignals(True)
 
-        # Auto-create To-Do subfolder if it doesn't exist
         todo_dir = self.root_path / "To-Do"
         if not todo_dir.exists():
             try:
@@ -2328,10 +2155,8 @@ class MainWindow(QMainWindow):
                 self._show_toast(f"Could not create To-Do folder: {e}", 5000, "error")
                 return
 
-        # Build autocomplete word list from existing song titles
         existing_titles = [s.title for s in self.songs_by_id.values()]
 
-        # ── Custom dialog: name input + autocomplete + star rating ────
         from PySide6.QtWidgets import QDialog, QCompleter
         dlg = QDialog(self)
         dlg.setWindowTitle("Add To-Do")
@@ -2347,7 +2172,6 @@ class MainWindow(QMainWindow):
         name_input = QLineEdit()
         name_input.setPlaceholderText("Type song name...")
         name_input.setMinimumHeight(32)
-        # Autocomplete from existing titles (case-insensitive)
         completer = QCompleter(existing_titles, dlg)
         completer.setCaseSensitivity(Qt.CaseInsensitive)
         completer.setFilterMode(Qt.MatchContains)
@@ -2355,9 +2179,6 @@ class MainWindow(QMainWindow):
         name_input.setCompleter(completer)
         dlg_lay.addWidget(name_input)
 
-        # No rating for To-Do items (they are placeholders, not songs)
-
-        # OK / Cancel buttons
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel_btn = QPushButton("Cancel")
@@ -2379,9 +2200,8 @@ class MainWindow(QMainWindow):
         if not name:
             self._suppress_rescan = False; self.watcher.blockSignals(False)
             return
-        rat_val = 0  # To-Do items have no rating
+        rat_val = 0
 
-        # Create exactly ONE .txt placeholder file
         txt_path = todo_dir / f"{name}.txt"
         counter = 1
         while txt_path.exists():
@@ -2389,14 +2209,12 @@ class MainWindow(QMainWindow):
             counter += 1
         txt_path.write_text(f"To-Do: {name}\n", encoding="utf-8")
 
-        # Add to table immediately (single entry, no watcher duplicate)
         song = Song(
             path=txt_path, category="To-Do",
             title=txt_path.stem, artist="",
             rating=rat_val, duration=0.0)
         self._add_or_update(song)
 
-        # Cache
         st = txt_path.stat()
         self.cache[str(txt_path)] = {
             "size": st.st_size, "mtime": st.st_mtime,
@@ -2408,19 +2226,12 @@ class MainWindow(QMainWindow):
         self._rebuild_cat_filter()
         self._apply_filters()
 
-        # Unblock watcher and cancel any pending rescans
         self._suppress_rescan = False; self.watcher.blockSignals(False)
         self._rescan_timer.stop()
         self._show_toast(f"\u2713  To-Do added: \"{name}\"", 3000, "success")
         self._log_change("TODO", name, "To-Do placeholder created")
 
-        self._rebuild_cat_filter()
-        self._apply_filters()
-        self._show_toast(f"\u2713  To-Do added: \"{name}\"", 3000, "success")
-
     def _delete_song(self, song: Song):
-        """Delete the physical file and remove the song from the table."""
-        # Confirm deletion
         reply = QMessageBox.question(
             self, "Delete file",
             f"Permanently delete this file?\n\n{song.path.name}\n\nThis cannot be undone.",
@@ -2428,23 +2239,19 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        # Stop playback if this song is playing
         if self.player.current_song() is song:
             self.player._player.stop()
 
-        # Delete the physical file
         try:
             os.remove(song.path)
         except OSError as e:
             self._show_toast(f"Could not delete: {e}", 5000, "error")
             return
 
-        # Remove from cache
         self.cache.pop(str(song.path), None)
         if self.root_path:
             save_cache(self.root_path, self.cache)
 
-        # Remove from table
         item = self.row_items.pop(song.id, None)
         self.songs_by_id.pop(song.id, None)
         if item is not None:
@@ -2456,16 +2263,15 @@ class MainWindow(QMainWindow):
         self._log_change("DEL", song.title, str(song.path))
 
     def _cycle_repeat(self):
-        """Cycle: Off → All → Reverse → One → Off"""
         order = [RepeatMode.OFF, RepeatMode.ALL, RepeatMode.REVERSE, RepeatMode.ONE]
         new   = order[(order.index(self.player.repeat_mode()) + 1) % 4]
         self.player.set_repeat_mode(new)
 
         cfg = {
-            RepeatMode.OFF:     ("↻", "#8e8e93", "#2c2c2e", "Repeat: Off"),
-            RepeatMode.ALL:     ("↻", "#0a84ff", "#1a3a5c", "Repeat: All  —  restarts from beginning"),
-            RepeatMode.REVERSE: ("↺", "#0a84ff", "#1a3a5c", "Repeat: Reverse  —  plays backwards through list"),
-            RepeatMode.ONE:     ("①", "#30D158", "#1a3a2c", "Repeat: One  —  repeats this song only"),
+            RepeatMode.OFF:     ("\u21bb", "#8e8e93", "#2c2c2e", "Repeat: Off"),
+            RepeatMode.ALL:     ("\u21bb", "#0a84ff", "#1a3a5c", "Repeat: All  \u2014  restarts from beginning"),
+            RepeatMode.REVERSE: ("\u21ba", "#0a84ff", "#1a3a5c", "Repeat: Reverse  \u2014  plays backwards through list"),
+            RepeatMode.ONE:     ("\u2460", "#30D158", "#1a3a2c", "Repeat: One  \u2014  repeats this song only"),
         }
         icon, fg, bg, tip = cfg[new]
         self.rep_btn.setText(icon)
@@ -2499,7 +2305,6 @@ class MainWindow(QMainWindow):
                 f"QToolButton:pressed{{background:#232325;}}"
             )
 
-
     # ------------------------------------------------------------------
     # Folder management
     # ------------------------------------------------------------------
@@ -2513,8 +2318,7 @@ class MainWindow(QMainWindow):
         if self.watcher.directories():
             self.watcher.removePaths(self.watcher.directories())
         self.root_path = path
-        # Show only the folder name on the button, full path in tooltip
-        self.path_btn.setText(f"📁  {path.name}")
+        self.path_btn.setText(f"\U0001f4c1  {path.name}")
         self.path_btn.setToolTip(str(path))
         self.settings.setValue("root_path", str(path))
 
@@ -2546,7 +2350,7 @@ class MainWindow(QMainWindow):
         if self.root_path is None: return
         if self.scan_worker and self.scan_worker.isRunning():
             self.pending_rescan = True; return
-        self._set_status("Checking library…")
+        self._set_status("Checking library\u2026")
         w = ScanWorker(self.root_path, dict(self.cache))
         w.batchReady.connect(self._on_batch)
         w.songReady.connect(self._on_song_ready)
@@ -2565,17 +2369,27 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(50, self._start_scan)
 
     def _on_batch(self, songs: List[Song]):
-        # batchReady is no longer emitted; kept for safety
         for s in songs: self._add_or_update(s)
         self._rebuild_cat_filter(); self._apply_filters()
 
     def _on_song_ready(self, song: Song):
+        """Called for EACH song during scan.
+
+        PERFORMANCE FIX: Only set visibility for THIS one song.
+        The old code called _apply_filters() here, which iterates ALL
+        songs — O(n^2) total during a scan, freezing the entire UI
+        including transport buttons.  Now we just check this one song
+        and move on.  Full _apply_filters runs ONCE in _on_finished.
+        """
         self._add_or_update(song)
-        self._apply_filters()
+        # Only set visibility for THIS song — not all songs
+        item = self.row_items.get(song.id)
+        if item is not None:
+            self.table.setRowHidden(item.row(), not self._matches(song))
         self.watcher.addPath(str(song.path))
-        # Keep UI responsive — process pending events every 25 songs
+        # Keep UI responsive — process pending events every 50 songs
         self._song_ready_count = getattr(self, '_song_ready_count', 0) + 1
-        if self._song_ready_count % 25 == 0:
+        if self._song_ready_count % 50 == 0:
             QApplication.processEvents()
 
     def _on_total(self, total: int):
@@ -2583,7 +2397,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         verb = "Loading" if not self.songs_by_id else "Updating"
-        self._set_info(f"{verb}  0 / {total} songs…", "loading", auto_reset=False)
+        self._set_info(f"{verb}  0 / {total} songs\u2026", "loading", auto_reset=False)
 
     def _on_progress(self, done: int, total: int, eta: Optional[float], name: str):
         self.progress_bar.setValue(done)
@@ -2618,6 +2432,13 @@ class MainWindow(QMainWindow):
         self.song_count_label.setText(f"{n} songs")
         self._set_info(f"{n} songs  \u2022  Up to date", "success",
                        auto_reset=True, duration_ms=3000)
+
+        # FIX: Apply filters & queue numbers ONCE after full scan
+        # (not per-song during scan — that was the O(n^2) freeze)
+        self._apply_filters()
+        self._update_queue_numbers()
+        self._rebuild_play_queue()
+
         if added or removed:
             self.last_added = added; self.last_removed = removed
             self.changes_btn.setEnabled(True)
@@ -2631,7 +2452,6 @@ class MainWindow(QMainWindow):
                            "warning", auto_reset=True, duration_ms=5000)
 
     def _show_changes(self):
-        """Show change history + pending queue in a scrollable dialog with icons."""
         from PySide6.QtWidgets import QDialog, QTextEdit
 
         log_path = self._changelog_path()
@@ -2644,30 +2464,28 @@ class MainWindow(QMainWindow):
                 pass
 
         icons = {
-            "ADD":    ("\u2795", "#30D158"),   # ➕ green
-            "DEL":    ("\u274C", "#FF453A"),   # ❌ red
-            "MOVE":   ("\u27A1", "#0a84ff"),   # ➡ blue
-            "RATING": ("\u2B50", "#FFD60A"),   # ⭐ yellow
-            "RENAME": ("\u270F", "#FF9F0A"),   # ✏ orange
-            "TODO":   ("\u2610", "#8e8e93"),   # ☐ gray
+            "ADD":    ("\u2795", "#30D158"),
+            "DEL":    ("\u274c", "#FF453A"),
+            "MOVE":   ("\u27a1", "#0a84ff"),
+            "RATING": ("\u2b50", "#FFD60A"),
+            "RENAME": ("\u270f", "#FF9F0A"),
+            "TODO":   ("\u2610", "#8e8e93"),
         }
 
         html = "<table style='font-family:SF Mono,Consolas,monospace;font-size:11px;border-collapse:collapse;white-space:nowrap;'>"
 
-        # ── Pending queue (if any) ──
         if self._pending_changes:
             html += ("<tr><td colspan='4' style='color:#FF9F0A;font-weight:700;"
-                     "font-size:12px;padding:4px 0;'>\u23F3 PENDING QUEUE</td></tr>")
+                     "font-size:12px;padding:4px 0;'>\u23f3 PENDING QUEUE</td></tr>")
             for action, song, detail in self._pending_changes:
                 icon, color = icons.get(action, ("\u2022", "#8e8e93"))
                 html += (f"<tr style='background:#2a1e0a;'>"
                          f"<td style='color:{color};font-size:14px;padding:3px 8px 3px 4px;width:20px;'>{icon}</td>"
-                         f"<td style='color:#FF9F0A;padding:3px 8px;'>\u23F3 Waiting</td>"
+                         f"<td style='color:#FF9F0A;padding:3px 8px;'>\u23f3 Waiting</td>"
                          f"<td style='color:#f2f2f7;font-weight:600;padding:3px 4px;'>{song.title}</td>"
                          f"<td style='color:#8e8e93;padding:3px 4px;'>{detail}</td></tr>")
             html += "<tr><td colspan='4' style='border-bottom:1px solid #3a3a3c;'></td></tr>"
 
-        # ── History ──
         if not lines:
             html += "<tr><td colspan='4' style='color:#8e8e93;padding:8px;'>No changes recorded yet.</td></tr>"
         else:
@@ -2693,7 +2511,7 @@ class MainWindow(QMainWindow):
         text_view = QTextEdit()
         text_view.setReadOnly(True)
         text_view.setHtml(html)
-        text_view.setLineWrapMode(QTextEdit.NoWrap)  # single line per entry
+        text_view.setLineWrapMode(QTextEdit.NoWrap)
         text_view.setStyleSheet(
             "QTextEdit{background:#1c1c1e;border:1px solid #2c2c2e;"
             "border-radius:6px;color:#f2f2f7;}")
@@ -2706,7 +2524,6 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _update_pending_btn(self):
-        """Update the pending button with current bg worker queue count."""
         n = len(self._pending_changes)
         self.pending_btn.setText(f"Queue ({n})")
         if n > 0:
@@ -2716,12 +2533,11 @@ class MainWindow(QMainWindow):
             self.pending_btn.setStyleSheet("")
 
     def _show_pending(self):
-        """Show pending changes queue in a dialog."""
         from PySide6.QtWidgets import QDialog, QTextEdit
 
         icons = {
-            "MOVE":   ("\u27A1", "#0a84ff"),
-            "RENAME": ("\u270F", "#FF9F0A"),
+            "MOVE":   ("\u27a1", "#0a84ff"),
+            "RENAME": ("\u270f", "#FF9F0A"),
         }
 
         html = "<div style='font-family:SF Mono,Consolas,monospace;font-size:12px;'>"
@@ -2729,7 +2545,7 @@ class MainWindow(QMainWindow):
             html += "<p style='color:#8e8e93;'>No pending changes in queue.</p>"
         else:
             html += (f"<p style='color:#FF9F0A;font-weight:700;'>"
-                     f"\u23F3 {len(self._pending_changes)} pending change(s)</p><br>")
+                     f"\u23f3 {len(self._pending_changes)} pending change(s)</p><br>")
             for action, song, detail in self._pending_changes:
                 icon, color = icons.get(action, ("\u2022", "#8e8e93"))
                 html += (f"<p style='margin:4px 0;'>"
@@ -2764,7 +2580,6 @@ class MainWindow(QMainWindow):
         return bp / "changelog.csv"
 
     def _log_change(self, action: str, title: str, detail: str = ""):
-        """Append to CSV changelog. Actions: ADD, DEL, MOVE, RATING, RENAME, TODO"""
         try:
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
             with open(self._changelog_path(), "a", encoding="utf-8") as f:
@@ -2773,25 +2588,22 @@ class MainWindow(QMainWindow):
             pass
 
     # ------------------------------------------------------------------
-    # Category filter dropdown
+    # Category filter
     # ------------------------------------------------------------------
     def _rebuild_cat_filter(self):
         cats = list_categories(self.root_path) if self.root_path else []
         if cats == self._last_cats: return
         self._last_cats = cats
 
-        # Initialize checkboxes — all checked by default (= "All")
         for c in cats:
             if c not in self._cat_checks:
                 self._cat_checks[c] = True
-        # Remove categories that no longer exist
         for c in list(self._cat_checks):
             if c not in cats:
                 del self._cat_checks[c]
 
         self._update_cat_btn_label()
 
-        # update every row's combo
         for sid, item in self.row_items.items():
             combo = self.table.cellWidget(item.row(), COL_CATEGORY)
             if combo is None: continue
@@ -2824,10 +2636,6 @@ class MainWindow(QMainWindow):
         self._apply_filters()
 
     def _show_cat_checkboxes(self):
-        """Category filter popup with two selection modes:
-        1. Click category NAME → select only that one (instant, closes popup)
-        2. Use CHECKBOXES → multi-select, then click button to apply
-        """
         from PySide6.QtWidgets import QMenu, QWidgetAction, QCheckBox
 
         menu = QMenu(self)
@@ -2839,7 +2647,6 @@ class MainWindow(QMainWindow):
         self._pending_cat_change = False
 
         def _on_checkbox_toggled():
-            """When any checkbox is toggled, signal that Apply is needed."""
             self._pending_cat_change = True
             self.cat_filter_btn.setText("Apply Selection")
             self.cat_filter_btn.setStyleSheet(
@@ -2849,13 +2656,11 @@ class MainWindow(QMainWindow):
                 "padding:4px 10px;}")
 
         def _select_only(cat_name: str):
-            """Click on name = select ONLY this category, close popup."""
             for c in self._cat_checks:
                 self._cat_checks[c] = (c == cat_name)
             self._pending_cat_change = False
             menu.close()
 
-        # ── "All" row: checkbox + clickable text ──
         all_w = QWidget()
         all_lay = QHBoxLayout(all_w)
         all_lay.setContentsMargins(10, 3, 10, 3)
@@ -2888,7 +2693,6 @@ class MainWindow(QMainWindow):
         menu.addAction(wa_all)
         menu.addSeparator()
 
-        # ── Category rows ──
         for cat in self._last_cats:
             row_w = QWidget()
             row_lay = QHBoxLayout(row_w)
@@ -2918,7 +2722,6 @@ class MainWindow(QMainWindow):
             wa.setDefaultWidget(row_w)
             menu.addAction(wa)
 
-        # Sync "All" checkbox with individual checkboxes
         def _sync_all():
             all_cb.blockSignals(True)
             all_cb.setChecked(all(cb.isChecked() for _, cb in cat_cbs))
@@ -2932,12 +2735,10 @@ class MainWindow(QMainWindow):
         menu.exec(self.cat_filter_btn.mapToGlobal(
             self.cat_filter_btn.rect().bottomLeft()))
 
-        # After popup closes: read checkbox states if multi-select was used
         if self._pending_cat_change:
             for cat, cb in cat_cbs:
                 self._cat_checks[cat] = cb.isChecked()
 
-        # Reset button style
         self.cat_filter_btn.setStyleSheet("")
         self._update_cat_btn_label()
         self._apply_filters()
@@ -2965,14 +2766,12 @@ class MainWindow(QMainWindow):
         self._filter_search = ""; self._filter_rating = 0
         self._filter_collab = False; self._filter_cover = False
         self._filter_accordion = False; self._filter_christmas = False
-        # Reset all category checkboxes to checked
         for c in self._cat_checks:
             self._cat_checks[c] = True
         self._update_cat_btn_label()
         self._apply_filters()
 
     def _matches(self, song: Song) -> bool:
-        # Category checkbox filter
         checked_cats = [c for c, v in self._cat_checks.items() if v]
         if checked_cats and len(checked_cats) < len(self._last_cats):
             if song.category not in checked_cats:
@@ -2983,7 +2782,7 @@ class MainWindow(QMainWindow):
             if self._filter_search not in combined:
                 return False
         if self._filter_rating == -1 and song.rating != 0:
-            return False   # "No rating" filter: only unrated songs
+            return False
         if self._filter_rating > 0 and song.rating < self._filter_rating:
             return False
         if self._filter_collab and "collab" not in song.title.lower():
@@ -3000,10 +2799,8 @@ class MainWindow(QMainWindow):
     _last_sort_order = Qt.AscendingOrder
 
     def _on_sort_changed(self, logical_index: int, order):
-        """Update headers with sort arrows. Block sorting on Edit/Delete columns."""
         sortable = {COL_ARTIST, COL_SONGNAME, COL_CATEGORY, COL_RATING}
         if logical_index not in sortable:
-            # Revert: don't sort on non-data columns
             self.table.horizontalHeader().blockSignals(True)
             self.table.sortItems(self._last_sort_col, self._last_sort_order)
             self.table.horizontalHeader().blockSignals(False)
@@ -3014,7 +2811,7 @@ class MainWindow(QMainWindow):
 
         for i, base_name in enumerate(self._base_headers):
             if i == logical_index:
-                arrow = " ▼" if order == Qt.AscendingOrder else " ▲"
+                arrow = " \u25bc" if order == Qt.AscendingOrder else " \u25b2"
                 self.table.horizontalHeaderItem(i).setText(base_name + arrow)
             else:
                 self.table.horizontalHeaderItem(i).setText(base_name)
@@ -3030,8 +2827,6 @@ class MainWindow(QMainWindow):
         self._rebuild_play_queue()
 
     def _rebuild_play_queue(self):
-        """Rebuild the player's queue from the current visible table order.
-        Preserves the currently playing song's position in the new queue."""
         current = self.player.current_song()
         new_queue = self._visible_songs_in_order()
         if not new_queue:
@@ -3043,14 +2838,10 @@ class MainWindow(QMainWindow):
             self.player._index = max(0, min(self.player._index, len(new_queue) - 1))
 
     def _update_queue_numbers(self):
-        """Renumber visible rows 1,2,3... so Queue # always reflects the
-        current filtered view, not the original row index."""
-        vh = self.table.verticalHeader()
         queue_num = 0
         for visual in range(self.table.rowCount()):
             if not self.table.isRowHidden(visual):
                 queue_num += 1
-                # Set the vertical header label for this row
                 vhi = self.table.verticalHeaderItem(visual)
                 if vhi is None:
                     vhi = QTableWidgetItem()
@@ -3062,8 +2853,6 @@ class MainWindow(QMainWindow):
                     vhi.setText("")
 
     def _visible_songs_in_order(self) -> List[Song]:
-        """Return songs in their current visible table order (respects
-        sorting and filters). This is what the play queue should use."""
         result = []
         for row in range(self.table.rowCount()):
             if self.table.isRowHidden(row):
@@ -3078,7 +2867,6 @@ class MainWindow(QMainWindow):
         return result
 
     def _filtered_songs(self) -> List[Song]:
-        """Alias for visible songs in order."""
         return self._visible_songs_in_order()
 
     # ------------------------------------------------------------------
@@ -3095,22 +2883,19 @@ class MainWindow(QMainWindow):
     # Table rows (incremental)
     # ------------------------------------------------------------------
     def _add_or_update(self, song: Song):
-        # ── Deduplication: if a song with the same PATH already exists
-        # under a different ID, merge into the existing entry ──
         existing_id = None
         for sid, s in self.songs_by_id.items():
             if s.path == song.path and sid != song.id:
                 existing_id = sid
                 break
         if existing_id:
-            # Merge: update existing song, discard the new ID
             old_song = self.songs_by_id[existing_id]
             old_song.title = song.title
             old_song.artist = song.artist
             old_song.rating = song.rating
             old_song.category = song.category
             old_song.duration = song.duration
-            song = old_song   # use the existing object
+            song = old_song
 
         self.songs_by_id[song.id] = song
         item = self.row_items.get(song.id)
@@ -3151,7 +2936,6 @@ class MainWindow(QMainWindow):
         sn = QTableWidgetItem(song_part)
         self.table.setItem(row, COL_SONGNAME, sn)
 
-        # ── Name edit pen (edits both artist + song name) ──
         name_lock = LockButton(
             "Green pen: name is protected. Click to edit.",
             "Red pen: name editing active.")
@@ -3159,41 +2943,35 @@ class MainWindow(QMainWindow):
             lambda unlocked, s=song, lk=name_lock: self._on_title_edit_unlock(s, lk, unlocked))
         self.table.setCellWidget(row, COL_NAME_EDIT, _centered(name_lock))
 
-        # ── Category combo ──
         cats = list_categories(self.root_path) if self.root_path else []
         combo = QComboBox(); combo.addItems(cats)
         if song.category in cats: combo.setCurrentText(song.category)
         combo.setEnabled(False)
         combo.currentTextChanged.connect(
             lambda nc, s=song, c=combo: self._on_cat_combo(s, c, nc))
-        # Set hidden sort item BEFORE the widget (widget covers it visually)
         cat_sort_item = QTableWidgetItem(song.category)
         self.table.setItem(row, COL_CATEGORY, cat_sort_item)
         self.table.setCellWidget(row, COL_CATEGORY, combo)
 
-        # ── Category lock ──
         cat_lock = LockButton(
             "Green pen: category is protected. Click to allow editing.",
             "Red pen: editing active. Select a new category to move the file.")
         cat_lock.toggledLock.connect(lambda unlocked, c=combo: c.setEnabled(unlocked))
         self.table.setCellWidget(row, COL_CATEGORY_LOCK, _centered(cat_lock))
 
-        # ── Star rating — locked by default, pencil unlocks editing ──
         star_wrapper = QWidget()
         star_lay = QHBoxLayout(star_wrapper)
         star_lay.setContentsMargins(4, 0, 4, 0)
         star_lay.setSpacing(0)
         star = StarRatingWidget(song.rating)
-        star.set_editable(False)   # locked by default
+        star.set_editable(False)
         star.ratingChanged.connect(lambda nr, s=song, sw=star: self._on_rating(s, sw, nr))
         star_lay.addWidget(star)
         star_lay.addStretch()
-        # Set hidden sort item for rating (sort numerically by rating value)
         rat_sort_item = _InvisibleSortItem(song.rating)
         self.table.setItem(row, COL_RATING, rat_sort_item)
         self.table.setCellWidget(row, COL_RATING, star_wrapper)
 
-        # ── Rating edit lock ──
         rat_lock = LockButton(
             "Green pen: rating is protected. Click to allow editing.",
             "Red pen: editing active. Click a star to set the rating."
@@ -3204,16 +2982,14 @@ class MainWindow(QMainWindow):
         combo.setProperty("lock_ref", cat_lock)
         star.setProperty("lock_ref", rat_lock)
 
-        # ── Disable editing for To-Do items (placeholders, not songs) ──
         is_todo = song.path.suffix.lower() in TODO_EXTENSIONS
         if is_todo:
             cat_lock.setVisible(False)
             rat_lock.setVisible(False)
             combo.setEnabled(False)
 
-        # ── Delete button ──
         del_btn = QToolButton()
-        del_btn.setText("\U0001F5D1")   # 🗑 recycle bin
+        del_btn.setText("\U0001f5d1")
         del_btn.setToolTip("Delete this file permanently")
         del_btn.setCursor(Qt.PointingHandCursor)
         del_btn.setFixedSize(22, 22)
@@ -3231,7 +3007,6 @@ class MainWindow(QMainWindow):
     # Selection & bulk operations
     # ------------------------------------------------------------------
     def _on_selection_changed(self):
-        """Enable bulk controls when 2+ songs are selected."""
         sel_rows = set(idx.row() for idx in self.table.selectedIndexes())
         multi = len(sel_rows) >= 2
         self.bulk_cat_combo.setEnabled(multi)
@@ -3249,7 +3024,6 @@ class MainWindow(QMainWindow):
             self.bulk_status.setText("Select 2+ songs to enable")
 
     def _selected_songs(self) -> List[Song]:
-        """Return songs from the currently selected rows."""
         seen = set()
         songs = []
         for idx in self.table.selectedIndexes():
@@ -3336,7 +3110,6 @@ class MainWindow(QMainWindow):
         if not songs:
             return
 
-        # Block ALL file-change signals to prevent repeated rescans
         self._suppress_rescan = True; self.watcher.blockSignals(True)
         self._rescan_timer.stop()
         self.table.setSortingEnabled(False)
@@ -3344,30 +3117,28 @@ class MainWindow(QMainWindow):
 
         count = 0
         for i, song in enumerate(songs):
-            if write_rating(song.path, new_rating):
-                song.rating = new_rating
-                try:
-                    st = song.path.stat()
-                    self.cache[str(song.path)] = {
-                        "size": st.st_size, "mtime": st.st_mtime,
-                        "title": song.title, "artist": song.artist,
-                        "rating": new_rating, "duration": song.duration,
-                        "id": song.id}
-                except OSError:
-                    pass
-                item = self.row_items.get(song.id)
-                if item:
-                    star_wrap = self.table.cellWidget(item.row(), COL_RATING)
-                    if star_wrap:
-                        star = star_wrap.findChild(StarRatingWidget)
-                        if star:
-                            star.set_rating(new_rating)
-                count += 1
-            # Keep UI responsive during large bulk operations
+            _bg_write_rating(song.path, new_rating)
+            song.rating = new_rating
+            try:
+                st = song.path.stat()
+                self.cache[str(song.path)] = {
+                    "size": st.st_size, "mtime": st.st_mtime,
+                    "title": song.title, "artist": song.artist,
+                    "rating": new_rating, "duration": song.duration,
+                    "id": song.id}
+            except OSError:
+                pass
+            item = self.row_items.get(song.id)
+            if item:
+                star_wrap = self.table.cellWidget(item.row(), COL_RATING)
+                if star_wrap:
+                    star = star_wrap.findChild(StarRatingWidget)
+                    if star:
+                        star.set_rating(new_rating)
+            count += 1
             if (i + 1) % 30 == 0:
                 QApplication.processEvents()
 
-        # Save cache ONCE at the end
         if self.root_path:
             save_cache(self.root_path, self.cache)
 
@@ -3375,9 +3146,12 @@ class MainWindow(QMainWindow):
         self.bulk_rat_combo.setCurrentIndex(0)
         self._update_queue_numbers()
 
-        # Unblock watcher and cancel any queued rescans
-        self._suppress_rescan = False; self.watcher.blockSignals(False)
-        self._rescan_timer.stop()
+        # FIX: longer suppress window so bg writes finish before watcher re-enables
+        QTimer.singleShot(2500, lambda: (
+            setattr(self, '_suppress_rescan', False),
+            self.watcher.blockSignals(False),
+            self._rescan_timer.stop()
+        ))
 
         stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
         self._set_info(
@@ -3426,23 +3200,20 @@ class MainWindow(QMainWindow):
 
     _CSS_LOCK_DISABLED = (
         "QToolButton{background:transparent;border:none;"
-        "color:#48484a;font-size:13px;}"  # dark gray = disabled
+        "color:#48484a;font-size:13px;}"
     )
 
     def _highlight(self, playing: Optional[Song]):
-        # ── Restore previous song's appearance ──
         if self._highlighted_id:
             prev = self.row_items.get(self._highlighted_id)
             if prev:
                 row = prev.row()
                 f = prev.font(); f.setBold(False); prev.setFont(f)
                 prev.setForeground(Qt.white)
-                # Also restore Song Name column
                 sn = self.table.item(row, COL_SONGNAME)
                 if sn:
                     sf = sn.font(); sf.setBold(False); sn.setFont(sf)
                     sn.setForeground(Qt.white)
-                # Re-enable edit locks
                 for col in (COL_NAME_EDIT, COL_CATEGORY_LOCK):
                     w = self.table.cellWidget(row, col)
                     if w:
@@ -3454,19 +3225,16 @@ class MainWindow(QMainWindow):
 
         self._highlighted_id = playing.id if playing else None
 
-        # ── Highlight new playing song ──
         if playing:
             item = self.row_items.get(playing.id)
             if item:
                 row = item.row()
-                # Color BOTH Artist and Song Name columns
                 f = item.font(); f.setBold(True); item.setFont(f)
                 item.setForeground(Qt.cyan)
                 sn = self.table.item(row, COL_SONGNAME)
                 if sn:
                     sf = sn.font(); sf.setBold(True); sn.setFont(sf)
                     sn.setForeground(Qt.cyan)
-                # Gray out Name-Edit and Category-Lock (can't edit while playing)
                 for col in (COL_NAME_EDIT, COL_CATEGORY_LOCK):
                     w = self.table.cellWidget(row, col)
                     if w:
@@ -3480,10 +3248,7 @@ class MainWindow(QMainWindow):
                                 "Play a different song first.")
 
     # ------------------------------------------------------------------
-    # Category change → physical move
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # Title / Artist inline editing
+    # Category change
     # ------------------------------------------------------------------
     def _on_title_edit_unlock(self, song: Song, lock: "LockButton", unlocked: bool):
         item = self.row_items.get(song.id)
@@ -3493,7 +3258,6 @@ class MainWindow(QMainWindow):
         old_artist, old_songname = _split_title(song.title)
 
         def _commit_name(new_artist: str, new_songname: str):
-            """Combine artist + song name, rename file if changed."""
             if new_artist and new_songname:
                 new_title = f"{new_artist} - {new_songname}"
             elif new_songname:
@@ -3501,30 +3265,27 @@ class MainWindow(QMainWindow):
             else:
                 new_title = song.title
 
-            # Update display
             a_part, s_part = _split_title(new_title)
             item.setText(a_part)
             sn_item = self.table.item(row, COL_SONGNAME)
             if sn_item: sn_item.setText(s_part)
 
             if new_title != song.title:
-                # Check if song is currently playing
                 current = self.player.current_song()
                 is_active = (current is not None and current.id == song.id and
                             (self.player.is_playing() or
                              self.player._player.playbackState() != QMediaPlayer.StoppedState))
 
                 if is_active:
-                    # Queue the rename — will apply when song finishes
                     self._pending_changes.append(("RENAME", song, new_title))
                     self._update_pending_btn()
-                    lock.setText("\u23F3")   # ⏳
+                    lock.setText("\u23f3")
                     lock.setStyleSheet(
                         "QToolButton{background:transparent;border:none;"
                         "color:#FF9F0A;font-size:13px;}")
                     lock.setEnabled(False)
                     self._show_toast(
-                        f"\u23F3  Rename queued: \"{new_title}\"  (will apply when song finishes)",
+                        f"\u23f3  Rename queued: \"{new_title}\"  (will apply when song finishes)",
                         4000, "warning")
                     return
 
@@ -3540,14 +3301,12 @@ class MainWindow(QMainWindow):
                     self._set_info(f'\u2713  Renamed: "{new_title}"', "success")
                     self._log_change("RENAME", new_title, f"was: {old_title}")
                 else:
-                    # Revert display
                     a2, s2 = _split_title(song.title)
                     item.setText(a2)
                     if sn_item: sn_item.setText(s2)
                     self._set_info("Could not rename file.", "error")
 
         if not unlocked:
-            # Pen clicked back to green → close editors and commit
             ed_artist = self.table.cellWidget(row, COL_ARTIST)
             ed_song   = self.table.cellWidget(row, COL_SONGNAME)
             new_a = ed_artist.text().strip() if isinstance(ed_artist, QLineEdit) else old_artist
@@ -3557,7 +3316,6 @@ class MainWindow(QMainWindow):
             _commit_name(new_a, new_s or old_songname)
             return
 
-        # Pen clicked to red → open editors in both columns
         from PySide6.QtWidgets import QCompleter
         existing = [s.title for s in self.songs_by_id.values()]
 
@@ -3590,11 +3348,10 @@ class MainWindow(QMainWindow):
             _commit_name(new_a, new_s)
             lock.set_locked(True)
 
-        ed_a.returnPressed.connect(lambda: ed_s.setFocus())  # Tab to song name
+        ed_a.returnPressed.connect(lambda: ed_s.setFocus())
         ed_s.returnPressed.connect(commit_enter)
 
     def _sync_cache(self, song: Song):
-        """Update on-disk cache after any in-app change to a song."""
         try:
             st  = song.path.stat()
             rec = self.cache.get(str(song.path), {})
@@ -3607,11 +3364,9 @@ class MainWindow(QMainWindow):
         except OSError:
             pass
 
-
     def _on_cat_combo(self, song: Song, combo: QComboBox, new_cat: str):
         if new_cat == song.category or not combo.isEnabled(): return
 
-        # Block if this song is currently playing
         current = self.player.current_song()
         if current and current.id == song.id and self.player.is_playing():
             self._show_toast(
@@ -3622,7 +3377,6 @@ class MainWindow(QMainWindow):
             combo.blockSignals(False)
             return
 
-        # Direct move — suppress all rescans
         self._suppress_rescan = True
         old_cat = song.category
         old_path_str = str(song.path)
@@ -3656,42 +3410,37 @@ class MainWindow(QMainWindow):
         self._rescan_timer.stop()
         self._log_change("MOVE", song.title, f"{old_cat} \u2192 {new_cat}")
         self._show_toast(
-            f"\u2713  \'{song.title}\'  moved: {old_cat} \u2192 {new_cat}", 3000, "success")
-
+            f"\u2713  '{song.title}'  moved: {old_cat} \u2192 {new_cat}", 3000, "success")
 
     # ------------------------------------------------------------------
-    # Rating change → write directly into the audio file
+    # Rating change
     # ------------------------------------------------------------------
     def _on_rating(self, song: Song, star_widget: "StarRatingWidget", new_rating: int):
         item = self.row_items.get(song.id)
-        self._suppress_rescan = True
-
-        if not write_rating(song.path, new_rating):
-            self._show_toast("Could not write rating.", 3000, "error")
-            self._suppress_rescan = False
-            return
-
         song.rating = new_rating
-        self._sync_cache(song)
-
         if item:
             rat_sort = self.table.item(item.row(), COL_RATING)
             if isinstance(rat_sort, _InvisibleSortItem):
                 rat_sort.set_sort_key(new_rating)
             self.table.setRowHidden(item.row(), not self._matches(song))
             self.table.selectRow(item.row())
-
         lock: LockButton = star_widget.property("lock_ref")
         if lock: lock.set_locked(True)
         star_widget.set_editable(False)
-
-        self._suppress_rescan = False
-        self._rescan_timer.stop()
-
+        self._suppress_rescan = True
+        _bg_write_rating(song.path, new_rating)
+        try:
+            st = song.path.stat()
+            self.cache[str(song.path)] = {
+                "size": st.st_size, "mtime": st.st_mtime,
+                "title": song.title, "artist": song.artist,
+                "rating": new_rating, "duration": song.duration, "id": song.id}
+        except OSError: pass
+        # FIX: Increased from 500ms to 2500ms
+        QTimer.singleShot(2500, lambda: setattr(self, '_suppress_rescan', False))
         stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
         self._log_change("RATING", song.title, f"{new_rating}/5")
-        self._show_toast(
-            f"\u2713  Rating {stars} ({new_rating}/5) \u2014 {song.title}", 2500, "success")
+        self._show_toast(f"\u2713  {stars} ({new_rating}/5) \u2014 {song.title}", 2000, "success")
 
 
 # ============================================================================
@@ -3701,7 +3450,6 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORG_NAME)
 
-    # Set app icon
     icon_path = Path("../assets/01_media/01_icons/icon.ico")
     if not icon_path.exists():
         icon_path = Path("assets/01_media/01_icons/icon.ico")
