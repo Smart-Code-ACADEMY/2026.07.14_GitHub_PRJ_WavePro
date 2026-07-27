@@ -1342,11 +1342,12 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda p=Path(last): self._set_root(p))
 
     def _setup_shortcuts(self):
-        self._ctrl_w_active = False
-        self._ctrl_w_timer = QTimer(self)
-        self._ctrl_w_timer.setSingleShot(True)
-        self._ctrl_w_timer.setInterval(2000)
-        self._ctrl_w_timer.timeout.connect(self._deactivate_command_mode)
+        # ── Manual W-key tracking ─────────────────────────────────
+        # Qt modifiers only track Ctrl/Shift/Alt/Meta — NOT regular
+        # keys like W.  So when user holds Ctrl+W+Left, Qt only
+        # reports ControlModifier for the Left event.  We track W
+        # ourselves so Ctrl+W+<action> works reliably every time.
+        self._w_held = False
 
         # Seek acceleration: repeated arrow presses skip further
         self._seek_accel_count = 0
@@ -1356,10 +1357,49 @@ class MainWindow(QMainWindow):
         self._seek_accel_timer.timeout.connect(
             lambda: setattr(self, '_seek_accel_count', 0))
 
-    def _deactivate_command_mode(self):
-        if self._ctrl_w_active:
-            self._ctrl_w_active = False
-            self._seek_accel_count = 0
+        # ── App-wide event filter ─────────────────────────────────
+        # Catches keyboard shortcuts regardless of which child widget
+        # (table, search box, combo box) has focus.  Shortcuts work
+        # INSTANTLY from the moment the app launches.
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        """App-wide keyboard handler — shortcuts work everywhere."""
+        from PySide6.QtCore import QEvent
+
+        if event.type() == QEvent.KeyPress:
+            key = event.key()
+            mods = event.modifiers()
+
+            # Track W press (ignore auto-repeat)
+            if key == Qt.Key_W and not event.isAutoRepeat():
+                self._w_held = True
+                # If Ctrl is also held, consume the event so Ctrl+W
+                # doesn't leak to child widgets or the OS
+                if mods & Qt.ControlModifier:
+                    return True  # consumed
+
+            # ── Ctrl + W held + action key = command ──────────────
+            if (mods & Qt.ControlModifier) and self._w_held:
+                if key not in (Qt.Key_W, Qt.Key_Control):
+                    if self._handle_command_key(key):
+                        return True  # consumed
+
+        elif event.type() == QEvent.KeyRelease:
+            if event.key() == Qt.Key_W and not event.isAutoRepeat():
+                self._w_held = False
+                self._seek_accel_count = 0
+
+        return super().eventFilter(obj, event)
+
+    def changeEvent(self, event):
+        """Reset W-key state when window loses focus (prevents stuck key)."""
+        from PySide6.QtCore import QEvent
+        if event.type() == QEvent.ActivationChange:
+            if not self.isActiveWindow():
+                self._w_held = False
+                self._seek_accel_count = 0
+        super().changeEvent(event)
 
     def _get_seek_step_ms(self) -> int:
         """Accelerating seek: 5s → 7s → 9s → 12s → 16s → 20s → 25s → 30s max."""
@@ -1371,45 +1411,8 @@ class MainWindow(QMainWindow):
         step = min(5000 + 2000 * (n - 1), 30000)
         return step
 
-    def keyPressEvent(self, event):
-        key = event.key()
-        mods = event.modifiers()
-
-        # ── Ctrl+W activates command mode ──────────────────────────
-        if key == Qt.Key_W and (mods & Qt.ControlModifier):
-            self._ctrl_w_active = True
-            self._ctrl_w_timer.start()
-            self._show_toast(
-                "\u2328  Command mode active  (hold Ctrl+W, press action key)",
-                1500, "info")
-            event.accept()
-            return
-
-        # ── Handle command keys while in command mode ──────────────
-        # Command mode stays active so you can press keys repeatedly
-        # without releasing Ctrl+W each time.  It deactivates when:
-        #   • Ctrl is released (keyReleaseEvent)
-        #   • 2 seconds pass with no key press (timer)
-        if self._ctrl_w_active:
-            handled = self._handle_command_key(key)
-            if handled:
-                # Keep command mode alive — restart timeout
-                self._ctrl_w_timer.start()
-                event.accept()
-                return
-
-        super().keyPressEvent(event)
-
-    def keyReleaseEvent(self, event):
-        """Deactivate command mode when Ctrl or W is released."""
-        if self._ctrl_w_active and event.key() in (Qt.Key_Control, Qt.Key_W):
-            # Only deactivate if Ctrl is no longer held
-            if not (event.modifiers() & Qt.ControlModifier):
-                self._deactivate_command_mode()
-        super().keyReleaseEvent(event)
-
     def _handle_command_key(self, key) -> bool:
-        """Process a key while in Ctrl+W command mode.
+        """Process a key while Ctrl+W is held.
         Returns True if the key was handled."""
 
         # ── Rating: 0–5 ───────────────────────────────────────────
@@ -1440,16 +1443,15 @@ class MainWindow(QMainWindow):
                 self._show_toast("No song playing.", 1000, "warning")
             return True
 
-        # ── Play / Pause ──────────────────────────────────────────
-        # Supports Space, all media play/pause key variants
-        if key in (Qt.Key_Space,
-                   Qt.Key_MediaPlay, Qt.Key_MediaPause,
-                   Qt.Key_MediaTogglePlayPause):
+        # ── Play / Pause  (Ctrl+W+Space ONLY) ────────────────────
+        # Media keys (MediaPlay etc.) are NOT captured here because
+        # they conflict with the OS (open YouTube, Spotify, etc.)
+        if key == Qt.Key_Space:
             self._shortcut_play_pause()
             return True
 
         # ── Next / Previous ───────────────────────────────────────
-        if key in (Qt.Key_MediaNext, Qt.Key_N):
+        if key in (Qt.Key_N, Qt.Key_MediaNext):
             if self.player.current_song() is None:
                 songs = self._visible_songs_in_order()
                 if songs:
@@ -1458,7 +1460,7 @@ class MainWindow(QMainWindow):
                 self.player.next()
             return True
 
-        if key in (Qt.Key_MediaPrevious, Qt.Key_P):
+        if key in (Qt.Key_P, Qt.Key_MediaPrevious):
             if self.player.current_song() is None:
                 songs = self._visible_songs_in_order()
                 if songs:
