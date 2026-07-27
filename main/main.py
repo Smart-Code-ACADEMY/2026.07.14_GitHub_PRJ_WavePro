@@ -1346,70 +1346,142 @@ class MainWindow(QMainWindow):
         self._ctrl_w_timer = QTimer(self)
         self._ctrl_w_timer.setSingleShot(True)
         self._ctrl_w_timer.setInterval(2000)
-        self._ctrl_w_timer.timeout.connect(lambda: setattr(self, '_ctrl_w_active', False))
+        self._ctrl_w_timer.timeout.connect(self._deactivate_command_mode)
+
+        # Seek acceleration: repeated arrow presses skip further
+        self._seek_accel_count = 0
+        self._seek_accel_timer = QTimer(self)
+        self._seek_accel_timer.setSingleShot(True)
+        self._seek_accel_timer.setInterval(900)
+        self._seek_accel_timer.timeout.connect(
+            lambda: setattr(self, '_seek_accel_count', 0))
+
+    def _deactivate_command_mode(self):
+        if self._ctrl_w_active:
+            self._ctrl_w_active = False
+            self._seek_accel_count = 0
+
+    def _get_seek_step_ms(self) -> int:
+        """Accelerating seek: 5s → 7s → 9s → 12s → 16s → 20s → 25s → 30s max."""
+        self._seek_accel_count += 1
+        self._seek_accel_timer.start()  # reset decay
+        n = self._seek_accel_count
+        if n <= 1:
+            return 5000
+        step = min(5000 + 2000 * (n - 1), 30000)
+        return step
 
     def keyPressEvent(self, event):
         key = event.key()
         mods = event.modifiers()
 
-        if mods == Qt.ControlModifier and key == Qt.Key_W:
+        # ── Ctrl+W activates command mode ──────────────────────────
+        if key == Qt.Key_W and (mods & Qt.ControlModifier):
             self._ctrl_w_active = True
             self._ctrl_w_timer.start()
-            self._show_toast("Wave Pro command mode activated (press next key)", 1500, "info")
+            self._show_toast(
+                "\u2328  Command mode active  (hold Ctrl+W, press action key)",
+                1500, "info")
             event.accept()
             return
 
+        # ── Handle command keys while in command mode ──────────────
+        # Command mode stays active so you can press keys repeatedly
+        # without releasing Ctrl+W each time.  It deactivates when:
+        #   • Ctrl is released (keyReleaseEvent)
+        #   • 2 seconds pass with no key press (timer)
         if self._ctrl_w_active:
-            self._ctrl_w_active = False
-            self._ctrl_w_timer.stop()
-
-            if Qt.Key_0 <= key <= Qt.Key_5:
-                rating = key - Qt.Key_0
-                self._shortcut_rating(rating)
-                event.accept()
-                return
-
-            if key == Qt.Key_Right:
-                if self.player.current_song():
-                    self.player.seek(self.player._player.position() + 5000)
-                    self._show_toast("\u23e9  +5s", 1000, "info")
-                event.accept()
-                return
-            if key == Qt.Key_Left:
-                if self.player.current_song():
-                    self.player.seek(max(0, self.player._player.position() - 5000))
-                    self._show_toast("\u23ea  -5s", 1000, "info")
-                event.accept()
-                return
-
-            if key == Qt.Key_Space or key == Qt.Key_MediaPlay or key == Qt.Key_MediaPause:
-                self._shortcut_play_pause()
-                event.accept()
-                return
-
-            if key == Qt.Key_MediaNext or key == Qt.Key_N:
-                self.player.next()
-                event.accept()
-                return
-            if key == Qt.Key_MediaPrevious or key == Qt.Key_P:
-                self.player.previous()
-                event.accept()
-                return
-
-            if key == Qt.Key_Up or key == Qt.Key_VolumeUp:
-                self.vol_slider.setValue(min(100, self.vol_slider.value() + 5))
-                event.accept()
-                return
-            if key == Qt.Key_Down or key == Qt.Key_VolumeDown:
-                self.vol_slider.setValue(max(0, self.vol_slider.value() - 5))
-                event.accept()
-                return
-            if key == Qt.Key_M or key == Qt.Key_VolumeMute:
-                self.vol_slider.setValue(0 if self.vol_slider.value() > 0 else 80)
+            handled = self._handle_command_key(key)
+            if handled:
+                # Keep command mode alive — restart timeout
+                self._ctrl_w_timer.start()
                 event.accept()
                 return
 
         super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        """Deactivate command mode when Ctrl or W is released."""
+        if self._ctrl_w_active and event.key() in (Qt.Key_Control, Qt.Key_W):
+            # Only deactivate if Ctrl is no longer held
+            if not (event.modifiers() & Qt.ControlModifier):
+                self._deactivate_command_mode()
+        super().keyReleaseEvent(event)
+
+    def _handle_command_key(self, key) -> bool:
+        """Process a key while in Ctrl+W command mode.
+        Returns True if the key was handled."""
+
+        # ── Rating: 0–5 ───────────────────────────────────────────
+        if Qt.Key_0 <= key <= Qt.Key_5:
+            self._shortcut_rating(key - Qt.Key_0)
+            return True
+
+        # ── Seek forward (accelerating) ───────────────────────────
+        if key == Qt.Key_Right:
+            if self.player.current_song():
+                step = self._get_seek_step_ms()
+                self.player.seek(self.player._player.position() + step)
+                self._show_toast(
+                    f"\u23e9  +{step // 1000}s", 800, "info")
+            else:
+                self._show_toast("No song playing.", 1000, "warning")
+            return True
+
+        # ── Seek backward (accelerating) ──────────────────────────
+        if key == Qt.Key_Left:
+            if self.player.current_song():
+                step = self._get_seek_step_ms()
+                self.player.seek(
+                    max(0, self.player._player.position() - step))
+                self._show_toast(
+                    f"\u23ea  -{step // 1000}s", 800, "info")
+            else:
+                self._show_toast("No song playing.", 1000, "warning")
+            return True
+
+        # ── Play / Pause ──────────────────────────────────────────
+        # Supports Space, all media play/pause key variants
+        if key in (Qt.Key_Space,
+                   Qt.Key_MediaPlay, Qt.Key_MediaPause,
+                   Qt.Key_MediaTogglePlayPause):
+            self._shortcut_play_pause()
+            return True
+
+        # ── Next / Previous ───────────────────────────────────────
+        if key in (Qt.Key_MediaNext, Qt.Key_N):
+            if self.player.current_song() is None:
+                songs = self._visible_songs_in_order()
+                if songs:
+                    self.player.play_song(songs[0], queue=songs)
+            else:
+                self.player.next()
+            return True
+
+        if key in (Qt.Key_MediaPrevious, Qt.Key_P):
+            if self.player.current_song() is None:
+                songs = self._visible_songs_in_order()
+                if songs:
+                    self.player.play_song(songs[-1], queue=songs)
+            else:
+                self.player.previous()
+            return True
+
+        # ── Volume Up / Down / Mute ───────────────────────────────
+        if key in (Qt.Key_Up, Qt.Key_VolumeUp):
+            self.vol_slider.setValue(min(100, self.vol_slider.value() + 5))
+            return True
+
+        if key in (Qt.Key_Down, Qt.Key_VolumeDown):
+            self.vol_slider.setValue(max(0, self.vol_slider.value() - 5))
+            return True
+
+        if key in (Qt.Key_M, Qt.Key_VolumeMute):
+            self.vol_slider.setValue(
+                0 if self.vol_slider.value() > 0 else 80)
+            return True
+
+        return False  # key not handled
 
     def _shortcut_play_pause(self):
         if self.player.current_song() is None:
