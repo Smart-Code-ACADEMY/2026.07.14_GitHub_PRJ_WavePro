@@ -485,13 +485,25 @@ class ScanWorker(QThread):
             if rec is None:
                 rec = {}
             path_obj = Path(p)
-            # Always re-read title/artist from file
-            title, artist = read_display_tags(path_obj)
-            # Always re-read rating from file so changes made via Windows
-            # Properties > Details > Rating are immediately visible.
-            # Only duration is taken from cache (expensive, rarely changes).
-            rating   = read_rating(path_obj)
-            duration = rec.get("duration", 0.0)
+
+            # OPTIMIZATION: if mtime matches cache, use cached data (no disk I/O)
+            # This makes re-opening the app near-instant for unchanged files.
+            # Only re-read from disk if the file was actually modified.
+            cache_fresh = (rec.get("mtime") is not None
+                          and abs(rec.get("mtime", 0) - mtime) < 1.0
+                          and rec.get("size") == size
+                          and "title" in rec)
+
+            if cache_fresh:
+                title    = path_obj.stem   # title = always filename
+                artist   = rec.get("artist", "")
+                rating   = rec.get("rating", 0)
+                duration = rec.get("duration", 0.0)
+            else:
+                title, artist = read_display_tags(path_obj)
+                rating   = read_rating(path_obj)
+                duration = rec.get("duration", 0.0)
+
             song = Song(
                 path=path_obj, category=cat,
                 title=title, artist=artist,
@@ -499,7 +511,8 @@ class ScanWorker(QThread):
                 id=rec.get("id") or uuid.uuid4().hex,
             )
             new_cache[p] = {**rec, "size": size, "mtime": mtime,
-                            "title": title, "artist": artist, "id": song.id}
+                            "title": title, "artist": artist,
+                            "rating": rating, "id": song.id}
             done += 1
             elapsed = time.monotonic() - start
             rate    = done / elapsed if elapsed > 0.001 else 0
@@ -549,6 +562,104 @@ class RepeatMode(Enum):
     ONE     = 1
     ALL     = 2
     REVERSE = 3   # play all songs in reverse order
+
+
+class PlayerController(QObject):
+    """Manages playback queue, repeat, shuffle."""
+
+
+class PlayerController(QObject):
+    """Manages playback queue, repeat, shuffle."""
+
+
+class _FileOp:
+    """A single file operation to execute in the background."""
+    __slots__ = ("kind", "song_id", "args", "description")
+    def __init__(self, kind: str, song_id: str, args: dict, description: str):
+        self.kind = kind
+        self.song_id = song_id
+        self.args = args
+        self.description = description
+
+
+class BackgroundWorker(QThread):
+    """Processes file operations (move, rating, rename, delete) in a background
+    thread so the GUI never freezes. Operations are queued and processed FIFO."""
+    operationDone = Signal(str, str, bool, str)  # (kind, song_id, success, detail)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._ops: List[_FileOp] = []
+        self._running = True
+        from threading import Lock
+        self._lock = Lock()
+        self._has_work = False
+
+    def enqueue(self, op: "_FileOp"):
+        with self._lock:
+            self._ops.append(op)
+            self._has_work = True
+
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._ops)
+
+    def pending_list(self) -> list:
+        with self._lock:
+            return [(op.kind, op.song_id, op.description) for op in self._ops]
+
+    def run(self):
+        while self._running:
+            op = None
+            with self._lock:
+                if self._ops:
+                    op = self._ops.pop(0)
+                else:
+                    self._has_work = False
+            if op is None:
+                self.msleep(100)
+                continue
+            try:
+                ok = False
+                detail = ""
+                if op.kind == "MOVE":
+                    src = Path(op.args["src"])
+                    root = Path(op.args["root"])
+                    new_cat = op.args["new_cat"]
+                    if src.is_file():
+                        # Create a minimal song-like object for safe_move_song
+                        class _MinSong:
+                            pass
+                        ms = _MinSong()
+                        ms.path = src
+                        ms.category = op.args.get("old_cat", "")
+                        new_path = safe_move_song(ms, root, new_cat)
+                        ok = True
+                        detail = str(new_path)
+                    else:
+                        ok = False
+                        detail = f"File not found: {src}"
+                elif op.kind == "RATING":
+                    ok = write_rating(Path(op.args["path"]), op.args["rating"])
+                    detail = str(op.args["rating"])
+                elif op.kind == "RENAME":
+                    ok_r, new_path = write_display_tags(
+                        Path(op.args["path"]), op.args["new_title"], op.args.get("artist",""))
+                    ok = ok_r
+                    detail = str(new_path)
+                elif op.kind == "DELETE":
+                    p = Path(op.args["path"])
+                    if p.is_file():
+                        os.remove(p)
+                    ok = True
+                    detail = op.args["path"]
+            except Exception as e:
+                ok = False
+                detail = str(e)
+            self.operationDone.emit(op.kind, op.song_id, ok, detail)
+
+    def stop(self):
+        self._running = False
 
 
 class PlayerController(QObject):
@@ -1440,6 +1551,7 @@ class MainWindow(QMainWindow):
         self._suppress_rescan = False  # when True, all rescans are blocked
 
         self.player = PlayerController(self)
+
         self.watcher = QFileSystemWatcher(self)
         self.watcher.directoryChanged.connect(self._on_dir_changed)
         self.watcher.fileChanged.connect(self._on_file_changed)
@@ -1798,6 +1910,14 @@ class MainWindow(QMainWindow):
         self.bulk_rat_combo.activated.connect(self._on_bulk_rating)
         bulk_lay.addWidget(self.bulk_rat_combo)
 
+        self.bulk_del_btn = QPushButton("\U0001F5D1  Delete")
+        self.bulk_del_btn.setToolTip("Delete ALL selected songs permanently")
+        self.bulk_del_btn.setEnabled(False)
+        self.bulk_del_btn.setStyleSheet(
+            "QPushButton:enabled{color:#FF453A;font-weight:600;}")
+        self.bulk_del_btn.clicked.connect(self._on_bulk_delete)
+        bulk_lay.addWidget(self.bulk_del_btn)
+
         self.bulk_status = QLabel("Select 2+ songs to enable")
         self.bulk_status.setObjectName("subtleLabel")
         bulk_lay.addWidget(self.bulk_status)
@@ -2145,34 +2265,34 @@ class MainWindow(QMainWindow):
     _saved_scroll_pos: int = -1
 
     def _scroll_to_playing(self):
-        """Toggle: scroll to currently playing song (without changing selection),
-        or return to the previous scroll position if pressed again."""
+        """Scroll to currently playing song. Press again to return."""
         current = self.player.current_song()
         if current is None:
+            self._show_toast("No song is currently playing.", 2000, "warning")
             return
         item = self.row_items.get(current.id)
         if item is None:
             return
-
-        current_scroll = self.table.verticalScrollBar().value()
-        target_row = item.row()
 
         if self._saved_scroll_pos >= 0:
             # Return to saved position
             self.table.verticalScrollBar().setValue(self._saved_scroll_pos)
             self._saved_scroll_pos = -1
             self.focus_btn.setStyleSheet(
-                "QToolButton{background:#2c2c2e;border:none;border-radius:15px;"
-                "color:#8e8e93;font-size:14px;font-weight:600;}"
-                "QToolButton:hover{background:#3a3a3c;color:#ffffff;}"
+                "QToolButton{background:#2c2c2e;border:none;border-radius:6px;"
+                "color:#8e8e93;font-size:12px;font-weight:600;}"
+                "QToolButton:hover{background:#3a3a3c;color:#f2f2f7;}"
             )
         else:
-            # Save current position and scroll to playing song
-            self._saved_scroll_pos = current_scroll
-            self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+            # Save position and scroll to playing song
+            self._saved_scroll_pos = self.table.verticalScrollBar().value()
+            row = item.row()
+            # Use scrollTo with model index — works even without selection
+            idx = self.table.model().index(row, COL_ARTIST)
+            self.table.scrollTo(idx, QAbstractItemView.PositionAtCenter)
             self.focus_btn.setStyleSheet(
-                "QToolButton{background:#1a3a5c;border:none;border-radius:15px;"
-                "color:#0a84ff;font-size:14px;font-weight:700;}"
+                "QToolButton{background:#1a3a5c;border:none;border-radius:6px;"
+                "color:#0a84ff;font-size:12px;font-weight:700;}"
                 "QToolButton:hover{background:#234a70;}"
             )
 
@@ -2532,23 +2652,24 @@ class MainWindow(QMainWindow):
             "TODO":   ("\u2610", "#8e8e93"),   # ☐ gray
         }
 
-        html = "<div style='font-family:SF Mono,Consolas,monospace;font-size:11px;'>"
+        html = "<table style='font-family:SF Mono,Consolas,monospace;font-size:11px;border-collapse:collapse;white-space:nowrap;'>"
 
         # ── Pending queue (if any) ──
         if self._pending_changes:
-            html += "<p style='color:#FF9F0A;font-weight:700;font-size:12px;'>\u23F3 PENDING QUEUE</p>"
+            html += ("<tr><td colspan='4' style='color:#FF9F0A;font-weight:700;"
+                     "font-size:12px;padding:4px 0;'>\u23F3 PENDING QUEUE</td></tr>")
             for action, song, detail in self._pending_changes:
                 icon, color = icons.get(action, ("\u2022", "#8e8e93"))
-                html += (f"<p style='margin:2px 0;background:#2a1e0a;padding:4px 6px;border-radius:4px;'>"
-                         f"<span style='color:{color};font-size:13px;'>{icon}</span> "
-                         f"<span style='color:#FF9F0A;'>\u23F3 Waiting</span> "
-                         f"<span style='color:#f2f2f7;font-weight:600;'>{song.title}</span> "
-                         f"<span style='color:#8e8e93;'>\u2014 {detail}</span></p>")
-            html += "<hr style='border-color:#3a3a3c;'>"
+                html += (f"<tr style='background:#2a1e0a;'>"
+                         f"<td style='color:{color};font-size:14px;padding:3px 8px 3px 4px;width:20px;'>{icon}</td>"
+                         f"<td style='color:#FF9F0A;padding:3px 8px;'>\u23F3 Waiting</td>"
+                         f"<td style='color:#f2f2f7;font-weight:600;padding:3px 4px;'>{song.title}</td>"
+                         f"<td style='color:#8e8e93;padding:3px 4px;'>{detail}</td></tr>")
+            html += "<tr><td colspan='4' style='border-bottom:1px solid #3a3a3c;'></td></tr>"
 
         # ── History ──
         if not lines:
-            html += "<p style='color:#8e8e93;'>No changes recorded yet.</p>"
+            html += "<tr><td colspan='4' style='color:#8e8e93;padding:8px;'>No changes recorded yet.</td></tr>"
         else:
             for line in reversed(lines):
                 parts = line.split(",", 3)
@@ -2556,14 +2677,12 @@ class MainWindow(QMainWindow):
                     ts, action, title = parts[0], parts[1], parts[2]
                     detail = parts[3] if len(parts) > 3 else ""
                     icon, color = icons.get(action, ("\u2022", "#8e8e93"))
-                    html += (f"<p style='margin:2px 0;'>"
-                             f"<span style='color:{color};font-size:13px;display:inline-block;width:20px;text-align:center;'>{icon}</span>"
-                             f"<span style='color:#6e6e73;'>{ts}</span>&nbsp;&nbsp;"
-                             f"<span style='color:#f2f2f7;font-weight:600;'>{title}</span>")
-                    if detail:
-                        html += f" <span style='color:#8e8e93;'>\u2014 {detail}</span>"
-                    html += "</p>"
-        html += "</div>"
+                    html += (f"<tr>"
+                             f"<td style='color:{color};font-size:14px;padding:2px 8px 2px 4px;width:20px;'>{icon}</td>"
+                             f"<td style='color:#6e6e73;padding:2px 6px;'>{ts}</td>"
+                             f"<td style='color:#f2f2f7;font-weight:600;padding:2px 4px;'>{title}</td>"
+                             f"<td style='color:#8e8e93;padding:2px 4px;'>{detail}</td></tr>")
+        html += "</table>"
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Change History")
@@ -2574,6 +2693,7 @@ class MainWindow(QMainWindow):
         text_view = QTextEdit()
         text_view.setReadOnly(True)
         text_view.setHtml(html)
+        text_view.setLineWrapMode(QTextEdit.NoWrap)  # single line per entry
         text_view.setStyleSheet(
             "QTextEdit{background:#1c1c1e;border:1px solid #2c2c2e;"
             "border-radius:6px;color:#f2f2f7;}")
@@ -2586,7 +2706,7 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _update_pending_btn(self):
-        """Update the pending button text with current queue count."""
+        """Update the pending button with current bg worker queue count."""
         n = len(self._pending_changes)
         self.pending_btn.setText(f"Queue ({n})")
         if n > 0:
@@ -2628,6 +2748,7 @@ class MainWindow(QMainWindow):
         tv = QTextEdit()
         tv.setReadOnly(True)
         tv.setHtml(html)
+        tv.setLineWrapMode(QTextEdit.NoWrap)
         tv.setStyleSheet("QTextEdit{background:#1c1c1e;border:1px solid #2c2c2e;border-radius:6px;}")
         lay.addWidget(tv)
 
@@ -3115,6 +3236,7 @@ class MainWindow(QMainWindow):
         multi = len(sel_rows) >= 2
         self.bulk_cat_combo.setEnabled(multi)
         self.bulk_rat_combo.setEnabled(multi)
+        self.bulk_del_btn.setEnabled(multi)
         if multi:
             self.bulk_status.setText(f"{len(sel_rows)} songs selected")
             cats = list_categories(self.root_path) if self.root_path else []
@@ -3262,24 +3384,100 @@ class MainWindow(QMainWindow):
             f"\u2713  Rating {stars} ({new_rating}/5) set for {count} songs",
             "success", duration_ms=3500)
 
+    def _on_bulk_delete(self):
+        songs = self._selected_songs()
+        if not songs:
+            return
+        reply = QMessageBox.question(
+            self, "Delete files",
+            f"Permanently delete {len(songs)} selected file(s)?\n\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        self._suppress_rescan = True
+        deleted = 0
+        for song in songs:
+            if self.player.current_song() is song:
+                self.player._player.stop()
+            try:
+                os.remove(song.path)
+            except OSError:
+                continue
+            self.cache.pop(str(song.path), None)
+            item = self.row_items.pop(song.id, None)
+            self.songs_by_id.pop(song.id, None)
+            if item:
+                self.table.removeRow(item.row())
+            self._log_change("DEL", song.title, str(song.path))
+            deleted += 1
+        if self.root_path:
+            save_cache(self.root_path, self.cache)
+        self._suppress_rescan = False
+        self._rescan_timer.stop()
+        self._update_queue_numbers()
+        self._rebuild_play_queue()
+        self._show_toast(f"\u2713  Deleted {deleted} file(s)", 3000, "success")
+
     def _on_double_click(self, index):
         item = self.table.item(index.row(), COL_ARTIST)
         if item is None: return
         song = self.songs_by_id.get(item.data(Qt.UserRole))
         if song: self.player.play_song(song, queue=self._visible_songs_in_order())
 
+    _CSS_LOCK_DISABLED = (
+        "QToolButton{background:transparent;border:none;"
+        "color:#48484a;font-size:13px;}"  # dark gray = disabled
+    )
+
     def _highlight(self, playing: Optional[Song]):
+        # ── Restore previous song's appearance ──
         if self._highlighted_id:
             prev = self.row_items.get(self._highlighted_id)
             if prev:
+                row = prev.row()
                 f = prev.font(); f.setBold(False); prev.setFont(f)
                 prev.setForeground(Qt.white)
+                # Also restore Song Name column
+                sn = self.table.item(row, COL_SONGNAME)
+                if sn:
+                    sf = sn.font(); sf.setBold(False); sn.setFont(sf)
+                    sn.setForeground(Qt.white)
+                # Re-enable edit locks
+                for col in (COL_NAME_EDIT, COL_CATEGORY_LOCK):
+                    w = self.table.cellWidget(row, col)
+                    if w:
+                        lk = w.findChild(LockButton)
+                        if lk:
+                            lk.setEnabled(True)
+                            lk.set_locked(True)
+                            lk.setToolTip(lk._tip_locked)
+
         self._highlighted_id = playing.id if playing else None
+
+        # ── Highlight new playing song ──
         if playing:
             item = self.row_items.get(playing.id)
             if item:
+                row = item.row()
+                # Color BOTH Artist and Song Name columns
                 f = item.font(); f.setBold(True); item.setFont(f)
                 item.setForeground(Qt.cyan)
+                sn = self.table.item(row, COL_SONGNAME)
+                if sn:
+                    sf = sn.font(); sf.setBold(True); sn.setFont(sf)
+                    sn.setForeground(Qt.cyan)
+                # Gray out Name-Edit and Category-Lock (can't edit while playing)
+                for col in (COL_NAME_EDIT, COL_CATEGORY_LOCK):
+                    w = self.table.cellWidget(row, col)
+                    if w:
+                        lk = w.findChild(LockButton)
+                        if lk:
+                            lk.set_locked(True)
+                            lk.setEnabled(False)
+                            lk.setStyleSheet(self._CSS_LOCK_DISABLED)
+                            lk.setToolTip(
+                                "Cannot edit while this song is playing.\n"
+                                "Play a different song first.")
 
     # ------------------------------------------------------------------
     # Category change → physical move
@@ -3413,131 +3611,87 @@ class MainWindow(QMainWindow):
     def _on_cat_combo(self, song: Song, combo: QComboBox, new_cat: str):
         if new_cat == song.category or not combo.isEnabled(): return
 
+        # Block if this song is currently playing
         current = self.player.current_song()
-        is_active = (current is not None and current.id == song.id and
-                    (self.player.is_playing() or
-                     self.player._player.playbackState() != QMediaPlayer.StoppedState))
-
-        if is_active:
-            # Block watcher to prevent rescan from resetting the combo
-            self._suppress_rescan = True; self.watcher.blockSignals(True)
-
-            # Queue the category change — will execute when song stops playing
-            self._pending_changes.append(("MOVE", song, new_cat))
-            self._update_pending_btn()
-
-            # Update combo to show new category visually (queued)
-            combo.blockSignals(True)
-            combo.setCurrentText(new_cat)
-            combo.blockSignals(False)
-
-            # Show hourglass on lock button
-            lock: LockButton = combo.property("lock_ref")
-            if lock:
-                lock.setText("\u23F3")   # ⏳ hourglass
-                lock.setStyleSheet(
-                    "QToolButton{background:transparent;border:none;"
-                    "color:#FF9F0A;font-size:13px;}")
-                lock.setEnabled(False)
-            combo.setEnabled(False)
-
-            self._suppress_rescan = False; self.watcher.blockSignals(False)
-            self._rescan_timer.stop()
-
+        if current and current.id == song.id and self.player.is_playing():
             self._show_toast(
-                f"\u23F3  Move queued: '{song.title}' → {new_cat}  (will apply when song finishes)",
-                4000, "warning")
+                "Stop playing this song first before changing its category.",
+                3500, "warning")
+            combo.blockSignals(True)
+            combo.setCurrentText(song.category)
+            combo.blockSignals(False)
             return
 
-        # Not playing — move immediately
-        self._suppress_rescan = True; self.watcher.blockSignals(True)
-        self.table.setSortingEnabled(False)
+        # Direct move — suppress all rescans
+        self._suppress_rescan = True
+        old_cat = song.category
+        old_path_str = str(song.path)
 
-        old_cat, old_path_str = song.category, str(song.path)
         try:
             new_path = safe_move_song(song, self.root_path, new_cat)
         except SafeMoveError as e:
-            self._show_toast(f"Move failed: {e}", 6000, "error")
-            combo.blockSignals(True); combo.setCurrentText(old_cat); combo.blockSignals(False)
-            self.table.setSortingEnabled(True)
-            self._suppress_rescan = False; self.watcher.blockSignals(False)
+            self._show_toast(f"Move failed: {e}", 5000, "error")
+            combo.blockSignals(True)
+            combo.setCurrentText(old_cat)
+            combo.blockSignals(False)
+            self._suppress_rescan = False
             return
 
-        song.path = new_path; song.category = new_cat
-        self.player.notify_song_path_changed(song, new_path)
+        song.path = new_path
+        song.category = new_cat
         self.cache.pop(old_path_str, None)
         self._sync_cache(song)
 
-        # Update sort item
-        cat_sort = self.table.item(self.row_items[song.id].row(), COL_CATEGORY)
-        if cat_sort: cat_sort.setText(new_cat)
+        item = self.row_items.get(song.id)
+        if item:
+            cat_sort = self.table.item(item.row(), COL_CATEGORY)
+            if cat_sort: cat_sort.setText(new_cat)
+            self.table.setRowHidden(item.row(), not self._matches(song))
 
         lock: LockButton = combo.property("lock_ref")
         if lock: lock.set_locked(True)
         combo.setEnabled(False)
-        self.table.setRowHidden(self.row_items[song.id].row(), not self._matches(song))
-        self.table.setSortingEnabled(True)
 
-        self._suppress_rescan = False; self.watcher.blockSignals(False)
+        self._suppress_rescan = False
         self._rescan_timer.stop()
-        self._show_toast(f"\u2713  '{song.title}'  moved: {old_cat} \u2192 {new_cat}", 3500, "success")
-        self._log_change("MOVE", song.title, f"{old_cat} -> {new_cat}")
+        self._log_change("MOVE", song.title, f"{old_cat} \u2192 {new_cat}")
+        self._show_toast(
+            f"\u2713  \'{song.title}\'  moved: {old_cat} \u2192 {new_cat}", 3000, "success")
+
 
     # ------------------------------------------------------------------
     # Rating change → write directly into the audio file
     # ------------------------------------------------------------------
     def _on_rating(self, song: Song, star_widget: "StarRatingWidget", new_rating: int):
         item = self.row_items.get(song.id)
-
-        # Block watcher to prevent intermediate rescan
-        self._suppress_rescan = True; self.watcher.blockSignals(True)
-        self.table.setSortingEnabled(False)
+        self._suppress_rescan = True
 
         if not write_rating(song.path, new_rating):
-            self._show_toast(
-                f"Could not write rating into '{song.path.name}' — format may not support it.",
-                5000, "error")
-            self.table.setSortingEnabled(True)
+            self._show_toast("Could not write rating.", 3000, "error")
+            self._suppress_rescan = False
             return
+
         song.rating = new_rating
         self._sync_cache(song)
 
-        # Update hidden sort item for rating column
         if item:
             rat_sort = self.table.item(item.row(), COL_RATING)
             if isinstance(rat_sort, _InvisibleSortItem):
                 rat_sort.set_sort_key(new_rating)
+            self.table.setRowHidden(item.row(), not self._matches(song))
+            self.table.selectRow(item.row())
 
-        # Auto re-lock the rating pen after saving
         lock: LockButton = star_widget.property("lock_ref")
-        if lock:
-            lock.set_locked(True)
+        if lock: lock.set_locked(True)
         star_widget.set_editable(False)
 
-        # Re-evaluate row visibility (rating filter may now hide/show this song)
-        if item:
-            self.table.setRowHidden(item.row(), not self._matches(song))
-
-        # Re-enable sorting and unblock watcher
-        self.table.setSortingEnabled(True)
-        self._suppress_rescan = False; self.watcher.blockSignals(False)
+        self._suppress_rescan = False
         self._rescan_timer.stop()
 
-        # Restore selection to the same song row
-        if item:
-            actual_row = item.row()
-            self.table.selectRow(actual_row)
-            self.table.scrollTo(self.table.model().index(actual_row, COL_ARTIST))
-
-        # Inline toast — rating saved directly into the file
         stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
-        if new_rating == 0:
-            self._show_toast(f"Rating cleared  \u2014  {song.title}", 3000, "info")
-        else:
-            self._show_toast(
-                f"\u2713  Rating saved into file:  {song.title}   {stars}  ({new_rating}/5)",
-                3500, "success")
-            self._log_change("RATING", song.title, f"{new_rating}/5")
+        self._log_change("RATING", song.title, f"{new_rating}/5")
+        self._show_toast(
+            f"\u2713  Rating {stars} ({new_rating}/5) \u2014 {song.title}", 2500, "success")
 
 
 # ============================================================================
