@@ -512,6 +512,276 @@ class ScanWorker(QThread):
 
 
 # ============================================================================
+# Global hotkey listener  (works even when app is in background)
+# ============================================================================
+class GlobalHotkeyListener(QObject):
+    """Listens for Ctrl+W+<key> globally using pynput.
+    Works when other apps (Word, Chrome, etc.) have focus."""
+
+    commandReceived = Signal(int)  # emits Qt.Key_* code
+
+    _PYNPUT_TO_QT = {}  # populated at start()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._ctrl_held = False
+        self._w_held = False
+        self._listener = None
+        self._available = False
+
+    def start(self):
+        try:
+            from pynput import keyboard as _kb
+            self._kb = _kb
+
+            # Build key map
+            self._PYNPUT_TO_QT = {
+                _kb.Key.space: Qt.Key_Space,
+                _kb.Key.left:  Qt.Key_Left,
+                _kb.Key.right: Qt.Key_Right,
+                _kb.Key.up:    Qt.Key_Up,
+                _kb.Key.down:  Qt.Key_Down,
+                _kb.Key.media_play_pause: Qt.Key_Space,  # treat as Space
+                _kb.Key.media_next:       Qt.Key_N,
+                _kb.Key.media_previous:   Qt.Key_P,
+                _kb.Key.media_volume_up:   Qt.Key_Up,
+                _kb.Key.media_volume_down: Qt.Key_Down,
+                _kb.Key.media_volume_mute: Qt.Key_M,
+            }
+            # letter/digit keys added dynamically in _on_press
+
+            self._listener = _kb.Listener(
+                on_press=self._on_press,
+                on_release=self._on_release)
+            self._listener.daemon = True
+            self._listener.start()
+            self._available = True
+        except Exception:
+            self._available = False
+
+    def stop(self):
+        if self._listener:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def _on_press(self, key):
+        try:
+            _kb = self._kb
+            # Track Ctrl
+            if key in (_kb.Key.ctrl_l, _kb.Key.ctrl_r, _kb.Key.ctrl):
+                self._ctrl_held = True
+                return
+            # Track W
+            if hasattr(key, 'char') and key.char and key.char.lower() == 'w':
+                self._w_held = True
+                return
+            if hasattr(key, 'vk') and key.vk == 87:  # VK_W
+                self._w_held = True
+                return
+
+            # If Ctrl+W held → emit command
+            if self._ctrl_held and self._w_held:
+                qt_key = self._map_key(key)
+                if qt_key is not None:
+                    self.commandReceived.emit(qt_key)
+        except Exception:
+            pass
+
+    def _on_release(self, key):
+        try:
+            _kb = self._kb
+            if key in (_kb.Key.ctrl_l, _kb.Key.ctrl_r, _kb.Key.ctrl):
+                self._ctrl_held = False
+            if hasattr(key, 'char') and key.char and key.char.lower() == 'w':
+                self._w_held = False
+            if hasattr(key, 'vk') and key.vk == 87:
+                self._w_held = False
+        except Exception:
+            pass
+
+    def _map_key(self, key) -> Optional[int]:
+        # Check special keys
+        qt = self._PYNPUT_TO_QT.get(key)
+        if qt is not None:
+            return qt
+        # Check character keys (digits, letters)
+        ch = getattr(key, 'char', None)
+        if ch is None and hasattr(key, 'vk'):
+            vk = key.vk
+            if 48 <= vk <= 57:  # 0-9
+                return Qt.Key_0 + (vk - 48)
+            if 65 <= vk <= 90:  # A-Z
+                return Qt.Key_A + (vk - 65)
+            return None
+        if ch is not None:
+            c = ch.lower()
+            if '0' <= c <= '9':
+                return Qt.Key_0 + (ord(c) - ord('0'))
+            if 'a' <= c <= 'z':
+                return Qt.Key_A + (ord(c) - ord('a'))
+        return None
+
+
+# ============================================================================
+# Background task worker  (non-blocking file I/O with interrupts)
+# ============================================================================
+class TaskWorker(QThread):
+    """Processes file-I/O tasks (move, rename, rating) in background.
+
+    UI never freezes — tasks run on this thread.  When the user
+    interacts with the GUI, tasks can be interrupted and resumed.
+    Unfinished tasks are saved to disk on app exit and resumed on
+    next launch.
+    """
+
+    taskDone   = Signal(str, object)   # (task_id, result_dict)
+    taskFailed = Signal(str, str)      # (task_id, error_msg)
+    queueEmpty = Signal()
+    progressUpdate = Signal(int, int)  # (done, total)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._queue: List[dict] = []
+        self._lock = threading.Lock()
+        self._running = True
+        self._wake = threading.Event()
+        self._interrupted = threading.Event()
+
+    # ── Public API (called from main thread) ──────────────────────
+    def add_task(self, task: dict, priority: bool = False):
+        """Add a task dict to the queue.
+
+        task keys:
+            id       – unique string
+            action   – "MOVE" | "RENAME" | "RATING" | "DELETE"
+            song_id  – Song.id
+            ...action-specific keys...
+        """
+        with self._lock:
+            if priority:
+                self._queue.insert(0, task)
+            else:
+                self._queue.append(task)
+        self._wake.set()
+
+    def interrupt(self):
+        """Signal current task to pause (for UI priority)."""
+        self._interrupted.set()
+
+    def resume(self):
+        """Resume after interrupt."""
+        self._interrupted.clear()
+        self._wake.set()
+
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._queue)
+
+    def pending_tasks(self) -> list:
+        with self._lock:
+            return list(self._queue)
+
+    def stop(self):
+        self._running = False
+        self._wake.set()
+        self.wait(5000)
+
+    def get_serializable_queue(self) -> list:
+        """Return queue as JSON-serializable list for persistence."""
+        with self._lock:
+            safe = []
+            for t in self._queue:
+                st = {k: (str(v) if isinstance(v, Path) else v)
+                      for k, v in t.items()
+                      if k != '_song_ref'}  # exclude live object refs
+                safe.append(st)
+            return safe
+
+    # ── Thread loop ───────────────────────────────────────────────
+    def run(self):
+        while self._running:
+            self._wake.wait(timeout=1.0)
+            self._wake.clear()
+
+            while self._running:
+                # If interrupted, wait until resumed
+                if self._interrupted.is_set():
+                    self._interrupted.wait()
+                    if not self._running:
+                        break
+
+                with self._lock:
+                    if not self._queue:
+                        break
+                    task = self._queue.pop(0)
+
+                remaining = self.pending_count()
+                total = remaining + 1
+                self.progressUpdate.emit(total - remaining, total)
+
+                try:
+                    result = self._execute(task)
+                    self.taskDone.emit(task.get('id', ''), result)
+                except Exception as e:
+                    self.taskFailed.emit(
+                        task.get('id', ''), str(e))
+
+            self.queueEmpty.emit()
+
+    def _execute(self, task: dict) -> dict:
+        """Execute a single task (runs on worker thread)."""
+        action = task.get('action', '')
+
+        if action == 'MOVE':
+            src = Path(task['src_path'])
+            root = Path(task['root'])
+            target_cat = task['target_cat']
+            if not src.is_file():
+                return {'action': 'MOVE', 'error': 'source gone',
+                        'song_id': task.get('song_id')}
+            new_path = safe_move_song(
+                type('S', (), {'path': src, 'id': task.get('song_id')})(),
+                root, target_cat)
+            return {'action': 'MOVE', 'song_id': task.get('song_id'),
+                    'new_path': str(new_path), 'old_path': str(src),
+                    'new_cat': target_cat, 'old_cat': task.get('old_cat', ''),
+                    'title': task.get('title', '')}
+
+        if action == 'RENAME':
+            src = Path(task['src_path'])
+            new_title = task['new_title']
+            artist = task.get('artist', '')
+            ok, new_path = write_display_tags(src, new_title, artist)
+            if not ok:
+                raise RuntimeError(f"Could not rename {src.name}")
+            return {'action': 'RENAME', 'song_id': task.get('song_id'),
+                    'new_path': str(new_path), 'old_path': str(src),
+                    'new_title': new_title,
+                    'old_title': task.get('old_title', '')}
+
+        if action == 'RATING':
+            path = Path(task['path'])
+            rating = int(task['rating'])
+            write_rating(path, rating)
+            return {'action': 'RATING', 'song_id': task.get('song_id'),
+                    'path': str(path), 'rating': rating}
+
+        if action == 'DELETE':
+            path = Path(task['path'])
+            if path.is_file():
+                os.remove(path)
+            return {'action': 'DELETE', 'song_id': task.get('song_id'),
+                    'path': str(path), 'title': task.get('title', '')}
+
+        return {'action': action, 'error': 'unknown action'}
+
+
+# ============================================================================
 # Player
 # ============================================================================
 class RepeatMode(Enum):
@@ -1335,6 +1605,16 @@ class MainWindow(QMainWindow):
         self._connect_player()
         self._setup_shortcuts()
 
+        # ── Background task worker (non-blocking file I/O) ────────
+        self._task_worker = TaskWorker(self)
+        self._task_worker.taskDone.connect(self._on_task_done)
+        self._task_worker.taskFailed.connect(self._on_task_failed)
+        self._task_worker.queueEmpty.connect(self._on_queue_empty)
+        self._task_worker.start()
+
+        # ── Load unfinished tasks from last session ───────────────
+        self._load_pending_queue()
+
         # FIX: Restore last opened folder on startup ──────────────────
         # (was previously in _shortcut_rating — wrong place)
         last = self.settings.value("root_path", "")
@@ -1362,6 +1642,19 @@ class MainWindow(QMainWindow):
         # (table, search box, combo box) has focus.  Shortcuts work
         # INSTANTLY from the moment the app launches.
         QApplication.instance().installEventFilter(self)
+
+        # ── Global hotkey listener (works in background) ──────────
+        # Uses pynput to capture Ctrl+W+<key> even when other apps
+        # (Word, Chrome, Gmail) have focus.  Falls back gracefully
+        # if pynput is not installed.
+        self._global_hotkeys = GlobalHotkeyListener(self)
+        self._global_hotkeys.commandReceived.connect(
+            self._on_global_hotkey)
+        self._global_hotkeys.start()
+
+        if not self._global_hotkeys.is_available():
+            print("INFO: pynput not installed — global hotkeys disabled.\n"
+                  "      Install with: pip install pynput")
 
     def eventFilter(self, obj, event):
         """App-wide keyboard handler — shortcuts work everywhere."""
@@ -1484,6 +1777,159 @@ class MainWindow(QMainWindow):
             return True
 
         return False  # key not handled
+
+    def _on_global_hotkey(self, qt_key: int):
+        """Called from pynput background thread via signal — runs on
+        main thread.  Handles the command even when app is in background."""
+        self._handle_command_key(qt_key)
+
+    # ------------------------------------------------------------------
+    # Background task worker callbacks
+    # ------------------------------------------------------------------
+    def _on_task_done(self, task_id: str, result: dict):
+        """Called on main thread when a background task completes."""
+        action = result.get('action', '')
+        song_id = result.get('song_id', '')
+        song = self.songs_by_id.get(song_id)
+
+        if action == 'MOVE' and song:
+            new_path = Path(result['new_path'])
+            old_path_str = result.get('old_path', '')
+            new_cat = result.get('new_cat', '')
+            song.path = new_path
+            song.category = new_cat
+            self.cache.pop(old_path_str, None)
+            self._sync_cache(song)
+            item = self.row_items.get(song.id)
+            if item:
+                combo = self.table.cellWidget(item.row(), COL_CATEGORY)
+                if combo:
+                    combo.blockSignals(True)
+                    combo.setCurrentText(new_cat)
+                    combo.blockSignals(False)
+                cat_sort = self.table.item(item.row(), COL_CATEGORY)
+                if cat_sort:
+                    cat_sort.setText(new_cat)
+                lock = combo.property("lock_ref") if combo else None
+                if lock:
+                    lock.setEnabled(True)
+                    lock.set_locked(True)
+                self.table.setRowHidden(item.row(), not self._matches(song))
+            self._log_change("MOVE", result.get('title', song.title),
+                             f"{result.get('old_cat','')} \u2192 {new_cat}")
+            self._show_toast(
+                f"\u2713  '{song.title}'  moved \u2192 {new_cat}", 3000, "success")
+
+        elif action == 'RENAME' and song:
+            new_path = Path(result['new_path'])
+            old_path_str = result.get('old_path', '')
+            new_title = result.get('new_title', '')
+            self.cache.pop(old_path_str, None)
+            song.path = new_path
+            song.title = new_title
+            self.player.notify_song_path_changed(song, new_path)
+            self._sync_cache(song)
+            item = self.row_items.get(song.id)
+            if item:
+                a, s = _split_title(new_title)
+                item.setText(a)
+                sn = self.table.item(item.row(), COL_SONGNAME)
+                if sn:
+                    sn.setText(s)
+                lock_w = self.table.cellWidget(item.row(), COL_NAME_EDIT)
+                if lock_w:
+                    lk = lock_w.findChild(LockButton)
+                    if lk:
+                        lk.setEnabled(True)
+                        lk.set_locked(True)
+            self._log_change("RENAME", new_title,
+                             f"was: {result.get('old_title','')}")
+            self._show_toast(f'\u2713  Renamed: "{new_title}"', 3000, "success")
+
+        elif action == 'RATING':
+            pass  # rating already updated in UI before queueing
+
+        elif action == 'DELETE' and song:
+            self.cache.pop(result.get('path', ''), None)
+            item = self.row_items.pop(song.id, None)
+            self.songs_by_id.pop(song.id, None)
+            if item:
+                self.table.removeRow(item.row())
+            self._update_queue_numbers()
+            self._rebuild_play_queue()
+            self._log_change("DEL", result.get('title', ''), result.get('path', ''))
+            self._show_toast(
+                f"\u2713  Deleted: {result.get('title','')}", 3000, "success")
+
+        self._suppress_rescan = True
+        QTimer.singleShot(2500, lambda: setattr(self, '_suppress_rescan', False))
+        self._rescan_timer.stop()
+        self._update_pending_btn()
+        self._save_pending_queue()
+
+    def _on_task_failed(self, task_id: str, error: str):
+        self._show_toast(f"Task failed: {error}", 5000, "error")
+        self._update_pending_btn()
+        self._save_pending_queue()
+
+    def _on_queue_empty(self):
+        self._update_pending_btn()
+        self._save_pending_queue()
+        if self.root_path:
+            save_cache(self.root_path, self.cache)
+
+    # ------------------------------------------------------------------
+    # Queue persistence  (save on exit, resume on next launch)
+    # ------------------------------------------------------------------
+    def _queue_file_path(self) -> Path:
+        base = QStandardPaths.writableLocation(
+            QStandardPaths.AppDataLocation)
+        if not base:
+            base = str(Path.home() / ".music_library_app")
+        bp = Path(base)
+        bp.mkdir(parents=True, exist_ok=True)
+        return bp / "pending_queue.json"
+
+    def _save_pending_queue(self):
+        """Save unfinished tasks to disk so they survive app restart."""
+        try:
+            data = self._task_worker.get_serializable_queue()
+            with open(self._queue_file_path(), 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    def _load_pending_queue(self):
+        """Load and resume unfinished tasks from last session."""
+        qf = self._queue_file_path()
+        if not qf.is_file():
+            return
+        try:
+            with open(qf, 'r', encoding='utf-8') as f:
+                tasks = json.load(f)
+            if tasks:
+                for t in tasks:
+                    self._task_worker.add_task(t)
+                self._show_toast(
+                    f"\u23f3  Resuming {len(tasks)} pending task(s) from last session",
+                    4000, "warning")
+            # Clear the file after loading
+            qf.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        """Save pending work and stop workers cleanly on exit."""
+        # Save any remaining tasks
+        self._save_pending_queue()
+        # Stop workers
+        self._task_worker.stop()
+        if hasattr(self, '_global_hotkeys'):
+            self._global_hotkeys.stop()
+        # Save cache
+        if self.root_path:
+            save_cache(self.root_path, self.cache)
+        event.accept()
 
     def _shortcut_play_pause(self):
         if self.player.current_song() is None:
@@ -2598,7 +3044,9 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _update_pending_btn(self):
-        n = len(self._pending_changes)
+        n_pending = len(self._pending_changes)
+        n_bg = self._task_worker.pending_count() if hasattr(self, '_task_worker') else 0
+        n = n_pending + n_bg
         self.pending_btn.setText(f"Queue ({n})")
         if n > 0:
             self.pending_btn.setStyleSheet(
@@ -2612,14 +3060,35 @@ class MainWindow(QMainWindow):
         icons = {
             "MOVE":   ("\u27a1", "#0a84ff"),
             "RENAME": ("\u270f", "#FF9F0A"),
+            "RATING": ("\u2b50", "#FFD60A"),
+            "DELETE": ("\u274c", "#FF453A"),
         }
 
+        bg_tasks = self._task_worker.pending_tasks() if hasattr(self, '_task_worker') else []
+        total = len(self._pending_changes) + len(bg_tasks)
+
         html = "<div style='font-family:SF Mono,Consolas,monospace;font-size:12px;'>"
-        if not self._pending_changes:
-            html += "<p style='color:#8e8e93;'>No pending changes in queue.</p>"
-        else:
+
+        # Background worker queue
+        if bg_tasks:
+            html += (f"<p style='color:#0a84ff;font-weight:700;'>"
+                     f"\u2699 {len(bg_tasks)} background task(s) running</p>")
+            for t in bg_tasks:
+                action = t.get('action', '?')
+                icon, color = icons.get(action, ("\u2022", "#8e8e93"))
+                title = t.get('title', t.get('new_title', '?'))
+                detail = t.get('target_cat', t.get('new_title', ''))
+                html += (f"<p style='margin:4px 0;'>"
+                         f"<span style='color:{color};font-size:14px;'>{icon}</span>"
+                         f"&nbsp;&nbsp;&nbsp;"
+                         f"<span style='color:#f2f2f7;font-weight:600;'>{title}</span> "
+                         f"<span style='color:#8e8e93;'>\u2014 {action}: {detail}</span></p>")
+            html += "<hr style='border-color:#3a3a3c;'>"
+
+        # Inline pending (waiting for song to finish playing)
+        if self._pending_changes:
             html += (f"<p style='color:#FF9F0A;font-weight:700;'>"
-                     f"\u23f3 {len(self._pending_changes)} pending change(s)</p><br>")
+                     f"\u23f3 {len(self._pending_changes)} waiting for playback</p>")
             for action, song, detail in self._pending_changes:
                 icon, color = icons.get(action, ("\u2022", "#8e8e93"))
                 html += (f"<p style='margin:4px 0;'>"
@@ -2627,11 +3096,15 @@ class MainWindow(QMainWindow):
                          f"&nbsp;&nbsp;&nbsp;"
                          f"<span style='color:#f2f2f7;font-weight:600;'>{song.title}</span> "
                          f"<span style='color:#8e8e93;'>\u2014 {action}: {detail}</span></p>")
+
+        if not bg_tasks and not self._pending_changes:
+            html += "<p style='color:#30D158;'>\u2713  All tasks complete — queue is empty.</p>"
+
         html += "</div>"
 
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Pending Queue ({len(self._pending_changes)})")
-        dlg.setFixedSize(600, 300)
+        dlg.setWindowTitle(f"Pending Queue ({total})")
+        dlg.setFixedSize(650, 350)
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(12, 12, 12, 12)
 
@@ -3122,57 +3595,32 @@ class MainWindow(QMainWindow):
         if not songs:
             return
 
-        self._suppress_rescan = True; self.watcher.blockSignals(True)
-        self._rescan_timer.stop()
-        self.table.setSortingEnabled(False)
-        self._set_info(f"Moving {len(songs)} files to '{new_cat}'\u2026", "loading", auto_reset=False)
-
-        moved = 0
-        for i, song in enumerate(songs):
+        # Queue all moves in background — UI stays responsive
+        self._suppress_rescan = True
+        queued = 0
+        for song in songs:
             if song.category == new_cat:
                 continue
             if self.player.current_song() is song and self.player.is_playing():
                 continue
-            old_path_str = str(song.path)
-            try:
-                new_path = safe_move_song(song, self.root_path, new_cat)
-            except SafeMoveError:
-                continue
-            song.path = new_path
-            song.category = new_cat
-            self.player.notify_song_path_changed(song, new_path)
-            self.cache.pop(old_path_str, None)
-            try:
-                st = new_path.stat()
-                self.cache[str(new_path)] = {
-                    "size": st.st_size, "mtime": st.st_mtime,
-                    "title": song.title, "artist": song.artist,
-                    "rating": song.rating, "duration": song.duration,
-                    "id": song.id}
-            except OSError:
-                pass
-            item = self.row_items.get(song.id)
-            if item:
-                combo = self.table.cellWidget(item.row(), COL_CATEGORY)
-                if combo:
-                    combo.blockSignals(True)
-                    combo.setCurrentText(new_cat)
-                    combo.blockSignals(False)
-            moved += 1
-            if (i + 1) % 30 == 0:
-                QApplication.processEvents()
+            task_id = f"bulkmove_{song.id}_{uuid.uuid4().hex[:8]}"
+            self._task_worker.add_task({
+                'id': task_id,
+                'action': 'MOVE',
+                'song_id': song.id,
+                'src_path': str(song.path),
+                'root': str(self.root_path),
+                'target_cat': new_cat,
+                'old_cat': song.category,
+                'title': song.title,
+            })
+            queued += 1
 
-        if self.root_path:
-            save_cache(self.root_path, self.cache)
-
-        self.table.setSortingEnabled(True)
         self.bulk_cat_combo.setCurrentIndex(0)
-        self._update_queue_numbers()
-        self._suppress_rescan = False; self.watcher.blockSignals(False)
-        self._rescan_timer.stop()
-        self._set_info(
-            f"\u2713  {moved} songs moved to '{new_cat}'",
-            "success", duration_ms=3500)
+        self._update_pending_btn()
+        self._show_toast(
+            f"\u23f3  {queued} songs queued for move \u2192 '{new_cat}'",
+            3000, "info")
 
     def _on_bulk_rating(self, idx: int):
         if idx <= 0:
@@ -3451,40 +3899,27 @@ class MainWindow(QMainWindow):
             combo.blockSignals(False)
             return
 
-        self._suppress_rescan = True
+        # Queue the move in background — UI stays responsive
         old_cat = song.category
-        old_path_str = str(song.path)
-
-        try:
-            new_path = safe_move_song(song, self.root_path, new_cat)
-        except SafeMoveError as e:
-            self._show_toast(f"Move failed: {e}", 5000, "error")
-            combo.blockSignals(True)
-            combo.setCurrentText(old_cat)
-            combo.blockSignals(False)
-            self._suppress_rescan = False
-            return
-
-        song.path = new_path
-        song.category = new_cat
-        self.cache.pop(old_path_str, None)
-        self._sync_cache(song)
-
-        item = self.row_items.get(song.id)
-        if item:
-            cat_sort = self.table.item(item.row(), COL_CATEGORY)
-            if cat_sort: cat_sort.setText(new_cat)
-            self.table.setRowHidden(item.row(), not self._matches(song))
-
+        self._suppress_rescan = True
         lock: LockButton = combo.property("lock_ref")
         if lock: lock.set_locked(True)
         combo.setEnabled(False)
 
-        self._suppress_rescan = False
-        self._rescan_timer.stop()
-        self._log_change("MOVE", song.title, f"{old_cat} \u2192 {new_cat}")
+        task_id = f"move_{song.id}_{uuid.uuid4().hex[:8]}"
+        self._task_worker.add_task({
+            'id': task_id,
+            'action': 'MOVE',
+            'song_id': song.id,
+            'src_path': str(song.path),
+            'root': str(self.root_path),
+            'target_cat': new_cat,
+            'old_cat': old_cat,
+            'title': song.title,
+        })
+        self._update_pending_btn()
         self._show_toast(
-            f"\u2713  '{song.title}'  moved: {old_cat} \u2192 {new_cat}", 3000, "success")
+            f"\u23f3  Moving '{song.title}' \u2192 {new_cat}\u2026", 2000, "info")
 
     # ------------------------------------------------------------------
     # Rating change
