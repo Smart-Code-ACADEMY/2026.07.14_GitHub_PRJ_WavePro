@@ -622,13 +622,25 @@ class GlobalHotkeyListener(QObject):
                 self._caps_held = True
                 return
 
-            # If Ctrl+CapsLock held → emit command
+            # Ctrl+Space → Play / Pause
+            if self._ctrl_held and key == _kb.Key.space:
+                self.commandReceived.emit(Qt.Key_Space, self._shift_held)
+                return
+
+            # Keep the other Ctrl+CapsLock shortcuts unchanged
             if self._ctrl_held and self._caps_held:
                 qt_key = self._map_key(key)
                 if qt_key is not None:
                     self.commandReceived.emit(qt_key, self._shift_held)
-        except Exception:
-            pass
+
+            # Other shortcuts still use Ctrl+CapsLock
+            if self._ctrl_held and self._caps_held:
+                qt_key = self._map_key(key)
+                if qt_key is not None:
+                    self.commandReceived.emit(qt_key, self._shift_held)
+
+        except Exception as e:
+            print(f"Global hotkey error: {e}")
 
     def _on_release(self, key):
         try:
@@ -1575,8 +1587,8 @@ ROW_HEIGHT = 38
 # shown in the info bar)
 # ============================================================================
 SHORTCUTS_HELP = """
-─────────── KEYBOARD SHORTCUTS (Ctrl+CapsLock prefix) ───────────
-  Ctrl+CapsLock + P              →  Play / Pause
+──────────────────────── KEYBOARD SHORTCUTS ─────────────────────
+  Ctrl+Space                     →  Play / Pause
   Ctrl+CapsLock + MediaNext      →  Next song
   Ctrl+CapsLock + MediaPrev      →  Previous song
   Ctrl+CapsLock + →              →  Seek forward  (5s → 30s accel.)
@@ -1709,6 +1721,11 @@ class MainWindow(QMainWindow):
             key = event.key()
             mods = event.modifiers()
 
+            # Ctrl+Space → Play / Pause
+            if key == Qt.Key_Space and (mods & Qt.ControlModifier):
+                if self._handle_command_key(Qt.Key_Space):
+                    return True
+
             # Track Caps Lock press (ignore auto-repeat)
             if key == Qt.Key_CapsLock and not event.isAutoRepeat():
                 self._caps_held = True
@@ -1795,8 +1812,8 @@ class MainWindow(QMainWindow):
                 self._show_toast("No song playing.", 1000, "warning")
             return True
 
-        # ── Play / Pause  (letter P) ──────────────────────────────
-        if key == Qt.Key_P:
+        # ── Play / Pause  (Ctrl+Space) ────────────────────────────
+        if key == Qt.Key_Space:
             self._shortcut_play_pause()
             return True
 
