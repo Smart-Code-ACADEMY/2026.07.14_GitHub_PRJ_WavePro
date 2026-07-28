@@ -5,11 +5,26 @@ Music Library App
 Single-file, modern dark-mode (Apple-style) music library + player.
 
 Run:
-    pip install PySide6 mutagen
+    pip install PySide6 mutagen pynput
     python music_app.py
 
 Build .exe:
     pyinstaller --onefile --windowed music_app.py
+
+────────────────────────────────────────────────────────────────────────
+KEYBOARD SHORTCUTS  (all use Ctrl+Q as prefix — works in background)
+────────────────────────────────────────────────────────────────────────
+  Ctrl+Q + Space         Play / Pause
+  Ctrl+Q + N             Next song
+  Ctrl+Q + P             Previous song
+  Ctrl+Q + →             Seek forward (accelerating 5s → 30s)
+  Ctrl+Q + ←             Seek backward (accelerating 5s → 30s)
+  Ctrl+Q + ↑             Volume up (+5)
+  Ctrl+Q + ↓             Volume down (−5)
+  Ctrl+Q + M             Mute / Unmute
+  Ctrl+Q + 0..5          Rate current song 0–5 stars
+  Ctrl+Q + Shift + T     Open "Add To-Do" dialog
+────────────────────────────────────────────────────────────────────────
 """
 
 import hashlib
@@ -515,19 +530,25 @@ class ScanWorker(QThread):
 # Global hotkey listener  (works even when app is in background)
 # ============================================================================
 class GlobalHotkeyListener(QObject):
-    """Listens for Ctrl+W+<key> globally using pynput.
-    Works when other apps (Word, Chrome, etc.) have focus."""
+    """Listens for Ctrl+Q+<key> globally using pynput.
+    Works when other apps (Word, Chrome, etc.) have focus.
 
-    commandReceived = Signal(int)  # emits Qt.Key_* code
+    Prefix changed from Ctrl+W to Ctrl+Q to avoid conflict with the
+    universal "close tab / close window" shortcut.
+    """
+
+    # Signal emits (qt_key_code, shift_held)
+    commandReceived = Signal(int, bool)
 
     _PYNPUT_TO_QT = {}  # populated at start()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._ctrl_held = False
-        self._w_held = False
-        self._listener = None
-        self._available = False
+        self._ctrl_held  = False
+        self._q_held     = False
+        self._shift_held = False
+        self._listener   = None
+        self._available  = False
 
     def start(self):
         try:
@@ -541,14 +562,14 @@ class GlobalHotkeyListener(QObject):
                 _kb.Key.right: Qt.Key_Right,
                 _kb.Key.up:    Qt.Key_Up,
                 _kb.Key.down:  Qt.Key_Down,
-                _kb.Key.media_play_pause: Qt.Key_Space,  # treat as Space
+                _kb.Key.media_play_pause: Qt.Key_Space,
                 _kb.Key.media_next:       Qt.Key_N,
                 _kb.Key.media_previous:   Qt.Key_P,
                 _kb.Key.media_volume_up:   Qt.Key_Up,
                 _kb.Key.media_volume_down: Qt.Key_Down,
                 _kb.Key.media_volume_mute: Qt.Key_M,
             }
-            # letter/digit keys added dynamically in _on_press
+            # letter/digit keys handled dynamically in _map_key
 
             self._listener = _kb.Listener(
                 on_press=self._on_press,
@@ -556,7 +577,8 @@ class GlobalHotkeyListener(QObject):
             self._listener.daemon = True
             self._listener.start()
             self._available = True
-        except Exception:
+        except Exception as e:
+            print(f"WARN: Global hotkeys unavailable: {e}")
             self._available = False
 
     def stop(self):
@@ -576,19 +598,23 @@ class GlobalHotkeyListener(QObject):
             if key in (_kb.Key.ctrl_l, _kb.Key.ctrl_r, _kb.Key.ctrl):
                 self._ctrl_held = True
                 return
-            # Track W
-            if hasattr(key, 'char') and key.char and key.char.lower() == 'w':
-                self._w_held = True
+            # Track Shift
+            if key in (_kb.Key.shift, _kb.Key.shift_l, _kb.Key.shift_r):
+                self._shift_held = True
                 return
-            if hasattr(key, 'vk') and key.vk == 87:  # VK_W
-                self._w_held = True
+            # Track Q
+            if hasattr(key, 'char') and key.char and key.char.lower() == 'q':
+                self._q_held = True
+                return
+            if hasattr(key, 'vk') and key.vk == 81:  # VK_Q
+                self._q_held = True
                 return
 
-            # If Ctrl+W held → emit command
-            if self._ctrl_held and self._w_held:
+            # If Ctrl+Q held → emit command
+            if self._ctrl_held and self._q_held:
                 qt_key = self._map_key(key)
                 if qt_key is not None:
-                    self.commandReceived.emit(qt_key)
+                    self.commandReceived.emit(qt_key, self._shift_held)
         except Exception:
             pass
 
@@ -597,19 +623,19 @@ class GlobalHotkeyListener(QObject):
             _kb = self._kb
             if key in (_kb.Key.ctrl_l, _kb.Key.ctrl_r, _kb.Key.ctrl):
                 self._ctrl_held = False
-            if hasattr(key, 'char') and key.char and key.char.lower() == 'w':
-                self._w_held = False
-            if hasattr(key, 'vk') and key.vk == 87:
-                self._w_held = False
+            if key in (_kb.Key.shift, _kb.Key.shift_l, _kb.Key.shift_r):
+                self._shift_held = False
+            if hasattr(key, 'char') and key.char and key.char.lower() == 'q':
+                self._q_held = False
+            if hasattr(key, 'vk') and key.vk == 81:
+                self._q_held = False
         except Exception:
             pass
 
     def _map_key(self, key) -> Optional[int]:
-        # Check special keys
         qt = self._PYNPUT_TO_QT.get(key)
         if qt is not None:
             return qt
-        # Check character keys (digits, letters)
         ch = getattr(key, 'char', None)
         if ch is None and hasattr(key, 'vk'):
             vk = key.vk
@@ -631,18 +657,10 @@ class GlobalHotkeyListener(QObject):
 # Background task worker  (non-blocking file I/O with interrupts)
 # ============================================================================
 class TaskWorker(QThread):
-    """Processes file-I/O tasks (move, rename, rating) in background.
-
-    UI never freezes — tasks run on this thread.  When the user
-    interacts with the GUI, tasks can be interrupted and resumed.
-    Unfinished tasks are saved to disk on app exit and resumed on
-    next launch.
-    """
-
-    taskDone   = Signal(str, object)   # (task_id, result_dict)
-    taskFailed = Signal(str, str)      # (task_id, error_msg)
+    taskDone   = Signal(str, object)
+    taskFailed = Signal(str, str)
     queueEmpty = Signal()
-    progressUpdate = Signal(int, int)  # (done, total)
+    progressUpdate = Signal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -652,16 +670,7 @@ class TaskWorker(QThread):
         self._wake = threading.Event()
         self._interrupted = threading.Event()
 
-    # ── Public API (called from main thread) ──────────────────────
     def add_task(self, task: dict, priority: bool = False):
-        """Add a task dict to the queue.
-
-        task keys:
-            id       – unique string
-            action   – "MOVE" | "RENAME" | "RATING" | "DELETE"
-            song_id  – Song.id
-            ...action-specific keys...
-        """
         with self._lock:
             if priority:
                 self._queue.insert(0, task)
@@ -670,11 +679,9 @@ class TaskWorker(QThread):
         self._wake.set()
 
     def interrupt(self):
-        """Signal current task to pause (for UI priority)."""
         self._interrupted.set()
 
     def resume(self):
-        """Resume after interrupt."""
         self._interrupted.clear()
         self._wake.set()
 
@@ -692,24 +699,21 @@ class TaskWorker(QThread):
         self.wait(5000)
 
     def get_serializable_queue(self) -> list:
-        """Return queue as JSON-serializable list for persistence."""
         with self._lock:
             safe = []
             for t in self._queue:
                 st = {k: (str(v) if isinstance(v, Path) else v)
                       for k, v in t.items()
-                      if k != '_song_ref'}  # exclude live object refs
+                      if k != '_song_ref'}
                 safe.append(st)
             return safe
 
-    # ── Thread loop ───────────────────────────────────────────────
     def run(self):
         while self._running:
             self._wake.wait(timeout=1.0)
             self._wake.clear()
 
             while self._running:
-                # If interrupted, wait until resumed
                 if self._interrupted.is_set():
                     self._interrupted.wait()
                     if not self._running:
@@ -734,7 +738,6 @@ class TaskWorker(QThread):
             self.queueEmpty.emit()
 
     def _execute(self, task: dict) -> dict:
-        """Execute a single task (runs on worker thread)."""
         action = task.get('action', '')
 
         if action == 'MOVE':
@@ -1558,6 +1561,27 @@ ROW_HEIGHT = 38
 
 
 # ============================================================================
+# Shortcut help text (single source of truth — printed at startup and
+# shown in the info bar)
+# ============================================================================
+SHORTCUTS_HELP = """
+──────────── KEYBOARD SHORTCUTS (Ctrl+Q prefix) ────────────
+  Ctrl+Q + Space       →  Play / Pause
+  Ctrl+Q + N           →  Next song
+  Ctrl+Q + P           →  Previous song
+  Ctrl+Q + →           →  Seek forward  (5s → 30s accelerating)
+  Ctrl+Q + ←           →  Seek backward (5s → 30s accelerating)
+  Ctrl+Q + ↑           →  Volume up (+5)
+  Ctrl+Q + ↓           →  Volume down (−5)
+  Ctrl+Q + M           →  Mute / Unmute
+  Ctrl+Q + 0..5        →  Rate current song 0–5 stars
+  Ctrl+Q + Shift + T   →  Open "Add To-Do" dialog
+────────────────────────────────────────────────────────────
+Works in background (any app in focus) when 'pynput' is installed.
+"""
+
+
+# ============================================================================
 # Main window
 # ============================================================================
 class MainWindow(QMainWindow):
@@ -1596,8 +1620,6 @@ class MainWindow(QMainWindow):
         self.watcher.fileChanged.connect(self._on_file_changed)
         self._rescan_timer = QTimer(self)
         self._rescan_timer.setSingleShot(True)
-        # FIX: Increased from 600ms to 1500ms to reduce false rescans
-        # from our own file writes (rating, rename, move)
         self._rescan_timer.setInterval(1500)
         self._rescan_timer.timeout.connect(self._start_scan)
 
@@ -1615,19 +1637,17 @@ class MainWindow(QMainWindow):
         # ── Load unfinished tasks from last session ───────────────
         self._load_pending_queue()
 
-        # FIX: Restore last opened folder on startup ──────────────────
-        # (was previously in _shortcut_rating — wrong place)
+        # Restore last opened folder on startup
         last = self.settings.value("root_path", "")
         if last and Path(last).is_dir():
             QTimer.singleShot(0, lambda p=Path(last): self._set_root(p))
 
     def _setup_shortcuts(self):
-        # ── Manual W-key tracking ─────────────────────────────────
-        # Qt modifiers only track Ctrl/Shift/Alt/Meta — NOT regular
-        # keys like W.  So when user holds Ctrl+W+Left, Qt only
-        # reports ControlModifier for the Left event.  We track W
-        # ourselves so Ctrl+W+<action> works reliably every time.
-        self._w_held = False
+        # ── Manual Q-key + Shift tracking ─────────────────────────
+        # Qt modifiers only track Ctrl/Shift/Alt/Meta natively.
+        # We track Q ourselves so Ctrl+Q+<action> works reliably,
+        # and use Qt's ShiftModifier for the Shift key.
+        self._q_held = False
 
         # Seek acceleration: repeated arrow presses skip further
         self._seek_accel_count = 0
@@ -1637,76 +1657,81 @@ class MainWindow(QMainWindow):
         self._seek_accel_timer.timeout.connect(
             lambda: setattr(self, '_seek_accel_count', 0))
 
-        # ── App-wide event filter ─────────────────────────────────
-        # Catches keyboard shortcuts regardless of which child widget
-        # (table, search box, combo box) has focus.  Shortcuts work
-        # INSTANTLY from the moment the app launches.
+        # ── App-wide event filter (works when app HAS focus) ─────
         QApplication.instance().installEventFilter(self)
 
-        # ── Global hotkey listener (works in background) ──────────
-        # Uses pynput to capture Ctrl+W+<key> even when other apps
-        # (Word, Chrome, Gmail) have focus.  Falls back gracefully
-        # if pynput is not installed.
+        # ── Global hotkey listener (works when app is in BG) ─────
         self._global_hotkeys = GlobalHotkeyListener(self)
         self._global_hotkeys.commandReceived.connect(
             self._on_global_hotkey)
         self._global_hotkeys.start()
 
+        # Print shortcut help
+        print(SHORTCUTS_HELP)
+
         if not self._global_hotkeys.is_available():
-            print("INFO: pynput not installed — global hotkeys disabled.\n"
-                  "      Install with: pip install pynput")
+            print("INFO: pynput not installed — global (background) hotkeys disabled.\n"
+                  "      Install with: pip install pynput\n"
+                  "      (In-app shortcuts still work when window is focused.)")
 
     def eventFilter(self, obj, event):
-        """App-wide keyboard handler — shortcuts work everywhere."""
+        """App-wide keyboard handler — works when window has focus."""
         from PySide6.QtCore import QEvent
 
         if event.type() == QEvent.KeyPress:
             key = event.key()
             mods = event.modifiers()
 
-            # Track W press (ignore auto-repeat)
-            if key == Qt.Key_W and not event.isAutoRepeat():
-                self._w_held = True
-                # If Ctrl is also held, consume the event so Ctrl+W
-                # doesn't leak to child widgets or the OS
+            # Track Q press (ignore auto-repeat)
+            if key == Qt.Key_Q and not event.isAutoRepeat():
+                self._q_held = True
                 if mods & Qt.ControlModifier:
-                    return True  # consumed
+                    return True  # consume Ctrl+Q itself
 
-            # ── Ctrl + W held + action key = command ──────────────
-            if (mods & Qt.ControlModifier) and self._w_held:
-                if key not in (Qt.Key_W, Qt.Key_Control):
-                    if self._handle_command_key(key):
-                        return True  # consumed
+            # Ctrl + Q held + action key = command
+            if (mods & Qt.ControlModifier) and self._q_held:
+                if key not in (Qt.Key_Q, Qt.Key_Control, Qt.Key_Shift):
+                    shift = bool(mods & Qt.ShiftModifier)
+                    if self._handle_command_key(key, shift):
+                        return True
 
         elif event.type() == QEvent.KeyRelease:
-            if event.key() == Qt.Key_W and not event.isAutoRepeat():
-                self._w_held = False
+            if event.key() == Qt.Key_Q and not event.isAutoRepeat():
+                self._q_held = False
                 self._seek_accel_count = 0
 
         return super().eventFilter(obj, event)
 
     def changeEvent(self, event):
-        """Reset W-key state when window loses focus (prevents stuck key)."""
+        """Reset Q-key state when window loses focus."""
         from PySide6.QtCore import QEvent
         if event.type() == QEvent.ActivationChange:
             if not self.isActiveWindow():
-                self._w_held = False
+                self._q_held = False
                 self._seek_accel_count = 0
         super().changeEvent(event)
 
     def _get_seek_step_ms(self) -> int:
-        """Accelerating seek: 5s → 7s → 9s → 12s → 16s → 20s → 25s → 30s max."""
+        """Accelerating seek: 5s → 7s → 9s → 12s → … → 30s max."""
         self._seek_accel_count += 1
-        self._seek_accel_timer.start()  # reset decay
+        self._seek_accel_timer.start()
         n = self._seek_accel_count
         if n <= 1:
             return 5000
         step = min(5000 + 2000 * (n - 1), 30000)
         return step
 
-    def _handle_command_key(self, key) -> bool:
-        """Process a key while Ctrl+W is held.
-        Returns True if the key was handled."""
+    def _handle_command_key(self, key, shift: bool = False) -> bool:
+        """Process a key while Ctrl+Q is held.
+        Returns True if handled."""
+
+        # ── Ctrl+Q+Shift+T → Add To-Do ───────────────────────────
+        if shift and key == Qt.Key_T:
+            # Bring window to front so dialog is visible
+            self.raise_()
+            self.activateWindow()
+            self._add_todo()
+            return True
 
         # ── Rating: 0–5 ───────────────────────────────────────────
         if Qt.Key_0 <= key <= Qt.Key_5:
@@ -1718,8 +1743,7 @@ class MainWindow(QMainWindow):
             if self.player.current_song():
                 step = self._get_seek_step_ms()
                 self.player.seek(self.player._player.position() + step)
-                self._show_toast(
-                    f"\u23e9  +{step // 1000}s", 800, "info")
+                self._show_toast(f"\u23e9  +{step // 1000}s", 800, "info")
             else:
                 self._show_toast("No song playing.", 1000, "warning")
             return True
@@ -1728,17 +1752,13 @@ class MainWindow(QMainWindow):
         if key == Qt.Key_Left:
             if self.player.current_song():
                 step = self._get_seek_step_ms()
-                self.player.seek(
-                    max(0, self.player._player.position() - step))
-                self._show_toast(
-                    f"\u23ea  -{step // 1000}s", 800, "info")
+                self.player.seek(max(0, self.player._player.position() - step))
+                self._show_toast(f"\u23ea  -{step // 1000}s", 800, "info")
             else:
                 self._show_toast("No song playing.", 1000, "warning")
             return True
 
-        # ── Play / Pause  (Ctrl+W+Space ONLY) ────────────────────
-        # Media keys (MediaPlay etc.) are NOT captured here because
-        # they conflict with the OS (open YouTube, Spotify, etc.)
+        # ── Play / Pause ──────────────────────────────────────────
         if key == Qt.Key_Space:
             self._shortcut_play_pause()
             return True
@@ -1776,18 +1796,17 @@ class MainWindow(QMainWindow):
                 0 if self.vol_slider.value() > 0 else 80)
             return True
 
-        return False  # key not handled
+        return False
 
-    def _on_global_hotkey(self, qt_key: int):
+    def _on_global_hotkey(self, qt_key: int, shift: bool):
         """Called from pynput background thread via signal — runs on
-        main thread.  Handles the command even when app is in background."""
-        self._handle_command_key(qt_key)
+        main thread. Handles command even when app is in background."""
+        self._handle_command_key(qt_key, shift)
 
     # ------------------------------------------------------------------
     # Background task worker callbacks
     # ------------------------------------------------------------------
     def _on_task_done(self, task_id: str, result: dict):
-        """Called on main thread when a background task completes."""
         action = result.get('action', '')
         song_id = result.get('song_id', '')
         song = self.songs_by_id.get(song_id)
@@ -1847,7 +1866,7 @@ class MainWindow(QMainWindow):
             self._show_toast(f'\u2713  Renamed: "{new_title}"', 3000, "success")
 
         elif action == 'RATING':
-            pass  # rating already updated in UI before queueing
+            pass
 
         elif action == 'DELETE' and song:
             self.cache.pop(result.get('path', ''), None)
@@ -1879,7 +1898,7 @@ class MainWindow(QMainWindow):
             save_cache(self.root_path, self.cache)
 
     # ------------------------------------------------------------------
-    # Queue persistence  (save on exit, resume on next launch)
+    # Queue persistence
     # ------------------------------------------------------------------
     def _queue_file_path(self) -> Path:
         base = QStandardPaths.writableLocation(
@@ -1891,7 +1910,6 @@ class MainWindow(QMainWindow):
         return bp / "pending_queue.json"
 
     def _save_pending_queue(self):
-        """Save unfinished tasks to disk so they survive app restart."""
         try:
             data = self._task_worker.get_serializable_queue()
             with open(self._queue_file_path(), 'w', encoding='utf-8') as f:
@@ -1900,7 +1918,6 @@ class MainWindow(QMainWindow):
             pass
 
     def _load_pending_queue(self):
-        """Load and resume unfinished tasks from last session."""
         qf = self._queue_file_path()
         if not qf.is_file():
             return
@@ -1913,20 +1930,15 @@ class MainWindow(QMainWindow):
                 self._show_toast(
                     f"\u23f3  Resuming {len(tasks)} pending task(s) from last session",
                     4000, "warning")
-            # Clear the file after loading
             qf.unlink(missing_ok=True)
         except Exception:
             pass
 
     def closeEvent(self, event):
-        """Save pending work and stop workers cleanly on exit."""
-        # Save any remaining tasks
         self._save_pending_queue()
-        # Stop workers
         self._task_worker.stop()
         if hasattr(self, '_global_hotkeys'):
             self._global_hotkeys.stop()
-        # Save cache
         if self.root_path:
             save_cache(self.root_path, self.cache)
         event.accept()
@@ -1963,8 +1975,6 @@ class MainWindow(QMainWindow):
                 "title": song.title, "artist": song.artist,
                 "rating": rating, "duration": song.duration, "id": song.id}
         except OSError: pass
-        # FIX: Increased from 500ms to 2500ms so bg thread finishes before
-        # watcher is re-enabled — prevents unnecessary full rescan
         QTimer.singleShot(2500, lambda: setattr(self, '_suppress_rescan', False))
         stars = "\u2605" * rating + "\u2606" * (5 - rating)
         self._log_change("RATING", song.title, f"{rating}/5")
@@ -2016,7 +2026,9 @@ class MainWindow(QMainWindow):
 
         add_todo_btn = QToolButton()
         add_todo_btn.setText("+ To-Do")
-        add_todo_btn.setToolTip("Create a .txt placeholder for a song to download later")
+        add_todo_btn.setToolTip(
+            "Create a .txt placeholder for a song to download later\n"
+            "Shortcut: Ctrl+Q + Shift + T (also works when app is in background)")
         add_todo_btn.setFixedHeight(24)
         add_todo_btn.setCursor(Qt.PointingHandCursor)
         add_todo_btn.setStyleSheet(
@@ -2026,6 +2038,20 @@ class MainWindow(QMainWindow):
         )
         add_todo_btn.clicked.connect(self._add_todo)
         lay.addWidget(add_todo_btn)
+
+        # Shortcut help button
+        help_btn = QToolButton()
+        help_btn.setText("? Shortcuts")
+        help_btn.setToolTip("Show all keyboard shortcuts")
+        help_btn.setFixedHeight(24)
+        help_btn.setCursor(Qt.PointingHandCursor)
+        help_btn.setStyleSheet(
+            "QToolButton{background:#2c2c2e;border:1px solid #3a3a3c;"
+            "border-radius:6px;color:#8e8e93;font-size:11px;font-weight:600;padding:0 10px;}"
+            "QToolButton:hover{background:#3a3a3c;color:#f2f2f7;}"
+        )
+        help_btn.clicked.connect(self._show_shortcuts_dialog)
+        lay.addWidget(help_btn)
 
         lay.addStretch()
 
@@ -2042,6 +2068,62 @@ class MainWindow(QMainWindow):
         lay.addWidget(bottom_btn)
 
         return strip
+
+    def _show_shortcuts_dialog(self):
+        from PySide6.QtWidgets import QDialog, QTextEdit
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Keyboard Shortcuts")
+        dlg.setFixedSize(560, 440)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(16, 16, 16, 16)
+
+        html = """
+        <div style='font-family:SF Mono,Consolas,monospace;font-size:13px;color:#f2f2f7;'>
+        <h2 style='color:#0a84ff;margin-top:0;'>Keyboard Shortcuts</h2>
+        <p style='color:#8e8e93;font-size:12px;'>All shortcuts use <b>Ctrl+Q</b> as prefix.
+        Works globally (in background) when <code>pynput</code> is installed.</p>
+        <hr style='border-color:#3a3a3c;'>
+        <table style='border-collapse:collapse;width:100%;'>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+Q + Space</td>
+            <td style='padding:6px 12px;'>Play / Pause</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+Q + N</td>
+            <td style='padding:6px 12px;'>Next song</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+Q + P</td>
+            <td style='padding:6px 12px;'>Previous song</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+Q + →</td>
+            <td style='padding:6px 12px;'>Seek forward (5s → 30s accelerating)</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+Q + ←</td>
+            <td style='padding:6px 12px;'>Seek backward (5s → 30s accelerating)</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+Q + ↑</td>
+            <td style='padding:6px 12px;'>Volume up (+5)</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+Q + ↓</td>
+            <td style='padding:6px 12px;'>Volume down (−5)</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+Q + M</td>
+            <td style='padding:6px 12px;'>Mute / Unmute</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+Q + 0..5</td>
+            <td style='padding:6px 12px;'>Rate current song 0–5 stars ★</td></tr>
+        <tr><td style='padding:6px 12px;color:#FFD60A;font-weight:600;'>Ctrl+Q + Shift + T</td>
+            <td style='padding:6px 12px;'><b>Open "Add To-Do" dialog</b></td></tr>
+        </table>
+        <hr style='border-color:#3a3a3c;'>
+        <p style='color:#8e8e93;font-size:11px;'>
+        <b>Background support:</b> requires <code>pip install pynput</code>.<br>
+        Without pynput, shortcuts still work when the app window has focus.
+        </p>
+        </div>
+        """
+        tv = QTextEdit()
+        tv.setReadOnly(True)
+        tv.setHtml(html)
+        tv.setStyleSheet(
+            "QTextEdit{background:#1c1c1e;border:1px solid #2c2c2e;"
+            "border-radius:6px;padding:8px;}")
+        lay.addWidget(tv)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.close)
+        lay.addWidget(close_btn, alignment=Qt.AlignRight)
+        dlg.exec()
 
     def _build_top_bar(self) -> QWidget:
         wrapper = QWidget(); wrapper.setObjectName("topBar")
@@ -2420,7 +2502,7 @@ class MainWindow(QMainWindow):
 
         ctrl.addSpacing(8)
 
-        prev_btn = _circle_btn("\u23ee", 40, "Previous", font_size=17)
+        prev_btn = _circle_btn("\u23ee", 40, "Previous  (Ctrl+Q + P)", font_size=17)
         prev_btn.clicked.connect(self.player.previous)
         ctrl.addWidget(prev_btn)
 
@@ -2429,7 +2511,7 @@ class MainWindow(QMainWindow):
         self.pp_btn = QToolButton()
         self.pp_btn.setText("\u25b6")
         self.pp_btn.setFixedSize(50, 50)
-        self.pp_btn.setToolTip("Play / Pause")
+        self.pp_btn.setToolTip("Play / Pause  (Ctrl+Q + Space)")
         self.pp_btn.setCursor(Qt.PointingHandCursor)
         self.pp_btn.setStyleSheet(
             "QToolButton{background:#ffffff;border:none;border-radius:25px;"
@@ -2442,7 +2524,7 @@ class MainWindow(QMainWindow):
 
         ctrl.addSpacing(6)
 
-        next_btn = _circle_btn("\u23ed", 40, "Next", font_size=17)
+        next_btn = _circle_btn("\u23ed", 40, "Next  (Ctrl+Q + N)", font_size=17)
         next_btn.clicked.connect(self.player.next)
         ctrl.addWidget(next_btn)
 
@@ -2893,21 +2975,11 @@ class MainWindow(QMainWindow):
         self._rebuild_cat_filter(); self._apply_filters()
 
     def _on_song_ready(self, song: Song):
-        """Called for EACH song during scan.
-
-        PERFORMANCE FIX: Only set visibility for THIS one song.
-        The old code called _apply_filters() here, which iterates ALL
-        songs — O(n^2) total during a scan, freezing the entire UI
-        including transport buttons.  Now we just check this one song
-        and move on.  Full _apply_filters runs ONCE in _on_finished.
-        """
         self._add_or_update(song)
-        # Only set visibility for THIS song — not all songs
         item = self.row_items.get(song.id)
         if item is not None:
             self.table.setRowHidden(item.row(), not self._matches(song))
         self.watcher.addPath(str(song.path))
-        # Keep UI responsive — process pending events every 50 songs
         self._song_ready_count = getattr(self, '_song_ready_count', 0) + 1
         if self._song_ready_count % 50 == 0:
             QApplication.processEvents()
@@ -2953,8 +3025,6 @@ class MainWindow(QMainWindow):
         self._set_info(f"{n} songs  \u2022  Up to date", "success",
                        auto_reset=True, duration_ms=3000)
 
-        # FIX: Apply filters & queue numbers ONCE after full scan
-        # (not per-song during scan — that was the O(n^2) freeze)
         self._apply_filters()
         self._update_queue_numbers()
         self._rebuild_play_queue()
@@ -3069,7 +3139,6 @@ class MainWindow(QMainWindow):
 
         html = "<div style='font-family:SF Mono,Consolas,monospace;font-size:12px;'>"
 
-        # Background worker queue
         if bg_tasks:
             html += (f"<p style='color:#0a84ff;font-weight:700;'>"
                      f"\u2699 {len(bg_tasks)} background task(s) running</p>")
@@ -3085,7 +3154,6 @@ class MainWindow(QMainWindow):
                          f"<span style='color:#8e8e93;'>\u2014 {action}: {detail}</span></p>")
             html += "<hr style='border-color:#3a3a3c;'>"
 
-        # Inline pending (waiting for song to finish playing)
         if self._pending_changes:
             html += (f"<p style='color:#FF9F0A;font-weight:700;'>"
                      f"\u23f3 {len(self._pending_changes)} waiting for playback</p>")
@@ -3595,7 +3663,6 @@ class MainWindow(QMainWindow):
         if not songs:
             return
 
-        # Queue all moves in background — UI stays responsive
         self._suppress_rescan = True
         queued = 0
         for song in songs:
@@ -3668,7 +3735,6 @@ class MainWindow(QMainWindow):
         self.bulk_rat_combo.setCurrentIndex(0)
         self._update_queue_numbers()
 
-        # FIX: longer suppress window so bg writes finish before watcher re-enables
         QTimer.singleShot(2500, lambda: (
             setattr(self, '_suppress_rescan', False),
             self.watcher.blockSignals(False),
@@ -3899,7 +3965,6 @@ class MainWindow(QMainWindow):
             combo.blockSignals(False)
             return
 
-        # Queue the move in background — UI stays responsive
         old_cat = song.category
         self._suppress_rescan = True
         lock: LockButton = combo.property("lock_ref")
@@ -3941,11 +4006,9 @@ class MainWindow(QMainWindow):
         try:
             st = song.path.stat()
             self.cache[str(song.path)] = {
-                "size": st.st_size, "mtime": st.st_mtime,
                 "title": song.title, "artist": song.artist,
                 "rating": new_rating, "duration": song.duration, "id": song.id}
         except OSError: pass
-        # FIX: Increased from 500ms to 2500ms
         QTimer.singleShot(2500, lambda: setattr(self, '_suppress_rescan', False))
         stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
         self._log_change("RATING", song.title, f"{new_rating}/5")
