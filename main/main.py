@@ -12,24 +12,22 @@ Build .exe:
     pyinstaller --onefile --windowed music_app.py
 
 ────────────────────────────────────────────────────────────────────────
-KEYBOARD SHORTCUTS  (all use Ctrl+CapsLock as prefix — works in background)
+KEYBOARD SHORTCUTS  (all work globally — even when app is in background)
 ────────────────────────────────────────────────────────────────────────
-  Ctrl+CapsLock + P                  Play / Pause
-  Ctrl+CapsLock + MediaNext          Next song
-  Ctrl+CapsLock + MediaPrev          Previous song
-  Ctrl+CapsLock + →                  Seek forward  (5s → 30s accel.)
-  Ctrl+CapsLock + ←                  Seek backward (5s → 30s accel.)
-  Ctrl+CapsLock + ↑                  Volume up   (+1 → +5 accel.)
-  Ctrl+CapsLock + ↓                  Volume down (−1 → −5 accel.)
-  Ctrl+CapsLock + MediaMute          Mute / Unmute
-  Ctrl+CapsLock + 0..5               Rate current song 0–5 stars
-  Ctrl+CapsLock + O                  Open "Add To-Do" dialog
+  Ctrl + Space                       Play / Pause
+  MediaNext                          Next song
+  MediaPrev                          Previous song
+  MediaMute                          Mute / Unmute
+  Ctrl+E + →                         Seek forward  (5s → 30s accel.)
+  Ctrl+E + ←                         Seek backward (5s → 30s accel.)
+  Ctrl+E + ↑                         Volume up     (+1 → +5 accel.)
+  Ctrl+E + ↓                         Volume down   (−1 → −5 accel.)
+  Ctrl+E + 0..5                      Rate current song 0–5 stars
+  Ctrl+E + T                         Open "Add To-Do" dialog
 ────────────────────────────────────────────────────────────────────────
 
-NOTE: Caps Lock is an OS-level TOGGLE key. Using it as a modifier will
-      flip the Caps Lock state on each press — this is an operating-system
-      limitation and cannot be prevented from user-mode Python.
-      Background hotkeys require `pip install pynput`.
+Background hotkeys require `pip install pynput`. Without it, shortcuts
+still work but only when the app window has focus.
 """
 
 import hashlib
@@ -535,26 +533,24 @@ class ScanWorker(QThread):
 # Global hotkey listener  (works even when app is in background)
 # ============================================================================
 class GlobalHotkeyListener(QObject):
-    """Listens for Ctrl+CapsLock+<key> globally using pynput.
-    Works when other apps (Word, Chrome, etc.) have focus.
+    """Listens for hotkeys globally using pynput. Works when other apps
+    (Word, Chrome, etc.) have focus.
 
-    NOTE: Caps Lock is an OS-level toggle key. Windows/macOS will still
-    flip the Caps Lock LED/state each time it is pressed — that is a
-    hardware/OS behavior and cannot be intercepted from user-mode Python
-    without a low-level kernel hook. The hotkey combination itself still
-    works reliably.
+    Shortcut scheme:
+      - MediaNext / MediaPrev / MediaMute       — no modifier
+      - Ctrl + Space                            — play/pause
+      - Ctrl + E (held) + action key            — everything else
     """
 
-    # Signal emits (qt_key_code, shift_held)
-    commandReceived = Signal(int, bool)
+    # Signal emits qt_key_code
+    commandReceived = Signal(int)
 
     _PYNPUT_TO_QT = {}  # populated at start()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._ctrl_held  = False
-        self._caps_held  = False
-        self._shift_held = False
+        self._e_held     = False
         self._listener   = None
         self._available  = False
 
@@ -563,17 +559,13 @@ class GlobalHotkeyListener(QObject):
             from pynput import keyboard as _kb
             self._kb = _kb
 
-            # Build key map (special keys / media keys → Qt codes)
             self._PYNPUT_TO_QT = {
                 _kb.Key.left:  Qt.Key_Left,
                 _kb.Key.right: Qt.Key_Right,
                 _kb.Key.up:    Qt.Key_Up,
                 _kb.Key.down:  Qt.Key_Down,
-                _kb.Key.media_next:        Qt.Key_MediaNext,
-                _kb.Key.media_previous:    Qt.Key_MediaPrevious,
-                _kb.Key.media_volume_mute: Qt.Key_VolumeMute,
             }
-            # letter/digit keys handled dynamically in _map_key
+            # digits / letters handled dynamically in _map_key
 
             self._listener = _kb.Listener(
                 on_press=self._on_press,
@@ -595,49 +587,46 @@ class GlobalHotkeyListener(QObject):
     def is_available(self) -> bool:
         return self._available
 
-    def _is_caps_key(self, key) -> bool:
-        """Detect Caps Lock key across platforms."""
-        _kb = self._kb
-        # pynput exposes Key.caps_lock on all major platforms
-        if hasattr(_kb.Key, 'caps_lock') and key == _kb.Key.caps_lock:
+    def _is_e_key(self, key) -> bool:
+        """Detect the letter E as a held modifier — vk 69 or char 'e'/'E'."""
+        if hasattr(key, 'vk') and key.vk == 69:  # VK_E
             return True
-        # Windows virtual-key code for VK_CAPITAL is 20
-        if hasattr(key, 'vk') and key.vk == 20:
+        ch = getattr(key, 'char', None)
+        if ch and ch.lower() == 'e':
             return True
         return False
 
     def _on_press(self, key):
         try:
             _kb = self._kb
-            # Track Ctrl
+
+            # ─── Track Ctrl ──────────────────────────────────────
             if key in (_kb.Key.ctrl_l, _kb.Key.ctrl_r, _kb.Key.ctrl):
                 self._ctrl_held = True
                 return
-            # Track Shift
-            if key in (_kb.Key.shift, _kb.Key.shift_l, _kb.Key.shift_r):
-                self._shift_held = True
-                return
-            # Track Caps Lock
-            if self._is_caps_key(key):
-                self._caps_held = True
+
+            # ─── Track E (only while Ctrl is held) ───────────────
+            if self._ctrl_held and self._is_e_key(key):
+                self._e_held = True
                 return
 
-            # Ctrl+Space → Play / Pause
+            # ─── Zero-modifier media keys ────────────────────────
+            if key == _kb.Key.media_next:
+                self.commandReceived.emit(Qt.Key_MediaNext); return
+            if key == _kb.Key.media_previous:
+                self.commandReceived.emit(Qt.Key_MediaPrevious); return
+            if key == _kb.Key.media_volume_mute:
+                self.commandReceived.emit(Qt.Key_VolumeMute); return
+
+            # ─── Ctrl + Space → Play/Pause ───────────────────────
             if self._ctrl_held and key == _kb.Key.space:
-                self.commandReceived.emit(Qt.Key_Space, self._shift_held)
-                return
+                self.commandReceived.emit(Qt.Key_Space); return
 
-            # Keep the other Ctrl+CapsLock shortcuts unchanged
-            if self._ctrl_held and self._caps_held:
+            # ─── Ctrl + E + <action> ─────────────────────────────
+            if self._ctrl_held and self._e_held:
                 qt_key = self._map_key(key)
                 if qt_key is not None:
-                    self.commandReceived.emit(qt_key, self._shift_held)
-
-            # Other shortcuts still use Ctrl+CapsLock
-            if self._ctrl_held and self._caps_held:
-                qt_key = self._map_key(key)
-                if qt_key is not None:
-                    self.commandReceived.emit(qt_key, self._shift_held)
+                    self.commandReceived.emit(qt_key)
 
         except Exception as e:
             print(f"Global hotkey error: {e}")
@@ -647,26 +636,31 @@ class GlobalHotkeyListener(QObject):
             _kb = self._kb
             if key in (_kb.Key.ctrl_l, _kb.Key.ctrl_r, _kb.Key.ctrl):
                 self._ctrl_held = False
-            if key in (_kb.Key.shift, _kb.Key.shift_l, _kb.Key.shift_r):
-                self._shift_held = False
-            if self._is_caps_key(key):
-                self._caps_held = False
+                self._e_held    = False   # releasing Ctrl always drops E
+            elif self._is_e_key(key):
+                self._e_held = False
         except Exception:
             pass
 
     def _map_key(self, key) -> Optional[int]:
+        """Map a pynput key to a Qt key code.
+
+        CRITICAL: When Ctrl is held, Windows/pynput delivers a control
+        character for letters (e.g. Ctrl+O arrives as char '\\x0f', not
+        'o'). So we MUST prefer the virtual-key code (vk) over char.
+        Falling back to char only when vk is unavailable.
+        """
         qt = self._PYNPUT_TO_QT.get(key)
         if qt is not None:
             return qt
-        ch = getattr(key, 'char', None)
-        if ch is None and hasattr(key, 'vk'):
-            vk = key.vk
-            if 48 <= vk <= 57:  # 0-9
+        vk = getattr(key, 'vk', None)
+        if vk is not None:
+            if 48 <= vk <= 57:   # 0-9
                 return Qt.Key_0 + (vk - 48)
-            if 65 <= vk <= 90:  # A-Z (P for play/pause, O for To-Do)
+            if 65 <= vk <= 90:   # A-Z
                 return Qt.Key_A + (vk - 65)
-            return None
-        if ch is not None:
+        ch = getattr(key, 'char', None)
+        if ch and len(ch) == 1 and ' ' <= ch <= '~':
             c = ch.lower()
             if '0' <= c <= '9':
                 return Qt.Key_0 + (ord(c) - ord('0'))
@@ -1588,23 +1582,19 @@ ROW_HEIGHT = 38
 # ============================================================================
 SHORTCUTS_HELP = """
 ──────────────────────── KEYBOARD SHORTCUTS ─────────────────────
-  Ctrl+Space                     →  Play / Pause
-  Ctrl+CapsLock + MediaNext      →  Next song
-  Ctrl+CapsLock + MediaPrev      →  Previous song
-  Ctrl+CapsLock + →              →  Seek forward  (5s → 30s accel.)
-  Ctrl+CapsLock + ←              →  Seek backward (5s → 30s accel.)
-  Ctrl+CapsLock + ↑              →  Volume up   (+1 → +5 accel.)
-  Ctrl+CapsLock + ↓              →  Volume down (−1 → −5 accel.)
-  Ctrl+CapsLock + MediaMute      →  Mute / Unmute
-  Ctrl+CapsLock + 0..5           →  Rate current song 0–5 stars
-  Ctrl+CapsLock + O              →  Open "Add To-Do" dialog
+  Ctrl + Space                   →  Play / Pause
+  MediaNext                      →  Next song
+  MediaPrev                      →  Previous song
+  MediaMute                      →  Mute / Unmute
+  Ctrl+E + →                     →  Seek forward  (5s → 30s accel.)
+  Ctrl+E + ←                     →  Seek backward (5s → 30s accel.)
+  Ctrl+E + ↑                     →  Volume up     (+1 → +5 accel.)
+  Ctrl+E + ↓                     →  Volume down   (−1 → −5 accel.)
+  Ctrl+E + 0..5                  →  Rate current song 0–5 stars
+  Ctrl+E + T                     →  Open "Add To-Do" dialog
 ─────────────────────────────────────────────────────────────────
-Works globally (in background / any app focused) when 'pynput' is
-installed:   pip install pynput
-
-NOTE: Caps Lock is an OS toggle key — using it as a modifier will
-      still flip the Caps Lock indicator each press. That is an
-      OS-level behavior and cannot be suppressed from Python.
+All shortcuts work globally (in background / any app focused) when
+'pynput' is installed:   pip install pynput
 """
 
 
@@ -1670,11 +1660,10 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda p=Path(last): self._set_root(p))
 
     def _setup_shortcuts(self):
-        # ── Manual CapsLock + Shift tracking (in-app) ────────────
-        # Qt modifiers natively track Ctrl/Shift/Alt/Meta.
-        # We track Caps Lock ourselves so Ctrl+CapsLock+<action>
-        # works reliably, and use Qt's ShiftModifier for Shift.
-        self._caps_held = False
+        # ── Manual E-key tracking (in-app) ────────────────────────
+        # Qt modifiers natively track Ctrl/Shift/Alt/Meta. We track the
+        # E key ourselves so Ctrl+E+<action> works as a chorded prefix.
+        self._e_held = False
 
         # Seek acceleration: repeated arrow presses skip further
         self._seek_accel_count = 0
@@ -1721,37 +1710,47 @@ class MainWindow(QMainWindow):
             key = event.key()
             mods = event.modifiers()
 
-            # Ctrl+Space → Play / Pause
+            # ── Zero-modifier media keys ─────────────────────────
+            if key in (Qt.Key_MediaNext, Qt.Key_MediaPrevious,
+                       Qt.Key_VolumeMute):
+                if self._handle_command_key(key):
+                    return True
+
+            # ── Ctrl + Space → Play / Pause ──────────────────────
             if key == Qt.Key_Space and (mods & Qt.ControlModifier):
                 if self._handle_command_key(Qt.Key_Space):
                     return True
 
-            # Track Caps Lock press (ignore auto-repeat)
-            if key == Qt.Key_CapsLock and not event.isAutoRepeat():
-                self._caps_held = True
+            # ── Track E press (only meaningful with Ctrl held) ───
+            if key == Qt.Key_E and not event.isAutoRepeat():
                 if mods & Qt.ControlModifier:
-                    return True  # consume Ctrl+CapsLock itself
+                    self._e_held = True
+                    return True   # consume Ctrl+E itself
 
-            # Ctrl + CapsLock held + action key = command
-            if (mods & Qt.ControlModifier) and self._caps_held:
-                if key not in (Qt.Key_CapsLock, Qt.Key_Control, Qt.Key_Shift):
-                    shift = bool(mods & Qt.ShiftModifier)
-                    if self._handle_command_key(key, shift):
+            # ── Ctrl + E + action ────────────────────────────────
+            if (mods & Qt.ControlModifier) and self._e_held:
+                if key not in (Qt.Key_E, Qt.Key_Control, Qt.Key_Shift):
+                    if self._handle_command_key(key):
                         return True
 
         elif event.type() == QEvent.KeyRelease:
-            if event.key() == Qt.Key_CapsLock and not event.isAutoRepeat():
-                self._caps_held = False
+            key = event.key()
+            if key == Qt.Key_E and not event.isAutoRepeat():
+                self._e_held = False
                 self._seek_accel_count = 0
+                self._vol_accel_count  = 0
+            elif key == Qt.Key_Control:
+                # Releasing Ctrl always drops the E-modifier state
+                self._e_held = False
 
         return super().eventFilter(obj, event)
 
     def changeEvent(self, event):
-        """Reset CapsLock state when window loses focus."""
+        """Reset modifier state when window loses focus."""
         from PySide6.QtCore import QEvent
         if event.type() == QEvent.ActivationChange:
             if not self.isActiveWindow():
-                self._caps_held = False
+                self._e_held = False
                 self._seek_accel_count = 0
                 self._vol_accel_count = 0
         super().changeEvent(event)
@@ -1767,7 +1766,7 @@ class MainWindow(QMainWindow):
         return step
 
     def _handle_command_key(self, key, shift: bool = False) -> bool:
-        """Process a key while Ctrl+CapsLock is held.
+        """Dispatch a hotkey action.
         Returns True if handled."""
 
         # ── Deduplication ─────────────────────────────────────────
@@ -1780,19 +1779,19 @@ class MainWindow(QMainWindow):
             return True   # swallow the duplicate
         self._last_cmd_times[key] = now
 
-        # ── Ctrl+CapsLock+O → Add To-Do ───────────────────────────
-        if key == Qt.Key_O:
+        # ── Ctrl+E+T → Add To-Do ──────────────────────────────────
+        if key == Qt.Key_T:
             self.raise_()
             self.activateWindow()
             self._add_todo()
             return True
 
-        # ── Rating: 0–5 ───────────────────────────────────────────
+        # ── Rating: 0–5 (Ctrl+E+digit) ────────────────────────────
         if Qt.Key_0 <= key <= Qt.Key_5:
             self._shortcut_rating(key - Qt.Key_0)
             return True
 
-        # ── Seek forward (accelerating) ───────────────────────────
+        # ── Seek forward (Ctrl+E+→, accelerating) ─────────────────
         if key == Qt.Key_Right:
             if self.player.current_song():
                 step = self._get_seek_step_ms()
@@ -1802,7 +1801,7 @@ class MainWindow(QMainWindow):
                 self._show_toast("No song playing.", 1000, "warning")
             return True
 
-        # ── Seek backward (accelerating) ──────────────────────────
+        # ── Seek backward (Ctrl+E+←, accelerating) ────────────────
         if key == Qt.Key_Left:
             if self.player.current_song():
                 step = self._get_seek_step_ms()
@@ -1812,12 +1811,12 @@ class MainWindow(QMainWindow):
                 self._show_toast("No song playing.", 1000, "warning")
             return True
 
-        # ── Play / Pause  (Ctrl+Space) ────────────────────────────
+        # ── Play / Pause (Ctrl+Space) ─────────────────────────────
         if key == Qt.Key_Space:
             self._shortcut_play_pause()
             return True
 
-        # ── Next / Previous (media keys only) ─────────────────────
+        # ── Next / Previous (MediaNext / MediaPrev, no modifier) ──
         if key == Qt.Key_MediaNext:
             if self.player.current_song() is None:
                 songs = self._visible_songs_in_order()
@@ -1868,10 +1867,11 @@ class MainWindow(QMainWindow):
             return 3
         return 5
 
-    def _on_global_hotkey(self, qt_key: int, shift: bool):
+    def _on_global_hotkey(self, qt_key: int):
         """Called from pynput background thread via signal — runs on
-        main thread. Handles command even when app is in background."""
-        self._handle_command_key(qt_key, shift)
+        main thread. Handles the command even when the app is in
+        the background."""
+        self._handle_command_key(qt_key)
 
     # ------------------------------------------------------------------
     # Background task worker callbacks
@@ -2126,7 +2126,7 @@ class MainWindow(QMainWindow):
     def _restore_last_song(self, song: Song):
         """Load the last-played song into the player without autoplay,
         highlight it in blue, and scroll to it."""
-        # Load into the player queue so Ctrl+CapsLock+P starts it
+        # Load into the player queue so Ctrl+Space starts it
         visible = self._visible_songs_in_order()
         if song in visible:
             queue = visible
@@ -2154,7 +2154,7 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(50, lambda: self.table.scrollTo(
                     idx, QAbstractItemView.PositionAtCenter))
         self._show_toast(
-            f"\u23ee  Resumed at: {song.title}   (Ctrl+CapsLock+P to play)",
+            f"\u23ee  Resumed at: {song.title}   (Ctrl+Space to play)",
             4500, "info")
 
     def _shortcut_play_pause(self):
@@ -2242,7 +2242,7 @@ class MainWindow(QMainWindow):
         add_todo_btn.setText("+ To-Do")
         add_todo_btn.setToolTip(
             "Create a .txt placeholder for a song to download later\n"
-            "Shortcut: Ctrl+CapsLock + O  (works globally when pynput is installed)")
+            "Shortcut: Ctrl+E + T  (works globally when pynput is installed)")
         add_todo_btn.setFixedHeight(24)
         add_todo_btn.setCursor(Qt.PointingHandCursor)
         add_todo_btn.setStyleSheet(
@@ -2294,42 +2294,36 @@ class MainWindow(QMainWindow):
         html = """
         <div style='font-family:SF Mono,Consolas,monospace;font-size:13px;color:#f2f2f7;'>
         <h2 style='color:#0a84ff;margin-top:0;'>Keyboard Shortcuts</h2>
-        <p style='color:#8e8e93;font-size:12px;'>All shortcuts use <b>Ctrl+CapsLock</b> as prefix.
-        Works globally (in background — any app can be focused) when
-        <code>pynput</code> is installed.</p>
+        <p style='color:#8e8e93;font-size:12px;'>All shortcuts work globally
+        (in background — any app can be focused) when <code>pynput</code> is
+        installed.</p>
         <hr style='border-color:#3a3a3c;'>
         <table style='border-collapse:collapse;width:100%;'>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + P</td>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl + Space</td>
             <td style='padding:6px 12px;'>Play / Pause</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + MediaNext</td>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>MediaNext</td>
             <td style='padding:6px 12px;'>Next song</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + MediaPrev</td>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>MediaPrev</td>
             <td style='padding:6px 12px;'>Previous song</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + →</td>
-            <td style='padding:6px 12px;'>Seek forward (5s → 30s accelerating)</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + ←</td>
-            <td style='padding:6px 12px;'>Seek backward (5s → 30s accelerating)</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + ↑</td>
-            <td style='padding:6px 12px;'>Volume up  (+1 → +5 accelerating)</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + ↓</td>
-            <td style='padding:6px 12px;'>Volume down (−1 → −5 accelerating)</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + MediaMute</td>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>MediaMute</td>
             <td style='padding:6px 12px;'>Mute / Unmute</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + 0..5</td>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+E + →</td>
+            <td style='padding:6px 12px;'>Seek forward (5s → 30s accelerating)</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+E + ←</td>
+            <td style='padding:6px 12px;'>Seek backward (5s → 30s accelerating)</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+E + ↑</td>
+            <td style='padding:6px 12px;'>Volume up  (+1 → +5 accelerating)</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+E + ↓</td>
+            <td style='padding:6px 12px;'>Volume down (−1 → −5 accelerating)</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+E + 0..5</td>
             <td style='padding:6px 12px;'>Rate current song 0–5 stars ★</td></tr>
-        <tr><td style='padding:6px 12px;color:#FFD60A;font-weight:600;'>Ctrl+CapsLock + O</td>
+        <tr><td style='padding:6px 12px;color:#FFD60A;font-weight:600;'>Ctrl+E + T</td>
             <td style='padding:6px 12px;'><b>Open "Add To-Do" dialog</b></td></tr>
         </table>
         <hr style='border-color:#3a3a3c;'>
         <p style='color:#8e8e93;font-size:11px;'>
         <b>Background support:</b> requires <code>pip install pynput</code>.<br>
         Without pynput, shortcuts still work when the app window has focus.
-        </p>
-        <p style='color:#FF9F0A;font-size:11px;'>
-        <b>Note about Caps Lock:</b> Caps Lock is an OS-level toggle key.
-        Windows/macOS will still flip the Caps Lock LED/state each time
-        it is pressed — that behavior cannot be intercepted from user-mode
-        Python. The hotkey combinations themselves still work reliably.
         </p>
         </div>
         """
@@ -2723,7 +2717,7 @@ class MainWindow(QMainWindow):
 
         ctrl.addSpacing(8)
 
-        prev_btn = _circle_btn("\u23ee", 40, "Previous  (Ctrl+CapsLock + MediaPrev)", font_size=17)
+        prev_btn = _circle_btn("\u23ee", 40, "Previous  (MediaPrev)", font_size=17)
         prev_btn.clicked.connect(self.player.previous)
         ctrl.addWidget(prev_btn)
 
@@ -2732,7 +2726,7 @@ class MainWindow(QMainWindow):
         self.pp_btn = QToolButton()
         self.pp_btn.setText("\u25b6")
         self.pp_btn.setFixedSize(50, 50)
-        self.pp_btn.setToolTip("Play / Pause  (Ctrl+CapsLock + P)")
+        self.pp_btn.setToolTip("Play / Pause  (Ctrl + Space)")
         self.pp_btn.setCursor(Qt.PointingHandCursor)
         self.pp_btn.setStyleSheet(
             "QToolButton{background:#ffffff;border:none;border-radius:25px;"
@@ -2745,7 +2739,7 @@ class MainWindow(QMainWindow):
 
         ctrl.addSpacing(6)
 
-        next_btn = _circle_btn("\u23ed", 40, "Next  (Ctrl+CapsLock + MediaNext)", font_size=17)
+        next_btn = _circle_btn("\u23ed", 40, "Next  (MediaNext)", font_size=17)
         next_btn.clicked.connect(self.player.next)
         ctrl.addWidget(next_btn)
 
