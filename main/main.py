@@ -14,16 +14,16 @@ Build .exe:
 ────────────────────────────────────────────────────────────────────────
 KEYBOARD SHORTCUTS  (all use Ctrl+CapsLock as prefix — works in background)
 ────────────────────────────────────────────────────────────────────────
-  Ctrl+CapsLock + Space              Play / Pause
-  Ctrl+CapsLock + N  / MediaNext     Next song
-  Ctrl+CapsLock + P  / MediaPrev     Previous song
-  Ctrl+CapsLock + →                  Seek forward (accelerating 5s → 30s)
-  Ctrl+CapsLock + ←                  Seek backward (accelerating 5s → 30s)
-  Ctrl+CapsLock + ↑                  Volume up (+1 > 5)
-  Ctrl+CapsLock + ↓                  Volume down (−1 > -5)
-  Ctrl+CapsLock + M  / MediaMute     Mute / Unmute
+  Ctrl+CapsLock + P                  Play / Pause
+  Ctrl+CapsLock + MediaNext          Next song
+  Ctrl+CapsLock + MediaPrev          Previous song
+  Ctrl+CapsLock + →                  Seek forward  (5s → 30s accel.)
+  Ctrl+CapsLock + ←                  Seek backward (5s → 30s accel.)
+  Ctrl+CapsLock + ↑                  Volume up   (+1 → +5 accel.)
+  Ctrl+CapsLock + ↓                  Volume down (−1 → −5 accel.)
+  Ctrl+CapsLock + MediaMute          Mute / Unmute
   Ctrl+CapsLock + 0..5               Rate current song 0–5 stars
-  Ctrl+CapsLock + Shift + Q          Open "Add To-Do" dialog
+  Ctrl+CapsLock + O                  Open "Add To-Do" dialog
 ────────────────────────────────────────────────────────────────────────
 
 NOTE: Caps Lock is an OS-level TOGGLE key. Using it as a modifier will
@@ -565,17 +565,13 @@ class GlobalHotkeyListener(QObject):
 
             # Build key map (special keys / media keys → Qt codes)
             self._PYNPUT_TO_QT = {
-                _kb.Key.space: Qt.Key_Space,
                 _kb.Key.left:  Qt.Key_Left,
                 _kb.Key.right: Qt.Key_Right,
                 _kb.Key.up:    Qt.Key_Up,
                 _kb.Key.down:  Qt.Key_Down,
-                _kb.Key.media_play_pause: Qt.Key_Space,
-                _kb.Key.media_next:       Qt.Key_MediaNext,
-                _kb.Key.media_previous:   Qt.Key_MediaPrevious,
-                _kb.Key.media_volume_up:   Qt.Key_Up,
-                _kb.Key.media_volume_down: Qt.Key_Down,
-                _kb.Key.media_volume_mute: Qt.Key_M,
+                _kb.Key.media_next:        Qt.Key_MediaNext,
+                _kb.Key.media_previous:    Qt.Key_MediaPrevious,
+                _kb.Key.media_volume_mute: Qt.Key_VolumeMute,
             }
             # letter/digit keys handled dynamically in _map_key
 
@@ -655,7 +651,7 @@ class GlobalHotkeyListener(QObject):
             vk = key.vk
             if 48 <= vk <= 57:  # 0-9
                 return Qt.Key_0 + (vk - 48)
-            if 65 <= vk <= 90:  # A-Z
+            if 65 <= vk <= 90:  # A-Z (P for play/pause, O for To-Do)
                 return Qt.Key_A + (vk - 65)
             return None
         if ch is not None:
@@ -1580,16 +1576,16 @@ ROW_HEIGHT = 38
 # ============================================================================
 SHORTCUTS_HELP = """
 ─────────── KEYBOARD SHORTCUTS (Ctrl+CapsLock prefix) ───────────
-  Ctrl+CapsLock + Space          →  Play / Pause
-  Ctrl+CapsLock + N / MediaNext  →  Next song
-  Ctrl+CapsLock + P / MediaPrev  →  Previous song
+  Ctrl+CapsLock + P              →  Play / Pause
+  Ctrl+CapsLock + MediaNext      →  Next song
+  Ctrl+CapsLock + MediaPrev      →  Previous song
   Ctrl+CapsLock + →              →  Seek forward  (5s → 30s accel.)
   Ctrl+CapsLock + ←              →  Seek backward (5s → 30s accel.)
-  Ctrl+CapsLock + ↑              →  Volume up (+1)
-  Ctrl+CapsLock + ↓              →  Volume down (−1)
-  Ctrl+CapsLock + M / MediaMute  →  Mute / Unmute
+  Ctrl+CapsLock + ↑              →  Volume up   (+1 → +5 accel.)
+  Ctrl+CapsLock + ↓              →  Volume down (−1 → −5 accel.)
+  Ctrl+CapsLock + MediaMute      →  Mute / Unmute
   Ctrl+CapsLock + 0..5           →  Rate current song 0–5 stars
-  Ctrl+CapsLock + Shift + Q      →  Open "Add To-Do" dialog
+  Ctrl+CapsLock + O              →  Open "Add To-Do" dialog
 ─────────────────────────────────────────────────────────────────
 Works globally (in background / any app focused) when 'pynput' is
 installed:   pip install pynput
@@ -1676,6 +1672,18 @@ class MainWindow(QMainWindow):
         self._seek_accel_timer.timeout.connect(
             lambda: setattr(self, '_seek_accel_count', 0))
 
+        # Volume acceleration: repeated up/down presses jump further
+        self._vol_accel_count = 0
+        self._vol_accel_timer = QTimer(self)
+        self._vol_accel_timer.setSingleShot(True)
+        self._vol_accel_timer.setInterval(600)
+        self._vol_accel_timer.timeout.connect(
+            lambda: setattr(self, '_vol_accel_count', 0))
+
+        # Dedup: track last-fire timestamp per key so the same command
+        # arriving twice (Qt eventFilter + pynput) is not executed twice.
+        self._last_cmd_times: Dict[int, float] = {}
+
         # ── App-wide event filter (works when app HAS focus) ─────
         QApplication.instance().installEventFilter(self)
 
@@ -1728,6 +1736,7 @@ class MainWindow(QMainWindow):
             if not self.isActiveWindow():
                 self._caps_held = False
                 self._seek_accel_count = 0
+                self._vol_accel_count = 0
         super().changeEvent(event)
 
     def _get_seek_step_ms(self) -> int:
@@ -1744,9 +1753,18 @@ class MainWindow(QMainWindow):
         """Process a key while Ctrl+CapsLock is held.
         Returns True if handled."""
 
-        # ── Ctrl+CapsLock+Shift+Q → Add To-Do ────────────────────
-        if shift and key == Qt.Key_Q:
-            # Bring window to front so dialog is visible
+        # ── Deduplication ─────────────────────────────────────────
+        # When the app window has focus, a key can fire twice — once
+        # via Qt's event filter, once via the pynput global listener.
+        # Ignore duplicates that arrive within 200 ms of each other.
+        now = time.monotonic()
+        last = self._last_cmd_times.get(key, 0.0)
+        if now - last < 0.20:
+            return True   # swallow the duplicate
+        self._last_cmd_times[key] = now
+
+        # ── Ctrl+CapsLock+O → Add To-Do ───────────────────────────
+        if key == Qt.Key_O:
             self.raise_()
             self.activateWindow()
             self._add_todo()
@@ -1777,13 +1795,13 @@ class MainWindow(QMainWindow):
                 self._show_toast("No song playing.", 1000, "warning")
             return True
 
-        # ── Play / Pause ──────────────────────────────────────────
-        if key == Qt.Key_Space:
+        # ── Play / Pause  (letter P) ──────────────────────────────
+        if key == Qt.Key_P:
             self._shortcut_play_pause()
             return True
 
-        # ── Next / Previous ───────────────────────────────────────
-        if key in (Qt.Key_N, Qt.Key_MediaNext):
+        # ── Next / Previous (media keys only) ─────────────────────
+        if key == Qt.Key_MediaNext:
             if self.player.current_song() is None:
                 songs = self._visible_songs_in_order()
                 if songs:
@@ -1792,7 +1810,7 @@ class MainWindow(QMainWindow):
                 self.player.next()
             return True
 
-        if key in (Qt.Key_P, Qt.Key_MediaPrevious):
+        if key == Qt.Key_MediaPrevious:
             if self.player.current_song() is None:
                 songs = self._visible_songs_in_order()
                 if songs:
@@ -1801,21 +1819,37 @@ class MainWindow(QMainWindow):
                 self.player.previous()
             return True
 
-        # ── Volume Up / Down / Mute  (±1 step) ────────────────────
-        if key in (Qt.Key_Up, Qt.Key_VolumeUp):
-            self.vol_slider.setValue(min(100, self.vol_slider.value() + 1))
+        # ── Volume Up / Down  (accelerating ±1 → ±5) ──────────────
+        if key == Qt.Key_Up:
+            step = self._get_volume_step()
+            self.vol_slider.setValue(min(100, self.vol_slider.value() + step))
             return True
 
-        if key in (Qt.Key_Down, Qt.Key_VolumeDown):
-            self.vol_slider.setValue(max(0, self.vol_slider.value() - 1))
+        if key == Qt.Key_Down:
+            step = self._get_volume_step()
+            self.vol_slider.setValue(max(0, self.vol_slider.value() - step))
             return True
 
-        if key in (Qt.Key_M, Qt.Key_VolumeMute):
+        # ── Mute (media key only) ─────────────────────────────────
+        if key == Qt.Key_VolumeMute:
             self.vol_slider.setValue(
                 0 if self.vol_slider.value() > 0 else 80)
             return True
 
         return False
+
+    def _get_volume_step(self) -> int:
+        """Accelerating volume: 1, 1, 2, 3, 5, 5, 5 …"""
+        self._vol_accel_count += 1
+        self._vol_accel_timer.start()
+        n = self._vol_accel_count
+        if n <= 2:
+            return 1
+        if n == 3:
+            return 2
+        if n == 4:
+            return 3
+        return 5
 
     def _on_global_hotkey(self, qt_key: int, shift: bool):
         """Called from pynput background thread via signal — runs on
@@ -1955,12 +1989,156 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._save_pending_queue()
+        self._save_session_state()
         self._task_worker.stop()
         if hasattr(self, '_global_hotkeys'):
             self._global_hotkeys.stop()
         if self.root_path:
             save_cache(self.root_path, self.cache)
         event.accept()
+
+    # ------------------------------------------------------------------
+    # Session state persistence (filters + last-played song)
+    # ------------------------------------------------------------------
+    def _save_session_state(self):
+        """Save current filter state and last-played song path via QSettings."""
+        try:
+            self.settings.setValue("filter/search",     self._filter_search)
+            self.settings.setValue("filter/rating",     self._filter_rating)
+            self.settings.setValue("filter/collab",     self._filter_collab)
+            self.settings.setValue("filter/cover",      self._filter_cover)
+            self.settings.setValue("filter/accordion",  self._filter_accordion)
+            self.settings.setValue("filter/christmas",  self._filter_christmas)
+            self.settings.setValue("filter/cat_checks", json.dumps(self._cat_checks))
+            # Sort column & order
+            self.settings.setValue("sort/col",   self._last_sort_col)
+            self.settings.setValue("sort/order", int(self._last_sort_order))
+            # Last played song — prefer highlighted (last selection), else player
+            last = self.player.current_song()
+            if last is None and self._highlighted_id:
+                last = self.songs_by_id.get(self._highlighted_id)
+            if last:
+                self.settings.setValue("session/last_song_path", str(last.path))
+            else:
+                self.settings.remove("session/last_song_path")
+            # Volume
+            self.settings.setValue("session/volume", self.vol_slider.value())
+        except Exception as e:
+            print(f"WARN: could not save session state: {e}")
+
+    def _restore_session_state(self):
+        """Restore filters + last-played song. Called ONCE after first scan
+        completes, so that self.songs_by_id is populated."""
+        if getattr(self, '_session_restored', False):
+            return
+        self._session_restored = True
+
+        try:
+            # ── Filters ─────────────────────────────────────────
+            search = self.settings.value("filter/search", "", type=str)
+            if search:
+                self.search_box.blockSignals(True)
+                self.search_box.setText(search)
+                self.search_box.blockSignals(False)
+                self._filter_search = search.lower()
+
+            rating = self.settings.value("filter/rating", 0, type=int)
+            if rating != 0:
+                self._filter_rating = rating
+                for i in range(self.rat_filter.count()):
+                    if self.rat_filter.itemData(i) == rating:
+                        self.rat_filter.blockSignals(True)
+                        self.rat_filter.setCurrentIndex(i)
+                        self.rat_filter.blockSignals(False)
+                        break
+
+            for attr, btn in [
+                ("collab",    self.collab_btn),
+                ("cover",     self.cover_btn),
+                ("accordion", self.accordion_btn),
+                ("christmas", self.christmas_btn),
+            ]:
+                val = self.settings.value(f"filter/{attr}", False, type=bool)
+                if val:
+                    setattr(self, f"_filter_{attr}", True)
+                    btn.blockSignals(True)
+                    btn.setChecked(True)
+                    btn.blockSignals(False)
+
+            cat_json = self.settings.value("filter/cat_checks", "", type=str)
+            if cat_json:
+                try:
+                    saved_checks = json.loads(cat_json)
+                    for cat in self._cat_checks:
+                        if cat in saved_checks:
+                            self._cat_checks[cat] = bool(saved_checks[cat])
+                    self._update_cat_btn_label()
+                except Exception:
+                    pass
+
+            # ── Sort ────────────────────────────────────────────
+            sort_col   = self.settings.value("sort/col",   COL_ARTIST, type=int)
+            sort_order = self.settings.value("sort/order", int(Qt.AscendingOrder), type=int)
+            if sort_col in (COL_ARTIST, COL_SONGNAME, COL_CATEGORY, COL_RATING):
+                self.table.sortItems(sort_col, Qt.SortOrder(sort_order))
+
+            # ── Volume ──────────────────────────────────────────
+            vol = self.settings.value("session/volume", -1, type=int)
+            if 0 <= vol <= 100:
+                self.vol_slider.setValue(vol)
+
+            # ── Apply filters, then locate last song ────────────
+            self._apply_filters()
+
+            last_path = self.settings.value("session/last_song_path", "", type=str)
+            if last_path:
+                target = None
+                for sid, s in self.songs_by_id.items():
+                    if str(s.path) == last_path:
+                        target = s
+                        break
+                if target:
+                    self._restore_last_song(target)
+                else:
+                    self._show_toast(
+                        "Last-played song was not found (moved or deleted).",
+                        3500, "warning")
+        except Exception as e:
+            print(f"WARN: could not restore session state: {e}")
+
+    def _restore_last_song(self, song: Song):
+        """Load the last-played song into the player without autoplay,
+        highlight it in blue, and scroll to it."""
+        # Load into the player queue so Ctrl+CapsLock+P starts it
+        visible = self._visible_songs_in_order()
+        if song in visible:
+            queue = visible
+        else:
+            # Song may be filtered out — put it as a single-item queue
+            queue = [song]
+        self.player._queue = list(queue)
+        self.player._index = queue.index(song) if song in queue else 0
+        # Set the media source but DO NOT play
+        try:
+            self.player._player.setSource(QUrl.fromLocalFile(str(song.path)))
+        except Exception:
+            pass
+        # Update the "Now Playing" label
+        self.player.songChanged.emit(song)
+        # Ensure the row is highlighted in blue
+        self._highlight(song)
+        # Scroll into view
+        item = self.row_items.get(song.id)
+        if item is not None:
+            row = item.row()
+            if not self.table.isRowHidden(row):
+                idx = self.table.model().index(row, COL_ARTIST)
+                # Delay scroll one tick so the table has laid out
+                QTimer.singleShot(50, lambda: self.table.scrollTo(
+                    idx, QAbstractItemView.PositionAtCenter))
+        self._show_toast(
+            f"\u23ee  Resumed at: {song.title}   (Ctrl+CapsLock+P to play)",
+            4500, "info")
 
     def _shortcut_play_pause(self):
         if self.player.current_song() is None:
@@ -2047,7 +2225,7 @@ class MainWindow(QMainWindow):
         add_todo_btn.setText("+ To-Do")
         add_todo_btn.setToolTip(
             "Create a .txt placeholder for a song to download later\n"
-            "Shortcut: Ctrl+CapsLock + Shift + Q  (works globally when pynput is installed)")
+            "Shortcut: Ctrl+CapsLock + O  (works globally when pynput is installed)")
         add_todo_btn.setFixedHeight(24)
         add_todo_btn.setCursor(Qt.PointingHandCursor)
         add_todo_btn.setStyleSheet(
@@ -2104,25 +2282,25 @@ class MainWindow(QMainWindow):
         <code>pynput</code> is installed.</p>
         <hr style='border-color:#3a3a3c;'>
         <table style='border-collapse:collapse;width:100%;'>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + Space</td>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + P</td>
             <td style='padding:6px 12px;'>Play / Pause</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + N  <span style='color:#8e8e93;'>/ MediaNext</span></td>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + MediaNext</td>
             <td style='padding:6px 12px;'>Next song</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + P  <span style='color:#8e8e93;'>/ MediaPrev</span></td>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + MediaPrev</td>
             <td style='padding:6px 12px;'>Previous song</td></tr>
         <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + →</td>
             <td style='padding:6px 12px;'>Seek forward (5s → 30s accelerating)</td></tr>
         <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + ←</td>
             <td style='padding:6px 12px;'>Seek backward (5s → 30s accelerating)</td></tr>
         <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + ↑</td>
-            <td style='padding:6px 12px;'>Volume up (+1)</td></tr>
+            <td style='padding:6px 12px;'>Volume up  (+1 → +5 accelerating)</td></tr>
         <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + ↓</td>
-            <td style='padding:6px 12px;'>Volume down (−1)</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + M  <span style='color:#8e8e93;'>/ MediaMute</span></td>
+            <td style='padding:6px 12px;'>Volume down (−1 → −5 accelerating)</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + MediaMute</td>
             <td style='padding:6px 12px;'>Mute / Unmute</td></tr>
         <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+CapsLock + 0..5</td>
             <td style='padding:6px 12px;'>Rate current song 0–5 stars ★</td></tr>
-        <tr><td style='padding:6px 12px;color:#FFD60A;font-weight:600;'>Ctrl+CapsLock + Shift + Q</td>
+        <tr><td style='padding:6px 12px;color:#FFD60A;font-weight:600;'>Ctrl+CapsLock + O</td>
             <td style='padding:6px 12px;'><b>Open "Add To-Do" dialog</b></td></tr>
         </table>
         <hr style='border-color:#3a3a3c;'>
@@ -2528,7 +2706,7 @@ class MainWindow(QMainWindow):
 
         ctrl.addSpacing(8)
 
-        prev_btn = _circle_btn("\u23ee", 40, "Previous  (Ctrl+CapsLock + P)", font_size=17)
+        prev_btn = _circle_btn("\u23ee", 40, "Previous  (Ctrl+CapsLock + MediaPrev)", font_size=17)
         prev_btn.clicked.connect(self.player.previous)
         ctrl.addWidget(prev_btn)
 
@@ -2537,7 +2715,7 @@ class MainWindow(QMainWindow):
         self.pp_btn = QToolButton()
         self.pp_btn.setText("\u25b6")
         self.pp_btn.setFixedSize(50, 50)
-        self.pp_btn.setToolTip("Play / Pause  (Ctrl+CapsLock + Space)")
+        self.pp_btn.setToolTip("Play / Pause  (Ctrl+CapsLock + P)")
         self.pp_btn.setCursor(Qt.PointingHandCursor)
         self.pp_btn.setStyleSheet(
             "QToolButton{background:#ffffff;border:none;border-radius:25px;"
@@ -2550,7 +2728,7 @@ class MainWindow(QMainWindow):
 
         ctrl.addSpacing(6)
 
-        next_btn = _circle_btn("\u23ed", 40, "Next  (Ctrl+CapsLock + N)", font_size=17)
+        next_btn = _circle_btn("\u23ed", 40, "Next  (Ctrl+CapsLock + MediaNext)", font_size=17)
         next_btn.clicked.connect(self.player.next)
         ctrl.addWidget(next_btn)
 
@@ -3054,6 +3232,9 @@ class MainWindow(QMainWindow):
         self._apply_filters()
         self._update_queue_numbers()
         self._rebuild_play_queue()
+
+        # ── Restore filters + last-played song (first scan only) ────
+        self._restore_session_state()
 
         if added or removed:
             self.last_added = added; self.last_removed = removed

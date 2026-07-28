@@ -1,10 +1,10 @@
-  Ctrl+CapsLock + Space (Not MediaPlay/Pause Button)   Play / Pause
-  Ctrl+CapsLock + MediaNext                            Next song
-  Ctrl+CapsLock + MediaPrev                            Previous song
-  Ctrl+CapsLock + →                                    Seek forward  (5s → 30s accel.)
-  Ctrl+CapsLock + ←                                    Seek backward (5s → 30s accel.)
-  Ctrl+CapsLock + ↑                                    Volume up (+1 > +5 accel.)
-  Ctrl+CapsLock + ↓                                    Volume down (−1 > -5 accel.)
-  Ctrl+CapsLock + MediaMute                            Mute / Unmute
-  Ctrl+CapsLock + 0..5                                 Rate current song 0–5 stars
-  Ctrl+CapsLock + Shift + Q                            Open "Add To-Do" dialog
+  Ctrl+Space                                    Play / Pause
+  MediaNext                                     Next song
+  MediaPrev                                     Previous song
+  MediaMute                                     Mute / Unmute
+  Ctrl+E + →                                    Seek forward  (5s → 30s accel.)
+  Ctrl+E + ←                                    Seek backward (5s → 30s accel.)
+  Ctrl+E + ↑                                    Volume up (+1 > +5 accel.)
+  Ctrl+E + ↓                                    Volume down (−1 > -5 accel.)
+  Ctrl+E + 0..5                                 Rate current song 0–5 stars
+  Ctrl+E + T                                    Open "Add To-Do" dialog
