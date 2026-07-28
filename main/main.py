@@ -684,7 +684,13 @@ class TaskWorker(QThread):
         self._lock = threading.Lock()
         self._running = True
         self._wake = threading.Event()
-        self._interrupted = threading.Event()
+        # Proper pause mechanism: hold the lock, use a Condition to wait
+        # for _paused → False. Event.wait() returned immediately when the
+        # event was already set, which was the bug in the previous impl.
+        self._pause_cond = threading.Condition()
+        self._paused = False
+        # Task currently being executed (readable from any thread)
+        self._current_task_id: Optional[str] = None
 
     def add_task(self, task: dict, priority: bool = False):
         with self._lock:
@@ -695,11 +701,24 @@ class TaskWorker(QThread):
         self._wake.set()
 
     def interrupt(self):
-        self._interrupted.set()
+        """Pause task processing between tasks. The current task, if any,
+        completes atomically first — file operations must never be halted
+        mid-write. UI stays responsive because tasks run on this thread."""
+        with self._pause_cond:
+            self._paused = True
 
     def resume(self):
-        self._interrupted.clear()
+        with self._pause_cond:
+            self._paused = False
+            self._pause_cond.notify_all()
         self._wake.set()
+
+    def is_paused(self) -> bool:
+        with self._pause_cond:
+            return self._paused
+
+    def current_task_id(self) -> Optional[str]:
+        return self._current_task_id
 
     def pending_count(self) -> int:
         with self._lock:
@@ -711,8 +730,12 @@ class TaskWorker(QThread):
 
     def stop(self):
         self._running = False
+        # Force-unpause so the thread can exit
+        with self._pause_cond:
+            self._paused = False
+            self._pause_cond.notify_all()
         self._wake.set()
-        self.wait(5000)
+        self.wait(10000)
 
     def get_serializable_queue(self) -> list:
         with self._lock:
@@ -730,26 +753,38 @@ class TaskWorker(QThread):
             self._wake.clear()
 
             while self._running:
-                if self._interrupted.is_set():
-                    self._interrupted.wait()
+                # ─── Wait if paused (UI activity in progress) ───
+                with self._pause_cond:
+                    while self._paused and self._running:
+                        self._pause_cond.wait(timeout=0.5)
                     if not self._running:
                         break
 
+                # ─── Pop next task ──────────────────────────────
                 with self._lock:
                     if not self._queue:
                         break
                     task = self._queue.pop(0)
 
+                self._current_task_id = task.get('id', '')
+
                 remaining = self.pending_count()
                 total = remaining + 1
                 self.progressUpdate.emit(total - remaining, total)
 
+                # ─── Execute task atomically ────────────────────
+                # We intentionally do NOT check _paused inside file
+                # operations. A single file operation (move/rename) is
+                # allowed to complete without interruption — otherwise
+                # we'd risk file corruption.
                 try:
                     result = self._execute(task)
                     self.taskDone.emit(task.get('id', ''), result)
                 except Exception as e:
                     self.taskFailed.emit(
                         task.get('id', ''), str(e))
+
+                self._current_task_id = None
 
             self.queueEmpty.emit()
 
@@ -1630,6 +1665,12 @@ class MainWindow(QMainWindow):
         self._pending_changes: List[tuple] = []
         self._suppress_rescan = False
 
+        # ── Spinner state: song IDs currently having a queued/running task ──
+        # Maps song_id → dict{'task_id', 'action'}. Row displays a spinner
+        # icon until this entry is removed.
+        self._pending_task_state: Dict[str, dict] = {}
+        self._spinner_icon_cache: Optional["QIcon"] = None
+
         self.player = PlayerController(self)
 
         self.watcher = QFileSystemWatcher(self)
@@ -1651,8 +1692,23 @@ class MainWindow(QMainWindow):
         self._task_worker.queueEmpty.connect(self._on_queue_empty)
         self._task_worker.start()
 
+        # ── UI-priority interrupts ───────────────────────────────
+        # Any keystroke / mouse press pauses the worker briefly; after
+        # 350 ms of UI idle, work resumes.
+        self._ui_idle_timer = QTimer(self)
+        self._ui_idle_timer.setSingleShot(True)
+        self._ui_idle_timer.setInterval(350)
+        self._ui_idle_timer.timeout.connect(self._ui_idle_resume)
+
+        # ── Debounced cache save (never blocks the main thread) ──
+        self._cache_save_timer = QTimer(self)
+        self._cache_save_timer.setSingleShot(True)
+        self._cache_save_timer.setInterval(1500)
+        self._cache_save_timer.timeout.connect(self._flush_cache_now)
+
         # ── Load unfinished tasks from last session ───────────────
         self._load_pending_queue()
+        self._restore_all_spinners_from_queue()
 
         # Restore last opened folder on startup
         last = self.settings.value("root_path", "")
@@ -1702,9 +1758,101 @@ class MainWindow(QMainWindow):
                   "      Install with: pip install pynput\n"
                   "      (In-app shortcuts still work when window is focused.)")
 
+    # ------------------------------------------------------------------
+    # Spinner icon + per-song pending-task tracking
+    # ------------------------------------------------------------------
+    def _get_spinner_icon(self):
+        """Cached QIcon (hourglass) shown on rows whose task is pending."""
+        if self._spinner_icon_cache is not None:
+            return self._spinner_icon_cache
+        from PySide6.QtGui import QIcon, QPixmap
+        pm = QPixmap(18, 18)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QColor("#FF9F0A"))
+        p.setFont(QFont("", 12))
+        p.drawText(pm.rect(), Qt.AlignCenter, "\u23f3")   # hourglass ⏳
+        p.end()
+        self._spinner_icon_cache = QIcon(pm)
+        return self._spinner_icon_cache
+
+    def _mark_task_pending(self, song_id: str, task_id: str, action: str):
+        """Register a queued/running task for a song and show the spinner."""
+        self._pending_task_state[song_id] = {
+            'task_id': task_id, 'action': action}
+        item = self.row_items.get(song_id)
+        if item is not None:
+            item.setIcon(self._get_spinner_icon())
+            act_map = {'MOVE': 'Moving…', 'RENAME': 'Renaming…',
+                       'RATING': 'Saving rating…', 'DELETE': 'Deleting…'}
+            item.setToolTip(act_map.get(action, f"{action}…"))
+        self._update_pending_btn()
+
+    def _mark_task_done(self, song_id: str):
+        """Remove pending marker for a song (task finished / failed)."""
+        self._pending_task_state.pop(song_id, None)
+        item = self.row_items.get(song_id)
+        if item is not None:
+            from PySide6.QtGui import QIcon
+            item.setIcon(QIcon())    # clear icon
+            item.setToolTip("")
+        self._update_pending_btn()
+
+    def _restore_all_spinners_from_queue(self):
+        """After loading pending_queue.json on startup, mark spinners for
+        every song whose task is still pending."""
+        for task in self._task_worker.pending_tasks():
+            sid = task.get('song_id')
+            if sid:
+                self._mark_task_pending(sid, task.get('id', ''), task.get('action', ''))
+
+    # ------------------------------------------------------------------
+    # UI-priority interrupts
+    # ------------------------------------------------------------------
+    def _bump_ui_activity(self):
+        """Call whenever the user does anything (key press, mouse click,
+        shortcut). Pauses the task worker so it doesn't compete for CPU
+        or disk I/O with UI work. Auto-resumes after a short idle window."""
+        if hasattr(self, '_task_worker'):
+            if not self._task_worker.is_paused():
+                self._task_worker.interrupt()
+        # Restart idle timer — resume after 350 ms with no more activity
+        if hasattr(self, '_ui_idle_timer'):
+            self._ui_idle_timer.start()
+
+    def _ui_idle_resume(self):
+        if hasattr(self, '_task_worker'):
+            self._task_worker.resume()
+
+    # ------------------------------------------------------------------
+    # Debounced cache saving (never blocks the main thread)
+    # ------------------------------------------------------------------
+    def _schedule_cache_save(self):
+        """Batch cache-save requests; a background thread does the write."""
+        if hasattr(self, '_cache_save_timer'):
+            self._cache_save_timer.start()
+
+    def _flush_cache_now(self, sync: bool = False):
+        """Write cache to disk. `sync=True` blocks (used at app close)."""
+        if not self.root_path:
+            return
+        snapshot = dict(self.cache)
+        root = self.root_path
+        if sync:
+            save_cache(root, snapshot)
+        else:
+            threading.Thread(
+                target=save_cache, args=(root, snapshot), daemon=True).start()
+
     def eventFilter(self, obj, event):
         """App-wide keyboard handler — works when window has focus."""
         from PySide6.QtCore import QEvent
+
+        # ── UI activity → interrupt worker ──────────────────────
+        if event.type() in (QEvent.KeyPress, QEvent.MouseButtonPress,
+                             QEvent.MouseButtonDblClick, QEvent.Wheel):
+            self._bump_ui_activity()
 
         if event.type() == QEvent.KeyPress:
             key = event.key()
@@ -1871,6 +2019,7 @@ class MainWindow(QMainWindow):
         """Called from pynput background thread via signal — runs on
         main thread. Handles the command even when the app is in
         the background."""
+        self._bump_ui_activity()
         self._handle_command_key(qt_key)
 
     # ------------------------------------------------------------------
@@ -1880,6 +2029,10 @@ class MainWindow(QMainWindow):
         action = result.get('action', '')
         song_id = result.get('song_id', '')
         song = self.songs_by_id.get(song_id)
+
+        # Clear the pending spinner regardless of action
+        if song_id:
+            self._mark_task_done(song_id)
 
         if action == 'MOVE' and song:
             new_path = Path(result['new_path'])
@@ -1935,8 +2088,11 @@ class MainWindow(QMainWindow):
                              f"was: {result.get('old_title','')}")
             self._show_toast(f'\u2713  Renamed: "{new_title}"', 3000, "success")
 
-        elif action == 'RATING':
-            pass
+        elif action == 'RATING' and song:
+            # Update cache with the final rating
+            self._sync_cache(song)
+            # Small toast to confirm persistence (short, not intrusive)
+            # (Rating UI was already updated when user pressed the shortcut.)
 
         elif action == 'DELETE' and song:
             self.cache.pop(result.get('path', ''), None)
@@ -1957,6 +2113,11 @@ class MainWindow(QMainWindow):
         self._save_pending_queue()
 
     def _on_task_failed(self, task_id: str, error: str):
+        # Best-effort spinner cleanup: find song_id whose task matches
+        for sid, state in list(self._pending_task_state.items()):
+            if state.get('task_id') == task_id:
+                self._mark_task_done(sid)
+                break
         self._show_toast(f"Task failed: {error}", 5000, "error")
         self._update_pending_btn()
         self._save_pending_queue()
@@ -1965,7 +2126,7 @@ class MainWindow(QMainWindow):
         self._update_pending_btn()
         self._save_pending_queue()
         if self.root_path:
-            save_cache(self.root_path, self.cache)
+            self._schedule_cache_save()
 
     # ------------------------------------------------------------------
     # Queue persistence
@@ -2005,13 +2166,21 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event):
+        # Save the queue BEFORE stopping the worker so any in-progress
+        # task is atomically persisted for next launch.
         self._save_pending_queue()
         self._save_session_state()
-        self._task_worker.stop()
+        # Allow the CURRENT running task to complete before we exit.
+        # TaskWorker.stop() calls wait() which blocks until run() returns.
+        # We deliberately don't interrupt mid-write to protect files.
+        if hasattr(self, '_task_worker'):
+            self._task_worker.stop()
         if hasattr(self, '_global_hotkeys'):
             self._global_hotkeys.stop()
-        if self.root_path:
-            save_cache(self.root_path, self.cache)
+        # Final SYNCHRONOUS cache flush so we exit clean
+        self._flush_cache_now(sync=True)
+        # Re-save queue in case tasks completed during stop()
+        self._save_pending_queue()
         event.accept()
 
     # ------------------------------------------------------------------
@@ -2171,6 +2340,7 @@ class MainWindow(QMainWindow):
             self._show_toast("No song playing.", 1500, "warning")
             return
         song.rating = rating
+        # Update UI immediately (visual feedback is instant)
         item = self.row_items.get(song.id)
         if item:
             rat_sort = self.table.item(item.row(), COL_RATING)
@@ -2180,27 +2350,26 @@ class MainWindow(QMainWindow):
             if star_wrap:
                 star = star_wrap.findChild(StarRatingWidget)
                 if star: star.set_rating(rating)
-        self._suppress_rescan = True
-        _bg_write_rating(song.path, rating)
-        try:
-            st = song.path.stat()
-            self.cache[str(song.path)] = {
-                "size": st.st_size, "mtime": st.st_mtime,
-                "title": song.title, "artist": song.artist,
-                "rating": rating, "duration": song.duration, "id": song.id}
-        except OSError: pass
-        QTimer.singleShot(2500, lambda: setattr(self, '_suppress_rescan', False))
+        # Queue the disk write via TaskWorker (survives app close)
+        self._queue_rating_task(song, rating)
         stars = "\u2605" * rating + "\u2606" * (5 - rating)
         self._log_change("RATING", song.title, f"{rating}/5")
         self._show_toast(f"\u2713  {stars} ({rating}/5) \u2014 {song.title}", 1500, "success")
 
-        # Set window icon (shows in taskbar)
-        icon_path = Path("../assets/01_media/01_icons/icon.ico")
-        if not icon_path.exists():
-            icon_path = Path("assets/01_media/01_icons/icon.ico")
-        if icon_path.exists():
-            from PySide6.QtGui import QIcon
-            self.setWindowIcon(QIcon(str(icon_path)))
+    def _queue_rating_task(self, song: "Song", rating: int):
+        """Central place to submit a rating-write task."""
+        self._suppress_rescan = True
+        QTimer.singleShot(2500, lambda: setattr(self, '_suppress_rescan', False))
+        task_id = f"rating_{song.id}_{uuid.uuid4().hex[:8]}"
+        self._task_worker.add_task({
+            'id': task_id, 'action': 'RATING',
+            'song_id': song.id,
+            'path': str(song.path),
+            'rating': int(rating),
+            'title': song.title,
+        })
+        self._mark_task_pending(song.id, task_id, 'RATING')
+        self._save_pending_queue()
 
     # ------------------------------------------------------------------
     # UI building
@@ -3038,7 +3207,7 @@ class MainWindow(QMainWindow):
             "title": song.title, "artist": "", "rating": rat_val,
             "duration": 0.0, "id": song.id}
         if self.root_path:
-            save_cache(self.root_path, self.cache)
+            self._schedule_cache_save()
 
         self._rebuild_cat_filter()
         self._apply_filters()
@@ -3059,25 +3228,17 @@ class MainWindow(QMainWindow):
         if self.player.current_song() is song:
             self.player._player.stop()
 
-        try:
-            os.remove(song.path)
-        except OSError as e:
-            self._show_toast(f"Could not delete: {e}", 5000, "error")
-            return
-
-        self.cache.pop(str(song.path), None)
-        if self.root_path:
-            save_cache(self.root_path, self.cache)
-
-        item = self.row_items.pop(song.id, None)
-        self.songs_by_id.pop(song.id, None)
-        if item is not None:
-            self.table.removeRow(item.row())
-
-        self._update_queue_numbers()
-        self._rebuild_play_queue()
-        self._show_toast(f"\u2713  Deleted: {song.title}", 3000, "success")
-        self._log_change("DEL", song.title, str(song.path))
+        # Queue delete — TaskWorker performs os.remove and removes row on done
+        task_id = f"delete_{song.id}_{uuid.uuid4().hex[:8]}"
+        self._task_worker.add_task({
+            'id': task_id, 'action': 'DELETE',
+            'song_id': song.id,
+            'path': str(song.path),
+            'title': song.title,
+        })
+        self._mark_task_pending(song.id, task_id, 'DELETE')
+        self._save_pending_queue()
+        self._show_toast(f"\u23f3  Queued delete: {song.title}", 2000, "info")
 
     def _cycle_repeat(self):
         order = [RepeatMode.OFF, RepeatMode.ALL, RepeatMode.REVERSE, RepeatMode.ONE]
@@ -3233,7 +3394,7 @@ class MainWindow(QMainWindow):
                      moved: int, w: ScanWorker):
         self.progress_bar.setVisible(False)
         self.cache = w.new_cache
-        if self.root_path: save_cache(self.root_path, self.cache)
+        if self.root_path: self._schedule_cache_save()
         self._rebuild_cat_filter()
         n = len(self.songs_by_id)
         self.song_count_label.setText(f"{n} songs")
@@ -3766,6 +3927,11 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, COL_ARTIST, ti)
         self.row_items[song.id] = ti
 
+        # If a task for this song is already pending (e.g. loaded from
+        # the persisted queue on startup), show the spinner now.
+        if song.id in self._pending_task_state:
+            ti.setIcon(self._get_spinner_icon())
+
         sn = QTableWidgetItem(song_part)
         self.table.setItem(row, COL_SONGNAME, sn)
 
@@ -3899,10 +4065,11 @@ class MainWindow(QMainWindow):
                 'old_cat': song.category,
                 'title': song.title,
             })
+            self._mark_task_pending(song.id, task_id, 'MOVE')
             queued += 1
 
         self.bulk_cat_combo.setCurrentIndex(0)
-        self._update_pending_btn()
+        self._save_pending_queue()
         self._show_toast(
             f"\u23f3  {queued} songs queued for move \u2192 '{new_cat}'",
             3000, "info")
@@ -3917,51 +4084,32 @@ class MainWindow(QMainWindow):
         if not songs:
             return
 
-        self._suppress_rescan = True; self.watcher.blockSignals(True)
+        self._suppress_rescan = True
         self._rescan_timer.stop()
-        self.table.setSortingEnabled(False)
-        self._set_info(f"Writing rating to {len(songs)} files\u2026", "loading", auto_reset=False)
+        self._set_info(f"Queuing rating for {len(songs)} files\u2026",
+                       "loading", auto_reset=False)
 
         count = 0
-        for i, song in enumerate(songs):
-            _bg_write_rating(song.path, new_rating)
+        for song in songs:
             song.rating = new_rating
-            try:
-                st = song.path.stat()
-                self.cache[str(song.path)] = {
-                    "size": st.st_size, "mtime": st.st_mtime,
-                    "title": song.title, "artist": song.artist,
-                    "rating": new_rating, "duration": song.duration,
-                    "id": song.id}
-            except OSError:
-                pass
             item = self.row_items.get(song.id)
             if item:
+                rat_sort = self.table.item(item.row(), COL_RATING)
+                if isinstance(rat_sort, _InvisibleSortItem):
+                    rat_sort.set_sort_key(new_rating)
                 star_wrap = self.table.cellWidget(item.row(), COL_RATING)
                 if star_wrap:
                     star = star_wrap.findChild(StarRatingWidget)
-                    if star:
-                        star.set_rating(new_rating)
+                    if star: star.set_rating(new_rating)
+            self._queue_rating_task(song, new_rating)
             count += 1
-            if (i + 1) % 30 == 0:
-                QApplication.processEvents()
 
-        if self.root_path:
-            save_cache(self.root_path, self.cache)
-
-        self.table.setSortingEnabled(True)
         self.bulk_rat_combo.setCurrentIndex(0)
         self._update_queue_numbers()
 
-        QTimer.singleShot(2500, lambda: (
-            setattr(self, '_suppress_rescan', False),
-            self.watcher.blockSignals(False),
-            self._rescan_timer.stop()
-        ))
-
         stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
         self._set_info(
-            f"\u2713  Rating {stars} ({new_rating}/5) set for {count} songs",
+            f"\u23f3  Queued rating {stars} ({new_rating}/5) for {count} songs",
             "success", duration_ms=3500)
 
     def _on_bulk_delete(self):
@@ -3975,28 +4123,21 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
         self._suppress_rescan = True
-        deleted = 0
+        queued = 0
         for song in songs:
             if self.player.current_song() is song:
                 self.player._player.stop()
-            try:
-                os.remove(song.path)
-            except OSError:
-                continue
-            self.cache.pop(str(song.path), None)
-            item = self.row_items.pop(song.id, None)
-            self.songs_by_id.pop(song.id, None)
-            if item:
-                self.table.removeRow(item.row())
-            self._log_change("DEL", song.title, str(song.path))
-            deleted += 1
-        if self.root_path:
-            save_cache(self.root_path, self.cache)
-        self._suppress_rescan = False
-        self._rescan_timer.stop()
-        self._update_queue_numbers()
-        self._rebuild_play_queue()
-        self._show_toast(f"\u2713  Deleted {deleted} file(s)", 3000, "success")
+            task_id = f"bulkdel_{song.id}_{uuid.uuid4().hex[:8]}"
+            self._task_worker.add_task({
+                'id': task_id, 'action': 'DELETE',
+                'song_id': song.id,
+                'path': str(song.path),
+                'title': song.title,
+            })
+            self._mark_task_pending(song.id, task_id, 'DELETE')
+            queued += 1
+        self._save_pending_queue()
+        self._show_toast(f"\u23f3  Queued delete: {queued} file(s)", 3000, "info")
 
     def _on_double_click(self, index):
         item = self.table.item(index.row(), COL_ARTIST)
@@ -4095,22 +4236,25 @@ class MainWindow(QMainWindow):
                         4000, "warning")
                     return
 
-                old_path_str = str(song.path)
                 old_title = song.title
-                ok, new_path = write_display_tags(song.path, new_title, song.artist)
-                if ok:
-                    self.cache.pop(old_path_str, None)
-                    song.path = new_path
-                    song.title = new_title
-                    self.player.notify_song_path_changed(song, new_path)
-                    self._sync_cache(song)
-                    self._set_info(f'\u2713  Renamed: "{new_title}"', "success")
-                    self._log_change("RENAME", new_title, f"was: {old_title}")
-                else:
-                    a2, s2 = _split_title(song.title)
-                    item.setText(a2)
-                    if sn_item: sn_item.setText(s2)
-                    self._set_info("Could not rename file.", "error")
+                # Queue the disk write — UI already shows the new title
+                task_id = f"rename_{song.id}_{uuid.uuid4().hex[:8]}"
+                self._task_worker.add_task({
+                    'id': task_id,
+                    'action': 'RENAME',
+                    'song_id': song.id,
+                    'src_path': str(song.path),
+                    'new_title': new_title,
+                    'old_title': old_title,
+                    'artist': song.artist,
+                })
+                # Optimistically update in-memory title so UI is consistent
+                song.title = new_title
+                self._mark_task_pending(song.id, task_id, 'RENAME')
+                self._save_pending_queue()
+                self._set_info(f'\u23f3  Renaming: "{new_title}"\u2026',
+                               "loading", auto_reset=False)
+                self._log_change("RENAME", new_title, f"was: {old_title}")
 
         if not unlocked:
             ed_artist = self.table.cellWidget(row, COL_ARTIST)
@@ -4166,7 +4310,7 @@ class MainWindow(QMainWindow):
                         "rating": song.rating, "duration": song.duration,
                         "id": song.id})
             self.cache[str(song.path)] = rec
-            if self.root_path: save_cache(self.root_path, self.cache)
+            if self.root_path: self._schedule_cache_save()
         except OSError:
             pass
 
@@ -4200,7 +4344,8 @@ class MainWindow(QMainWindow):
             'old_cat': old_cat,
             'title': song.title,
         })
-        self._update_pending_btn()
+        self._mark_task_pending(song.id, task_id, 'MOVE')
+        self._save_pending_queue()
         self._show_toast(
             f"\u23f3  Moving '{song.title}' \u2192 {new_cat}\u2026", 2000, "info")
 
@@ -4219,16 +4364,7 @@ class MainWindow(QMainWindow):
         lock: LockButton = star_widget.property("lock_ref")
         if lock: lock.set_locked(True)
         star_widget.set_editable(False)
-        self._suppress_rescan = True
-        _bg_write_rating(song.path, new_rating)
-        try:
-            st = song.path.stat()
-            self.cache[str(song.path)] = {
-                "size": st.st_size, "mtime": st.st_mtime,
-                "title": song.title, "artist": song.artist,
-                "rating": new_rating, "duration": song.duration, "id": song.id}
-        except OSError: pass
-        QTimer.singleShot(2500, lambda: setattr(self, '_suppress_rescan', False))
+        self._queue_rating_task(song, new_rating)
         stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
         self._log_change("RATING", song.title, f"{new_rating}/5")
         self._show_toast(f"\u2713  {stars} ({new_rating}/5) \u2014 {song.title}", 2000, "success")
