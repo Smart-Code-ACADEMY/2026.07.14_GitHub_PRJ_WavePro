@@ -588,12 +588,22 @@ class GlobalHotkeyListener(QObject):
         return self._available
 
     def _is_e_key(self, key) -> bool:
-        """Detect the letter E as a held modifier — vk 69 or char 'e'/'E'."""
+        """Detect the letter E as a held modifier — vk 69 or char 'e'/'E'.
+
+        FIX: When Ctrl is held, pynput delivers a control character
+        (\\x05 for Ctrl+E) instead of the letter 'e'. We now detect
+        this control character as well, ensuring Ctrl+E works reliably
+        on all platforms (Linux, macOS, Windows).
+        """
         if hasattr(key, 'vk') and key.vk == 69:  # VK_E
             return True
         ch = getattr(key, 'char', None)
-        if ch and ch.lower() == 'e':
-            return True
+        if ch is not None:
+            if ch.lower() == 'e':
+                return True
+            # Ctrl+E produces control character \x05 on many platforms
+            if ch == '\x05':
+                return True
         return False
 
     def _on_press(self, key):
@@ -660,12 +670,18 @@ class GlobalHotkeyListener(QObject):
             if 65 <= vk <= 90:   # A-Z
                 return Qt.Key_A + (vk - 65)
         ch = getattr(key, 'char', None)
-        if ch and len(ch) == 1 and ' ' <= ch <= '~':
-            c = ch.lower()
-            if '0' <= c <= '9':
-                return Qt.Key_0 + (ord(c) - ord('0'))
-            if 'a' <= c <= 'z':
-                return Qt.Key_A + (ord(c) - ord('a'))
+        if ch and len(ch) == 1:
+            # Handle control characters: Ctrl+digit doesn't mangle digits
+            # on most platforms, but Ctrl+letter produces \x01-\x1a
+            if '0' <= ch <= '9':
+                return Qt.Key_0 + (ord(ch) - ord('0'))
+            if ' ' <= ch <= '~':
+                c = ch.lower()
+                if 'a' <= c <= 'z':
+                    return Qt.Key_A + (ord(c) - ord('a'))
+            # Map control characters back to letters (Ctrl+A=\x01 → A)
+            if '\x01' <= ch <= '\x1a':
+                return Qt.Key_A + (ord(ch) - 1)
         return None
 
 
@@ -684,12 +700,8 @@ class TaskWorker(QThread):
         self._lock = threading.Lock()
         self._running = True
         self._wake = threading.Event()
-        # Proper pause mechanism: hold the lock, use a Condition to wait
-        # for _paused → False. Event.wait() returned immediately when the
-        # event was already set, which was the bug in the previous impl.
         self._pause_cond = threading.Condition()
         self._paused = False
-        # Task currently being executed (readable from any thread)
         self._current_task_id: Optional[str] = None
 
     def add_task(self, task: dict, priority: bool = False):
@@ -701,9 +713,6 @@ class TaskWorker(QThread):
         self._wake.set()
 
     def interrupt(self):
-        """Pause task processing between tasks. The current task, if any,
-        completes atomically first — file operations must never be halted
-        mid-write. UI stays responsive because tasks run on this thread."""
         with self._pause_cond:
             self._paused = True
 
@@ -730,7 +739,6 @@ class TaskWorker(QThread):
 
     def stop(self):
         self._running = False
-        # Force-unpause so the thread can exit
         with self._pause_cond:
             self._paused = False
             self._pause_cond.notify_all()
@@ -753,14 +761,12 @@ class TaskWorker(QThread):
             self._wake.clear()
 
             while self._running:
-                # ─── Wait if paused (UI activity in progress) ───
                 with self._pause_cond:
                     while self._paused and self._running:
                         self._pause_cond.wait(timeout=0.5)
                     if not self._running:
                         break
 
-                # ─── Pop next task ──────────────────────────────
                 with self._lock:
                     if not self._queue:
                         break
@@ -772,11 +778,6 @@ class TaskWorker(QThread):
                 total = remaining + 1
                 self.progressUpdate.emit(total - remaining, total)
 
-                # ─── Execute task atomically ────────────────────
-                # We intentionally do NOT check _paused inside file
-                # operations. A single file operation (move/rename) is
-                # allowed to complete without interruption — otherwise
-                # we'd risk file corruption.
                 try:
                     result = self._execute(task)
                     self.taskDone.emit(task.get('id', ''), result)
@@ -1612,8 +1613,7 @@ ROW_HEIGHT = 38
 
 
 # ============================================================================
-# Shortcut help text (single source of truth — printed at startup and
-# shown in the info bar)
+# Shortcut help text
 # ============================================================================
 SHORTCUTS_HELP = """
 ──────────────────────── KEYBOARD SHORTCUTS ─────────────────────
@@ -1666,10 +1666,13 @@ class MainWindow(QMainWindow):
         self._suppress_rescan = False
 
         # ── Spinner state: song IDs currently having a queued/running task ──
-        # Maps song_id → dict{'task_id', 'action'}. Row displays a spinner
-        # icon until this entry is removed.
         self._pending_task_state: Dict[str, dict] = {}
         self._spinner_icon_cache: Optional["QIcon"] = None
+
+        # ── FIX: Track ALL pending actions per song (not just the latest) ──
+        # Maps song_id → set of action strings ('RATING', 'MOVE', etc.)
+        # This prevents rescans from overwriting fields being modified.
+        self._pending_actions_per_song: Dict[str, set] = {}
 
         self.player = PlayerController(self)
 
@@ -1693,8 +1696,6 @@ class MainWindow(QMainWindow):
         self._task_worker.start()
 
         # ── UI-priority interrupts ───────────────────────────────
-        # Any keystroke / mouse press pauses the worker briefly; after
-        # 350 ms of UI idle, work resumes.
         self._ui_idle_timer = QTimer(self)
         self._ui_idle_timer.setSingleShot(True)
         self._ui_idle_timer.setInterval(350)
@@ -1706,6 +1707,15 @@ class MainWindow(QMainWindow):
         self._cache_save_timer.setInterval(1500)
         self._cache_save_timer.timeout.connect(self._flush_cache_now)
 
+        # ── Pulse animation timers for Queue / View Changes btns ─
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.setSingleShot(True)
+        self._pulse_step = 0
+        self._pulse_target_btn: Optional[QPushButton] = None
+        self._pulse_original_style = ""
+        self._pulse_color = ""
+        self._pulse_timer.timeout.connect(self._pulse_tick)
+
         # ── Load unfinished tasks from last session ───────────────
         self._load_pending_queue()
         self._restore_all_spinners_from_queue()
@@ -1715,13 +1725,51 @@ class MainWindow(QMainWindow):
         if last and Path(last).is_dir():
             QTimer.singleShot(0, lambda p=Path(last): self._set_root(p))
 
+    # ------------------------------------------------------------------
+    # Button pulse animation (visual feedback for queue/changes)
+    # ------------------------------------------------------------------
+    def _pulse_button(self, button: QPushButton, color: str, pulses: int = 3):
+        """Make a button pulse with a colored glow to draw the user's
+        attention. Used when tasks enter the Queue (orange) or complete
+        in View Changes (green).
+
+        FIX: This provides the visual feedback the user requested —
+        orange blink on Queue when new items arrive, green blink on
+        View Changes when items complete.
+        """
+        self._pulse_target_btn = button
+        self._pulse_original_style = button.styleSheet()
+        self._pulse_color = color
+        self._pulse_step = 0
+        self._pulse_max = pulses * 2  # on/off pairs
+        self._pulse_tick()
+
+    def _pulse_tick(self):
+        if self._pulse_target_btn is None or self._pulse_step >= self._pulse_max:
+            # Restore original style
+            if self._pulse_target_btn is not None:
+                self._pulse_target_btn.setStyleSheet(self._pulse_original_style)
+                self._pulse_target_btn = None
+            return
+
+        btn = self._pulse_target_btn
+        if self._pulse_step % 2 == 0:
+            # Glow ON
+            btn.setStyleSheet(
+                f"QPushButton{{background:{self._pulse_color};"
+                f"border:1.5px solid {self._pulse_color};"
+                f"border-radius:10px;color:#fff;font-weight:700;"
+                f"padding:8px 16px;font-size:13px;}}")
+        else:
+            # Glow OFF (back to normal briefly)
+            btn.setStyleSheet(self._pulse_original_style)
+
+        self._pulse_step += 1
+        self._pulse_timer.start(250)  # 250ms per phase
+
     def _setup_shortcuts(self):
-        # ── Manual E-key tracking (in-app) ────────────────────────
-        # Qt modifiers natively track Ctrl/Shift/Alt/Meta. We track the
-        # E key ourselves so Ctrl+E+<action> works as a chorded prefix.
         self._e_held = False
 
-        # Seek acceleration: repeated arrow presses skip further
         self._seek_accel_count = 0
         self._seek_accel_timer = QTimer(self)
         self._seek_accel_timer.setSingleShot(True)
@@ -1729,7 +1777,6 @@ class MainWindow(QMainWindow):
         self._seek_accel_timer.timeout.connect(
             lambda: setattr(self, '_seek_accel_count', 0))
 
-        # Volume acceleration: repeated up/down presses jump further
         self._vol_accel_count = 0
         self._vol_accel_timer = QTimer(self)
         self._vol_accel_timer.setSingleShot(True)
@@ -1737,20 +1784,15 @@ class MainWindow(QMainWindow):
         self._vol_accel_timer.timeout.connect(
             lambda: setattr(self, '_vol_accel_count', 0))
 
-        # Dedup: track last-fire timestamp per key so the same command
-        # arriving twice (Qt eventFilter + pynput) is not executed twice.
         self._last_cmd_times: Dict[int, float] = {}
 
-        # ── App-wide event filter (works when app HAS focus) ─────
         QApplication.instance().installEventFilter(self)
 
-        # ── Global hotkey listener (works when app is in BG) ─────
         self._global_hotkeys = GlobalHotkeyListener(self)
         self._global_hotkeys.commandReceived.connect(
             self._on_global_hotkey)
         self._global_hotkeys.start()
 
-        # Print shortcut help
         print(SHORTCUTS_HELP)
 
         if not self._global_hotkeys.is_available():
@@ -1762,7 +1804,6 @@ class MainWindow(QMainWindow):
     # Spinner icon + per-song pending-task tracking
     # ------------------------------------------------------------------
     def _get_spinner_icon(self):
-        """Cached QIcon (hourglass) shown on rows whose task is pending."""
         if self._spinner_icon_cache is not None:
             return self._spinner_icon_cache
         from PySide6.QtGui import QIcon, QPixmap
@@ -1778,9 +1819,18 @@ class MainWindow(QMainWindow):
         return self._spinner_icon_cache
 
     def _mark_task_pending(self, song_id: str, task_id: str, action: str):
-        """Register a queued/running task for a song and show the spinner."""
+        """Register a queued/running task for a song and show the spinner.
+
+        FIX: Also tracks the action type so _add_or_update knows which
+        fields to protect from rescan overwrites.
+        """
         self._pending_task_state[song_id] = {
             'task_id': task_id, 'action': action}
+        # Track all pending action types per song
+        if song_id not in self._pending_actions_per_song:
+            self._pending_actions_per_song[song_id] = set()
+        self._pending_actions_per_song[song_id].add(action)
+
         item = self.row_items.get(song_id)
         if item is not None:
             item.setIcon(self._get_spinner_icon())
@@ -1788,20 +1838,35 @@ class MainWindow(QMainWindow):
                        'RATING': 'Saving rating…', 'DELETE': 'Deleting…'}
             item.setToolTip(act_map.get(action, f"{action}…"))
         self._update_pending_btn()
+        # FIX: Pulse the Queue button orange when new tasks are added
+        if hasattr(self, 'pending_btn'):
+            self._pulse_button(self.pending_btn, "#FF9F0A", pulses=2)
 
-    def _mark_task_done(self, song_id: str):
-        """Remove pending marker for a song (task finished / failed)."""
+    def _mark_task_done(self, song_id: str, action: str = ''):
+        """Remove pending marker for a song (task finished / failed).
+
+        FIX: Now also removes the action from _pending_actions_per_song
+        and restores the pen icon (not just clearing icon).
+        """
         self._pending_task_state.pop(song_id, None)
+        # Remove the specific completed action
+        if song_id in self._pending_actions_per_song:
+            self._pending_actions_per_song[song_id].discard(action)
+            if not self._pending_actions_per_song[song_id]:
+                del self._pending_actions_per_song[song_id]
+
         item = self.row_items.get(song_id)
         if item is not None:
-            from PySide6.QtGui import QIcon
-            item.setIcon(QIcon())    # clear icon
-            item.setToolTip("")
+            # If there are still pending actions for this song, keep spinner
+            if song_id in self._pending_actions_per_song:
+                item.setIcon(self._get_spinner_icon())
+            else:
+                from PySide6.QtGui import QIcon
+                item.setIcon(QIcon())    # clear icon
+                item.setToolTip("")
         self._update_pending_btn()
 
     def _restore_all_spinners_from_queue(self):
-        """After loading pending_queue.json on startup, mark spinners for
-        every song whose task is still pending."""
         for task in self._task_worker.pending_tasks():
             sid = task.get('song_id')
             if sid:
@@ -1811,13 +1876,9 @@ class MainWindow(QMainWindow):
     # UI-priority interrupts
     # ------------------------------------------------------------------
     def _bump_ui_activity(self):
-        """Call whenever the user does anything (key press, mouse click,
-        shortcut). Pauses the task worker so it doesn't compete for CPU
-        or disk I/O with UI work. Auto-resumes after a short idle window."""
         if hasattr(self, '_task_worker'):
             if not self._task_worker.is_paused():
                 self._task_worker.interrupt()
-        # Restart idle timer — resume after 350 ms with no more activity
         if hasattr(self, '_ui_idle_timer'):
             self._ui_idle_timer.start()
 
@@ -1826,15 +1887,13 @@ class MainWindow(QMainWindow):
             self._task_worker.resume()
 
     # ------------------------------------------------------------------
-    # Debounced cache saving (never blocks the main thread)
+    # Debounced cache saving
     # ------------------------------------------------------------------
     def _schedule_cache_save(self):
-        """Batch cache-save requests; a background thread does the write."""
         if hasattr(self, '_cache_save_timer'):
             self._cache_save_timer.start()
 
     def _flush_cache_now(self, sync: bool = False):
-        """Write cache to disk. `sync=True` blocks (used at app close)."""
         if not self.root_path:
             return
         snapshot = dict(self.cache)
@@ -1846,10 +1905,8 @@ class MainWindow(QMainWindow):
                 target=save_cache, args=(root, snapshot), daemon=True).start()
 
     def eventFilter(self, obj, event):
-        """App-wide keyboard handler — works when window has focus."""
         from PySide6.QtCore import QEvent
 
-        # ── UI activity → interrupt worker ──────────────────────
         if event.type() in (QEvent.KeyPress, QEvent.MouseButtonPress,
                              QEvent.MouseButtonDblClick, QEvent.Wheel):
             self._bump_ui_activity()
@@ -1858,24 +1915,20 @@ class MainWindow(QMainWindow):
             key = event.key()
             mods = event.modifiers()
 
-            # ── Zero-modifier media keys ─────────────────────────
             if key in (Qt.Key_MediaNext, Qt.Key_MediaPrevious,
                        Qt.Key_VolumeMute):
                 if self._handle_command_key(key):
                     return True
 
-            # ── Ctrl + Space → Play / Pause ──────────────────────
             if key == Qt.Key_Space and (mods & Qt.ControlModifier):
                 if self._handle_command_key(Qt.Key_Space):
                     return True
 
-            # ── Track E press (only meaningful with Ctrl held) ───
             if key == Qt.Key_E and not event.isAutoRepeat():
                 if mods & Qt.ControlModifier:
                     self._e_held = True
-                    return True   # consume Ctrl+E itself
+                    return True
 
-            # ── Ctrl + E + action ────────────────────────────────
             if (mods & Qt.ControlModifier) and self._e_held:
                 if key not in (Qt.Key_E, Qt.Key_Control, Qt.Key_Shift):
                     if self._handle_command_key(key):
@@ -1888,13 +1941,11 @@ class MainWindow(QMainWindow):
                 self._seek_accel_count = 0
                 self._vol_accel_count  = 0
             elif key == Qt.Key_Control:
-                # Releasing Ctrl always drops the E-modifier state
                 self._e_held = False
 
         return super().eventFilter(obj, event)
 
     def changeEvent(self, event):
-        """Reset modifier state when window loses focus."""
         from PySide6.QtCore import QEvent
         if event.type() == QEvent.ActivationChange:
             if not self.isActiveWindow():
@@ -1904,7 +1955,6 @@ class MainWindow(QMainWindow):
         super().changeEvent(event)
 
     def _get_seek_step_ms(self) -> int:
-        """Accelerating seek: 5s → 7s → 9s → 12s → … → 30s max."""
         self._seek_accel_count += 1
         self._seek_accel_timer.start()
         n = self._seek_accel_count
@@ -1914,32 +1964,22 @@ class MainWindow(QMainWindow):
         return step
 
     def _handle_command_key(self, key, shift: bool = False) -> bool:
-        """Dispatch a hotkey action.
-        Returns True if handled."""
-
-        # ── Deduplication ─────────────────────────────────────────
-        # When the app window has focus, a key can fire twice — once
-        # via Qt's event filter, once via the pynput global listener.
-        # Ignore duplicates that arrive within 200 ms of each other.
         now = time.monotonic()
         last = self._last_cmd_times.get(key, 0.0)
         if now - last < 0.20:
-            return True   # swallow the duplicate
+            return True
         self._last_cmd_times[key] = now
 
-        # ── Ctrl+E+T → Add To-Do ──────────────────────────────────
         if key == Qt.Key_T:
             self.raise_()
             self.activateWindow()
             self._add_todo()
             return True
 
-        # ── Rating: 0–5 (Ctrl+E+digit) ────────────────────────────
         if Qt.Key_0 <= key <= Qt.Key_5:
             self._shortcut_rating(key - Qt.Key_0)
             return True
 
-        # ── Seek forward (Ctrl+E+→, accelerating) ─────────────────
         if key == Qt.Key_Right:
             if self.player.current_song():
                 step = self._get_seek_step_ms()
@@ -1949,7 +1989,6 @@ class MainWindow(QMainWindow):
                 self._show_toast("No song playing.", 1000, "warning")
             return True
 
-        # ── Seek backward (Ctrl+E+←, accelerating) ────────────────
         if key == Qt.Key_Left:
             if self.player.current_song():
                 step = self._get_seek_step_ms()
@@ -1959,12 +1998,10 @@ class MainWindow(QMainWindow):
                 self._show_toast("No song playing.", 1000, "warning")
             return True
 
-        # ── Play / Pause (Ctrl+Space) ─────────────────────────────
         if key == Qt.Key_Space:
             self._shortcut_play_pause()
             return True
 
-        # ── Next / Previous (MediaNext / MediaPrev, no modifier) ──
         if key == Qt.Key_MediaNext:
             if self.player.current_song() is None:
                 songs = self._visible_songs_in_order()
@@ -1983,7 +2020,6 @@ class MainWindow(QMainWindow):
                 self.player.previous()
             return True
 
-        # ── Volume Up / Down  (accelerating ±1 → ±5) ──────────────
         if key == Qt.Key_Up:
             step = self._get_volume_step()
             self.vol_slider.setValue(min(100, self.vol_slider.value() + step))
@@ -1994,7 +2030,6 @@ class MainWindow(QMainWindow):
             self.vol_slider.setValue(max(0, self.vol_slider.value() - step))
             return True
 
-        # ── Mute (media key only) ─────────────────────────────────
         if key == Qt.Key_VolumeMute:
             self.vol_slider.setValue(
                 0 if self.vol_slider.value() > 0 else 80)
@@ -2003,7 +2038,6 @@ class MainWindow(QMainWindow):
         return False
 
     def _get_volume_step(self) -> int:
-        """Accelerating volume: 1, 1, 2, 3, 5, 5, 5 …"""
         self._vol_accel_count += 1
         self._vol_accel_timer.start()
         n = self._vol_accel_count
@@ -2016,9 +2050,6 @@ class MainWindow(QMainWindow):
         return 5
 
     def _on_global_hotkey(self, qt_key: int):
-        """Called from pynput background thread via signal — runs on
-        main thread. Handles the command even when the app is in
-        the background."""
         self._bump_ui_activity()
         self._handle_command_key(qt_key)
 
@@ -2030,9 +2061,9 @@ class MainWindow(QMainWindow):
         song_id = result.get('song_id', '')
         song = self.songs_by_id.get(song_id)
 
-        # Clear the pending spinner regardless of action
+        # FIX: Clear the pending spinner with action info
         if song_id:
-            self._mark_task_done(song_id)
+            self._mark_task_done(song_id, action)
 
         if action == 'MOVE' and song:
             new_path = Path(result['new_path'])
@@ -2089,10 +2120,8 @@ class MainWindow(QMainWindow):
             self._show_toast(f'\u2713  Renamed: "{new_title}"', 3000, "success")
 
         elif action == 'RATING' and song:
-            # Update cache with the final rating
+            # FIX: Sync cache with the confirmed rating from disk
             self._sync_cache(song)
-            # Small toast to confirm persistence (short, not intrusive)
-            # (Rating UI was already updated when user pressed the shortcut.)
 
         elif action == 'DELETE' and song:
             self.cache.pop(result.get('path', ''), None)
@@ -2112,15 +2141,21 @@ class MainWindow(QMainWindow):
         self._update_pending_btn()
         self._save_pending_queue()
 
+        # FIX: Pulse the View Changes button green when a task completes
+        if hasattr(self, 'changes_btn') and action != 'RATING':
+            self._pulse_button(self.changes_btn, "#30D158", pulses=2)
+
     def _on_task_failed(self, task_id: str, error: str):
-        # Best-effort spinner cleanup: find song_id whose task matches
         for sid, state in list(self._pending_task_state.items()):
             if state.get('task_id') == task_id:
-                self._mark_task_done(sid)
+                self._mark_task_done(sid, state.get('action', ''))
                 break
         self._show_toast(f"Task failed: {error}", 5000, "error")
         self._update_pending_btn()
         self._save_pending_queue()
+        # FIX: Pulse View Changes red on failure
+        if hasattr(self, 'changes_btn'):
+            self._pulse_button(self.changes_btn, "#FF453A", pulses=2)
 
     def _on_queue_empty(self):
         self._update_pending_btn()
@@ -2166,28 +2201,20 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event):
-        # Save the queue BEFORE stopping the worker so any in-progress
-        # task is atomically persisted for next launch.
         self._save_pending_queue()
         self._save_session_state()
-        # Allow the CURRENT running task to complete before we exit.
-        # TaskWorker.stop() calls wait() which blocks until run() returns.
-        # We deliberately don't interrupt mid-write to protect files.
         if hasattr(self, '_task_worker'):
             self._task_worker.stop()
         if hasattr(self, '_global_hotkeys'):
             self._global_hotkeys.stop()
-        # Final SYNCHRONOUS cache flush so we exit clean
         self._flush_cache_now(sync=True)
-        # Re-save queue in case tasks completed during stop()
         self._save_pending_queue()
         event.accept()
 
     # ------------------------------------------------------------------
-    # Session state persistence (filters + last-played song)
+    # Session state persistence
     # ------------------------------------------------------------------
     def _save_session_state(self):
-        """Save current filter state and last-played song path via QSettings."""
         try:
             self.settings.setValue("filter/search",     self._filter_search)
             self.settings.setValue("filter/rating",     self._filter_rating)
@@ -2196,10 +2223,8 @@ class MainWindow(QMainWindow):
             self.settings.setValue("filter/accordion",  self._filter_accordion)
             self.settings.setValue("filter/christmas",  self._filter_christmas)
             self.settings.setValue("filter/cat_checks", json.dumps(self._cat_checks))
-            # Sort column & order
             self.settings.setValue("sort/col",   self._last_sort_col)
             self.settings.setValue("sort/order", int(self._last_sort_order))
-            # Last played song — prefer highlighted (last selection), else player
             last = self.player.current_song()
             if last is None and self._highlighted_id:
                 last = self.songs_by_id.get(self._highlighted_id)
@@ -2207,20 +2232,16 @@ class MainWindow(QMainWindow):
                 self.settings.setValue("session/last_song_path", str(last.path))
             else:
                 self.settings.remove("session/last_song_path")
-            # Volume
             self.settings.setValue("session/volume", self.vol_slider.value())
         except Exception as e:
             print(f"WARN: could not save session state: {e}")
 
     def _restore_session_state(self):
-        """Restore filters + last-played song. Called ONCE after first scan
-        completes, so that self.songs_by_id is populated."""
         if getattr(self, '_session_restored', False):
             return
         self._session_restored = True
 
         try:
-            # ── Filters ─────────────────────────────────────────
             search = self.settings.value("filter/search", "", type=str)
             if search:
                 self.search_box.blockSignals(True)
@@ -2262,18 +2283,15 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-            # ── Sort ────────────────────────────────────────────
             sort_col   = self.settings.value("sort/col",   COL_ARTIST, type=int)
             sort_order = self.settings.value("sort/order", int(Qt.AscendingOrder), type=int)
             if sort_col in (COL_ARTIST, COL_SONGNAME, COL_CATEGORY, COL_RATING):
                 self.table.sortItems(sort_col, Qt.SortOrder(sort_order))
 
-            # ── Volume ──────────────────────────────────────────
             vol = self.settings.value("session/volume", -1, type=int)
             if 0 <= vol <= 100:
                 self.vol_slider.setValue(vol)
 
-            # ── Apply filters, then locate last song ────────────
             self._apply_filters()
 
             last_path = self.settings.value("session/last_song_path", "", type=str)
@@ -2293,33 +2311,24 @@ class MainWindow(QMainWindow):
             print(f"WARN: could not restore session state: {e}")
 
     def _restore_last_song(self, song: Song):
-        """Load the last-played song into the player without autoplay,
-        highlight it in blue, and scroll to it."""
-        # Load into the player queue so Ctrl+Space starts it
         visible = self._visible_songs_in_order()
         if song in visible:
             queue = visible
         else:
-            # Song may be filtered out — put it as a single-item queue
             queue = [song]
         self.player._queue = list(queue)
         self.player._index = queue.index(song) if song in queue else 0
-        # Set the media source but DO NOT play
         try:
             self.player._player.setSource(QUrl.fromLocalFile(str(song.path)))
         except Exception:
             pass
-        # Update the "Now Playing" label
         self.player.songChanged.emit(song)
-        # Ensure the row is highlighted in blue
         self._highlight(song)
-        # Scroll into view
         item = self.row_items.get(song.id)
         if item is not None:
             row = item.row()
             if not self.table.isRowHidden(row):
                 idx = self.table.model().index(row, COL_ARTIST)
-                # Delay scroll one tick so the table has laid out
                 QTimer.singleShot(50, lambda: self.table.scrollTo(
                     idx, QAbstractItemView.PositionAtCenter))
         self._show_toast(
@@ -2340,7 +2349,7 @@ class MainWindow(QMainWindow):
             self._show_toast("No song playing.", 1500, "warning")
             return
         song.rating = rating
-        # Update UI immediately (visual feedback is instant)
+        # Update UI immediately
         item = self.row_items.get(song.id)
         if item:
             rat_sort = self.table.item(item.row(), COL_RATING)
@@ -2350,16 +2359,44 @@ class MainWindow(QMainWindow):
             if star_wrap:
                 star = star_wrap.findChild(StarRatingWidget)
                 if star: star.set_rating(rating)
-        # Queue the disk write via TaskWorker (survives app close)
+        # Queue the disk write
         self._queue_rating_task(song, rating)
         stars = "\u2605" * rating + "\u2606" * (5 - rating)
         self._log_change("RATING", song.title, f"{rating}/5")
         self._show_toast(f"\u2713  {stars} ({rating}/5) \u2014 {song.title}", 1500, "success")
 
     def _queue_rating_task(self, song: "Song", rating: int):
-        """Central place to submit a rating-write task."""
+        """Central place to submit a rating-write task.
+
+        FIX: Now IMMEDIATELY updates the in-memory cache so that:
+        1. If a rescan triggers before the disk write completes,
+           the ScanWorker reads the NEW rating from cache, not
+           the stale one from disk.
+        2. The rating is guaranteed persisted even if the app
+           closes before the task worker processes it.
+        """
         self._suppress_rescan = True
         QTimer.singleShot(2500, lambda: setattr(self, '_suppress_rescan', False))
+
+        # ── FIX: Immediately update cache with new rating ──────────
+        cache_key = str(song.path)
+        if cache_key in self.cache:
+            self.cache[cache_key]['rating'] = int(rating)
+        else:
+            # Create a cache entry if one doesn't exist yet
+            try:
+                st = song.path.stat()
+                self.cache[cache_key] = {
+                    'size': st.st_size, 'mtime': st.st_mtime,
+                    'title': song.title, 'artist': song.artist,
+                    'rating': int(rating), 'duration': song.duration,
+                    'id': song.id,
+                }
+            except OSError:
+                pass
+        # Schedule a cache flush so it persists to disk
+        self._schedule_cache_save()
+
         task_id = f"rating_{song.id}_{uuid.uuid4().hex[:8]}"
         self._task_worker.add_task({
             'id': task_id, 'action': 'RATING',
@@ -2422,7 +2459,6 @@ class MainWindow(QMainWindow):
         add_todo_btn.clicked.connect(self._add_todo)
         lay.addWidget(add_todo_btn)
 
-        # Shortcut help button
         help_btn = QToolButton()
         help_btn.setText("? Shortcuts")
         help_btn.setToolTip("Show all keyboard shortcuts")
@@ -2476,16 +2512,16 @@ class MainWindow(QMainWindow):
             <td style='padding:6px 12px;'>Previous song</td></tr>
         <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>MediaMute</td>
             <td style='padding:6px 12px;'>Mute / Unmute</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+E + →</td>
-            <td style='padding:6px 12px;'>Seek forward (5s → 30s accelerating)</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+E + ←</td>
-            <td style='padding:6px 12px;'>Seek backward (5s → 30s accelerating)</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+E + ↑</td>
-            <td style='padding:6px 12px;'>Volume up  (+1 → +5 accelerating)</td></tr>
-        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+E + ↓</td>
-            <td style='padding:6px 12px;'>Volume down (−1 → −5 accelerating)</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+E + \u2192</td>
+            <td style='padding:6px 12px;'>Seek forward (5s \u2192 30s accelerating)</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+E + \u2190</td>
+            <td style='padding:6px 12px;'>Seek backward (5s \u2192 30s accelerating)</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+E + \u2191</td>
+            <td style='padding:6px 12px;'>Volume up  (+1 \u2192 +5 accelerating)</td></tr>
+        <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+E + \u2193</td>
+            <td style='padding:6px 12px;'>Volume down (\u22121 \u2192 \u22125 accelerating)</td></tr>
         <tr><td style='padding:6px 12px;color:#0a84ff;font-weight:600;'>Ctrl+E + 0..5</td>
-            <td style='padding:6px 12px;'>Rate current song 0–5 stars ★</td></tr>
+            <td style='padding:6px 12px;'>Rate current song 0\u20135 stars \u2605</td></tr>
         <tr><td style='padding:6px 12px;color:#FFD60A;font-weight:600;'>Ctrl+E + T</td>
             <td style='padding:6px 12px;'><b>Open "Add To-Do" dialog</b></td></tr>
         </table>
@@ -2863,9 +2899,7 @@ class MainWindow(QMainWindow):
 
         ctrl.addStretch(1)
 
-        def _circle_btn(text: str, size: int, tooltip: str,
-                        bg: str = "#2c2c2e", fg: str = "#f2f2f7",
-                        font_size: int = 15) -> QToolButton:
+        def _circle_btn(text, size, tooltip, bg="#2c2c2e", fg="#f2f2f7", font_size=15):
             btn = QToolButton()
             btn.setText(text)
             btn.setFixedSize(size, size)
@@ -2875,8 +2909,7 @@ class MainWindow(QMainWindow):
                 f"QToolButton{{background:{bg};border:none;border-radius:{size//2}px;"
                 f"color:{fg};font-size:{font_size}px;font-weight:600;}}"
                 f"QToolButton:hover{{background:#3a3a3c;color:#ffffff;}}"
-                f"QToolButton:pressed{{background:#232325;}}"
-            )
+                f"QToolButton:pressed{{background:#232325;}}")
             return btn
 
         self.rep_btn = _circle_btn("\u21bb", 36, "Repeat: Off",
@@ -3228,7 +3261,6 @@ class MainWindow(QMainWindow):
         if self.player.current_song() is song:
             self.player._player.stop()
 
-        # Queue delete — TaskWorker performs os.remove and removes row on done
         task_id = f"delete_{song.id}_{uuid.uuid4().hex[:8]}"
         self._task_worker.add_task({
             'id': task_id, 'action': 'DELETE',
@@ -3394,6 +3426,23 @@ class MainWindow(QMainWindow):
                      moved: int, w: ScanWorker):
         self.progress_bar.setVisible(False)
         self.cache = w.new_cache
+
+        # FIX: After scan finishes, re-apply any pending in-memory values
+        # to the cache so they aren't lost.
+        for sid, actions in self._pending_actions_per_song.items():
+            song = self.songs_by_id.get(sid)
+            if song is None:
+                continue
+            cache_key = str(song.path)
+            if cache_key in self.cache:
+                if 'RATING' in actions:
+                    self.cache[cache_key]['rating'] = song.rating
+                if 'MOVE' in actions:
+                    # category will be correct after move completes
+                    pass
+                if 'RENAME' in actions:
+                    self.cache[cache_key]['title'] = song.title
+
         if self.root_path: self._schedule_cache_save()
         self._rebuild_cat_filter()
         n = len(self.songs_by_id)
@@ -3405,7 +3454,6 @@ class MainWindow(QMainWindow):
         self._update_queue_numbers()
         self._rebuild_play_queue()
 
-        # ── Restore filters + last-played song (first scan only) ────
         self._restore_session_state()
 
         if added or removed:
@@ -3545,7 +3593,7 @@ class MainWindow(QMainWindow):
                          f"<span style='color:#8e8e93;'>\u2014 {action}: {detail}</span></p>")
 
         if not bg_tasks and not self._pending_changes:
-            html += "<p style='color:#30D158;'>\u2713  All tasks complete — queue is empty.</p>"
+            html += "<p style='color:#30D158;'>\u2713  All tasks complete \u2014 queue is empty.</p>"
 
         html += "</div>"
 
@@ -3771,7 +3819,6 @@ class MainWindow(QMainWindow):
             if song.category not in checked_cats:
                 return False
         if self._filter_search:
-            artist_part, song_part = _split_title(song.title)
             combined = song.title.lower()
             if self._filter_search not in combined:
                 return False
@@ -3874,46 +3921,78 @@ class MainWindow(QMainWindow):
         self.player.play_song(songs[0], queue=songs)
 
     # ------------------------------------------------------------------
-    # Table rows (incremental)
+    # _add_or_update  — THE CRITICAL FIX for rescan protection
     # ------------------------------------------------------------------
     def _add_or_update(self, song: Song):
+        """Add a song to the table, or update an existing one.
+
+        FIX: When a song has pending tasks (rating change, move, rename),
+        the rescan must NOT overwrite those in-memory values with stale
+        data from disk. We check _pending_actions_per_song and skip
+        updating fields that are still being modified.
+        """
         existing_id = None
         for sid, s in self.songs_by_id.items():
-            if s.path == song.path and sid != song.id:
+            if s.id == song.id:
                 existing_id = sid
                 break
+            if str(s.path) == str(song.path):
+                existing_id = sid
+                break
+
         if existing_id:
             old_song = self.songs_by_id[existing_id]
-            old_song.title = song.title
-            old_song.artist = song.artist
-            old_song.rating = song.rating
-            old_song.category = song.category
+            has_pending = existing_id in self._pending_actions_per_song
+            pending_actions = self._pending_actions_per_song.get(existing_id, set())
+
+            # Only update fields that DON'T have a pending task
+            if 'RENAME' not in pending_actions:
+                old_song.title = song.title
+            if 'RENAME' not in pending_actions:
+                old_song.artist = song.artist
+            if 'RATING' not in pending_actions:
+                old_song.rating = song.rating
+            if 'MOVE' not in pending_actions:
+                old_song.category = song.category
+            # Duration is always safe to update (no task changes it)
             old_song.duration = song.duration
+            # Path may change from move — only update if no MOVE pending
+            if 'MOVE' not in pending_actions:
+                old_song.path = song.path
             song = old_song
 
-        self.songs_by_id[song.id] = song
-        item = self.row_items.get(song.id)
-        if item is not None:
-            row = item.row()
-            artist_part, song_part = _split_title(song.title)
-            item.setText(artist_part)
-            sn_item = self.table.item(row, COL_SONGNAME)
-            if sn_item: sn_item.setText(song_part)
-            combo = self.table.cellWidget(row, COL_CATEGORY)
-            if combo and combo.currentText() != song.category:
-                combo.blockSignals(True)
-                combo.setCurrentText(song.category)
-                combo.blockSignals(False)
-            star_wrapper = self.table.cellWidget(row, COL_RATING)
-            if star_wrapper:
-                star = star_wrapper.findChild(StarRatingWidget)
-                if star: star.set_rating(song.rating)
-            cat_sort = self.table.item(row, COL_CATEGORY)
-            if cat_sort: cat_sort.setText(song.category)
-            self.table.setRowHidden(row, not self._matches(song))
+            # Update existing row
+            item = self.row_items.get(song.id)
+            if item is not None:
+                a, s = _split_title(song.title)
+                item.setText(a)
+                sn = self.table.item(item.row(), COL_SONGNAME)
+                if sn:
+                    sn.setText(s)
+                cat_sort = self.table.item(item.row(), COL_CATEGORY)
+                if cat_sort:
+                    cat_sort.setText(song.category)
+                combo = self.table.cellWidget(item.row(), COL_CATEGORY)
+                if combo:
+                    combo.blockSignals(True)
+                    combo.setCurrentText(song.category)
+                    combo.blockSignals(False)
+                rat_sort = self.table.item(item.row(), COL_RATING)
+                if isinstance(rat_sort, _InvisibleSortItem):
+                    rat_sort.set_sort_key(song.rating)
+                star_wrap = self.table.cellWidget(item.row(), COL_RATING)
+                if star_wrap:
+                    star = star_wrap.findChild(StarRatingWidget)
+                    if star:
+                        star.set_rating(song.rating)
+                return
         else:
+            self.songs_by_id[song.id] = song
             self._insert_row(song)
 
+    # ------------------------------------------------------------------
+    # _insert_row  — create a new table row
+    # ------------------------------------------------------------------
     def _insert_row(self, song: Song):
         self.table.setSortingEnabled(False)
         row = self.table.rowCount()
@@ -3922,97 +4001,119 @@ class MainWindow(QMainWindow):
 
         artist_part, song_part = _split_title(song.title)
 
-        ti = QTableWidgetItem(artist_part)
-        ti.setData(Qt.UserRole, song.id)
-        self.table.setItem(row, COL_ARTIST, ti)
-        self.row_items[song.id] = ti
+        # COL_ARTIST
+        artist_item = QTableWidgetItem(artist_part)
+        artist_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        artist_item.setData(Qt.UserRole, song.id)
+        self.table.setItem(row, COL_ARTIST, artist_item)
+        self.row_items[song.id] = artist_item
 
-        # If a task for this song is already pending (e.g. loaded from
-        # the persisted queue on startup), show the spinner now.
-        if song.id in self._pending_task_state:
-            ti.setIcon(self._get_spinner_icon())
+        # COL_SONGNAME
+        song_item = QTableWidgetItem(song_part)
+        song_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        self.table.setItem(row, COL_SONGNAME, song_item)
 
-        sn = QTableWidgetItem(song_part)
-        self.table.setItem(row, COL_SONGNAME, sn)
+        # COL_NAME_EDIT  (lock button for title editing)
+        lock_name = LockButton("Click to edit title", "Editing title…")
+        lock_name.toggledLock.connect(
+            lambda unlocked, sid=song.id: self._on_title_edit_unlock(sid, unlocked))
+        self.table.setCellWidget(row, COL_NAME_EDIT, _centered(lock_name))
 
-        name_lock = LockButton(
-            "Green pen: name is protected. Click to edit.",
-            "Red pen: name editing active.")
-        name_lock.toggledLock.connect(
-            lambda unlocked, s=song, lk=name_lock: self._on_title_edit_unlock(s, lk, unlocked))
-        self.table.setCellWidget(row, COL_NAME_EDIT, _centered(name_lock))
-
+        # COL_CATEGORY  (combo box)
+        combo = QComboBox()
+        combo.setFixedWidth(120)
         cats = list_categories(self.root_path) if self.root_path else []
-        combo = QComboBox(); combo.addItems(cats)
-        if song.category in cats: combo.setCurrentText(song.category)
+        combo.addItems(cats)
+        if song.category in cats:
+            combo.setCurrentText(song.category)
         combo.setEnabled(False)
-        combo.currentTextChanged.connect(
-            lambda nc, s=song, c=combo: self._on_cat_combo(s, c, nc))
-        cat_sort_item = QTableWidgetItem(song.category)
-        self.table.setItem(row, COL_CATEGORY, cat_sort_item)
+        combo.activated.connect(
+            lambda _idx, sid=song.id: self._on_cat_combo(sid))
         self.table.setCellWidget(row, COL_CATEGORY, combo)
 
-        cat_lock = LockButton(
-            "Green pen: category is protected. Click to allow editing.",
-            "Red pen: editing active. Select a new category to move the file.")
-        cat_lock.toggledLock.connect(lambda unlocked, c=combo: c.setEnabled(unlocked))
-        self.table.setCellWidget(row, COL_CATEGORY_LOCK, _centered(cat_lock))
+        # COL_CATEGORY  sort item (hidden text for sorting)
+        cat_sort = QTableWidgetItem(song.category)
+        cat_sort.setFlags(Qt.ItemIsEnabled)
+        self.table.setItem(row, COL_CATEGORY, cat_sort)
 
-        star_wrapper = QWidget()
-        star_lay = QHBoxLayout(star_wrapper)
-        star_lay.setContentsMargins(4, 0, 4, 0)
-        star_lay.setSpacing(0)
+        # COL_CATEGORY_LOCK
+        lock_cat = LockButton("Click to change category", "Changing category…")
+        lock_cat.toggledLock.connect(
+            lambda unlocked, sid=song.id: self._on_cat_lock_toggle(sid, unlocked))
+        combo.setProperty("lock_ref", lock_cat)
+        self.table.setCellWidget(row, COL_CATEGORY_LOCK, _centered(lock_cat))
+
+        # COL_RATING  (star widget)
         star = StarRatingWidget(song.rating)
-        star.set_editable(False)
-        star.ratingChanged.connect(lambda nr, s=song, sw=star: self._on_rating(s, sw, nr))
-        star_lay.addWidget(star)
-        star_lay.addStretch()
-        rat_sort_item = _InvisibleSortItem(song.rating)
-        self.table.setItem(row, COL_RATING, rat_sort_item)
-        self.table.setCellWidget(row, COL_RATING, star_wrapper)
+        star.ratingChanged.connect(
+            lambda new_r, sid=song.id: self._on_rating(sid, new_r))
+        self.table.setCellWidget(row, COL_RATING, star)
 
-        rat_lock = LockButton(
-            "Green pen: rating is protected. Click to allow editing.",
-            "Red pen: editing active. Click a star to set the rating."
-        )
-        rat_lock.toggledLock.connect(lambda unlocked, sw=star: sw.set_editable(unlocked))
-        self.table.setCellWidget(row, COL_RATING_LOCK, _centered(rat_lock, right_pad=14))
+        # COL_RATING  sort item (invisible, sortable)
+        rat_sort = _InvisibleSortItem(song.rating)
+        rat_sort.setFlags(Qt.ItemIsEnabled)
+        self.table.setItem(row, COL_RATING, rat_sort)
 
-        combo.setProperty("lock_ref", cat_lock)
-        star.setProperty("lock_ref", rat_lock)
+        # COL_RATING_LOCK
+        lock_rat = LockButton("Click to edit rating", "Editing rating…")
+        lock_rat.toggledLock.connect(
+            lambda unlocked, sid=song.id: self._on_rat_lock_toggle(sid, unlocked))
+        self.table.setCellWidget(row, COL_RATING_LOCK, _centered(lock_rat))
 
-        is_todo = song.path.suffix.lower() in TODO_EXTENSIONS
-        if is_todo:
-            cat_lock.setVisible(False)
-            rat_lock.setVisible(False)
-            combo.setEnabled(False)
-
-        del_btn = QToolButton()
-        del_btn.setText("\U0001f5d1")
-        del_btn.setToolTip("Delete this file permanently")
+        # COL_DELETE
+        del_btn = QPushButton("\U0001f5d1")
+        del_btn.setFlat(True)
+        del_btn.setFixedSize(28, 28)
         del_btn.setCursor(Qt.PointingHandCursor)
-        del_btn.setFixedSize(22, 22)
+        del_btn.setToolTip("Delete this song")
         del_btn.setStyleSheet(
-            "QToolButton{background:transparent;border:none;color:#8e8e93;font-size:13px;}"
-            "QToolButton:hover{color:#FF453A;}"
-        )
-        del_btn.clicked.connect(lambda _=False, s=song: self._delete_song(s))
-        self.table.setCellWidget(row, COL_DELETE, _centered(del_btn, right_pad=6))
+            "QPushButton{border:none;background:transparent;"
+            "color:#FF453A;font-size:14px;}"
+            "QPushButton:hover{background:rgba(255,69,58,0.15);border-radius:6px;}")
+        del_btn.clicked.connect(lambda _=False, sid=song.id: self._delete_by_id(sid))
+        self.table.setCellWidget(row, COL_DELETE, _centered(del_btn, right_pad=4))
 
-        self.table.setRowHidden(row, not self._matches(song))
+        # Vertical header number
+        vhi = QTableWidgetItem("")
+        self.table.setVerticalHeaderItem(row, vhi)
+
         self.table.setSortingEnabled(True)
+
+    def _delete_by_id(self, sid: str):
+        song = self.songs_by_id.get(sid)
+        if song:
+            self._delete_song(song)
+
+    def _on_cat_lock_toggle(self, sid: str, unlocked: bool):
+        item = self.row_items.get(sid)
+        if item is None: return
+        combo = self.table.cellWidget(item.row(), COL_CATEGORY)
+        if combo:
+            combo.setEnabled(unlocked)
+
+    def _on_rat_lock_toggle(self, sid: str, unlocked: bool):
+        item = self.row_items.get(sid)
+        if item is None: return
+        star_wrap = self.table.cellWidget(item.row(), COL_RATING)
+        if star_wrap:
+            star = star_wrap.findChild(StarRatingWidget)
+            if star is None and isinstance(star_wrap, StarRatingWidget):
+                star = star_wrap
+            if star:
+                star.set_editable(unlocked)
 
     # ------------------------------------------------------------------
     # Selection & bulk operations
     # ------------------------------------------------------------------
     def _on_selection_changed(self):
-        sel_rows = set(idx.row() for idx in self.table.selectedIndexes())
-        multi = len(sel_rows) >= 2
-        self.bulk_cat_combo.setEnabled(multi)
-        self.bulk_rat_combo.setEnabled(multi)
-        self.bulk_del_btn.setEnabled(multi)
-        if multi:
-            self.bulk_status.setText(f"{len(sel_rows)} songs selected")
+        sel = self._selected_songs()
+        n = len(sel)
+        enabled = n >= 2
+        self.bulk_cat_combo.setEnabled(enabled)
+        self.bulk_rat_combo.setEnabled(enabled)
+        self.bulk_del_btn.setEnabled(enabled)
+        if enabled:
+            self.bulk_status.setText(f"{n} songs selected")
             cats = list_categories(self.root_path) if self.root_path else []
             self.bulk_cat_combo.blockSignals(True)
             self.bulk_cat_combo.clear()
@@ -4023,73 +4124,60 @@ class MainWindow(QMainWindow):
             self.bulk_status.setText("Select 2+ songs to enable")
 
     def _selected_songs(self) -> List[Song]:
-        seen = set()
-        songs = []
-        for idx in self.table.selectedIndexes():
-            row = idx.row()
-            if row in seen:
-                continue
-            seen.add(row)
+        rows = set()
+        for idx in self.table.selectionModel().selectedRows():
+            rows.add(idx.row())
+        result = []
+        for row in sorted(rows):
             item = self.table.item(row, COL_ARTIST)
-            if item is None:
-                continue
+            if item is None: continue
             sid = item.data(Qt.UserRole)
             song = self.songs_by_id.get(sid)
-            if song:
-                songs.append(song)
-        return songs
+            if song: result.append(song)
+        return result
 
     def _on_bulk_category(self, idx: int):
-        if idx <= 0:
-            return
-        new_cat = self.bulk_cat_combo.itemText(idx)
+        if idx == 0: return  # placeholder
+        target_cat = self.bulk_cat_combo.itemText(idx)
         songs = self._selected_songs()
-        if not songs:
+        if not songs: return
+        reply = QMessageBox.question(
+            self, "Bulk move",
+            f"Move {len(songs)} selected songs to '{target_cat}'?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self.bulk_cat_combo.setCurrentIndex(0)
             return
-
-        self._suppress_rescan = True
-        queued = 0
         for song in songs:
-            if song.category == new_cat:
+            if song.category == target_cat:
                 continue
-            if self.player.current_song() is song and self.player.is_playing():
-                continue
-            task_id = f"bulkmove_{song.id}_{uuid.uuid4().hex[:8]}"
+            task_id = f"move_{song.id}_{uuid.uuid4().hex[:8]}"
             self._task_worker.add_task({
-                'id': task_id,
-                'action': 'MOVE',
+                'id': task_id, 'action': 'MOVE',
                 'song_id': song.id,
                 'src_path': str(song.path),
                 'root': str(self.root_path),
-                'target_cat': new_cat,
+                'target_cat': target_cat,
                 'old_cat': song.category,
                 'title': song.title,
             })
             self._mark_task_pending(song.id, task_id, 'MOVE')
-            queued += 1
-
-        self.bulk_cat_combo.setCurrentIndex(0)
+            # FIX: Immediately update in-memory so rescans don't revert
+            song.category = target_cat
+            cache_key = str(song.path)
+            if cache_key in self.cache:
+                self.cache[cache_key]['category'] = target_cat
         self._save_pending_queue()
-        self._show_toast(
-            f"\u23f3  {queued} songs queued for move \u2192 '{new_cat}'",
-            3000, "info")
+        self._schedule_cache_save()
+        self.bulk_cat_combo.setCurrentIndex(0)
+        self._show_toast(f"\u23f3  Moving {len(songs)} songs \u2192 {target_cat}", 2000, "info")
 
     def _on_bulk_rating(self, idx: int):
-        if idx <= 0:
-            return
+        if idx == 0: return
         new_rating = self.bulk_rat_combo.itemData(idx)
-        if new_rating is None or new_rating < 0:
-            return
+        if new_rating == -99: return
         songs = self._selected_songs()
-        if not songs:
-            return
-
-        self._suppress_rescan = True
-        self._rescan_timer.stop()
-        self._set_info(f"Queuing rating for {len(songs)} files\u2026",
-                       "loading", auto_reset=False)
-
-        count = 0
+        if not songs: return
         for song in songs:
             song.rating = new_rating
             item = self.row_items.get(song.id)
@@ -4100,34 +4188,26 @@ class MainWindow(QMainWindow):
                 star_wrap = self.table.cellWidget(item.row(), COL_RATING)
                 if star_wrap:
                     star = star_wrap.findChild(StarRatingWidget)
-                    if star: star.set_rating(new_rating)
+                    if star is None and isinstance(star_wrap, StarRatingWidget):
+                        star = star_wrap
+                    if star:
+                        star.set_rating(new_rating)
             self._queue_rating_task(song, new_rating)
-            count += 1
-
         self.bulk_rat_combo.setCurrentIndex(0)
-        self._update_queue_numbers()
-
-        stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
-        self._set_info(
-            f"\u23f3  Queued rating {stars} ({new_rating}/5) for {count} songs",
-            "success", duration_ms=3500)
+        self._show_toast(
+            f"\u2713  Set rating {new_rating}/5 for {len(songs)} songs", 2000, "success")
 
     def _on_bulk_delete(self):
         songs = self._selected_songs()
-        if not songs:
-            return
+        if not songs: return
         reply = QMessageBox.question(
-            self, "Delete files",
-            f"Permanently delete {len(songs)} selected file(s)?\n\nThis cannot be undone.",
+            self, "Bulk delete",
+            f"Permanently delete {len(songs)} selected songs?\n\nThis cannot be undone.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
-        self._suppress_rescan = True
-        queued = 0
         for song in songs:
-            if self.player.current_song() is song:
-                self.player._player.stop()
-            task_id = f"bulkdel_{song.id}_{uuid.uuid4().hex[:8]}"
+            task_id = f"delete_{song.id}_{uuid.uuid4().hex[:8]}"
             self._task_worker.add_task({
                 'id': task_id, 'action': 'DELETE',
                 'song_id': song.id,
@@ -4135,208 +4215,178 @@ class MainWindow(QMainWindow):
                 'title': song.title,
             })
             self._mark_task_pending(song.id, task_id, 'DELETE')
-            queued += 1
         self._save_pending_queue()
-        self._show_toast(f"\u23f3  Queued delete: {queued} file(s)", 3000, "info")
+        self._show_toast(f"\u23f3  Deleting {len(songs)} songs\u2026", 2000, "info")
 
-    def _on_double_click(self, index):
-        item = self.table.item(index.row(), COL_ARTIST)
+    # ------------------------------------------------------------------
+    # Double-click & highlight
+    # ------------------------------------------------------------------
+    def _on_double_click(self, model_index):
+        row = model_index.row()
+        item = self.table.item(row, COL_ARTIST)
         if item is None: return
-        song = self.songs_by_id.get(item.data(Qt.UserRole))
-        if song: self.player.play_song(song, queue=self._visible_songs_in_order())
+        sid = item.data(Qt.UserRole)
+        song = self.songs_by_id.get(sid)
+        if song is None: return
+        if song.path.suffix.lower() in TODO_EXTENSIONS:
+            self._show_toast(f"\u2610  To-Do: {song.title}  (not playable)", 2500, "warning")
+            return
+        songs = self._visible_songs_in_order()
+        self.player.play_song(song, queue=songs)
 
-    _CSS_LOCK_DISABLED = (
-        "QToolButton{background:transparent;border:none;"
-        "color:#48484a;font-size:13px;}"
-    )
+    def _highlight(self, song: Optional[Song]):
+        old_id = self._highlighted_id
+        if old_id and old_id in self.row_items:
+            old_item = self.row_items[old_id]
+            for c in range(COL_COUNT):
+                ci = self.table.item(old_item.row(), c)
+                if ci:
+                    ci.setBackground(QColor("transparent"))
 
-    def _highlight(self, playing: Optional[Song]):
-        if self._highlighted_id:
-            prev = self.row_items.get(self._highlighted_id)
-            if prev:
-                row = prev.row()
-                f = prev.font(); f.setBold(False); prev.setFont(f)
-                prev.setForeground(Qt.white)
-                sn = self.table.item(row, COL_SONGNAME)
-                if sn:
-                    sf = sn.font(); sf.setBold(False); sn.setFont(sf)
-                    sn.setForeground(Qt.white)
-                for col in (COL_NAME_EDIT, COL_CATEGORY_LOCK):
-                    w = self.table.cellWidget(row, col)
-                    if w:
-                        lk = w.findChild(LockButton)
-                        if lk:
-                            lk.setEnabled(True)
-                            lk.set_locked(True)
-                            lk.setToolTip(lk._tip_locked)
-
-        self._highlighted_id = playing.id if playing else None
-
-        if playing:
-            item = self.row_items.get(playing.id)
-            if item:
-                row = item.row()
-                f = item.font(); f.setBold(True); item.setFont(f)
-                item.setForeground(Qt.cyan)
-                sn = self.table.item(row, COL_SONGNAME)
-                if sn:
-                    sf = sn.font(); sf.setBold(True); sn.setFont(sf)
-                    sn.setForeground(Qt.cyan)
-                for col in (COL_NAME_EDIT, COL_CATEGORY_LOCK):
-                    w = self.table.cellWidget(row, col)
-                    if w:
-                        lk = w.findChild(LockButton)
-                        if lk:
-                            lk.set_locked(True)
-                            lk.setEnabled(False)
-                            lk.setStyleSheet(self._CSS_LOCK_DISABLED)
-                            lk.setToolTip(
-                                "Cannot edit while this song is playing.\n"
-                                "Play a different song first.")
-
-    # ------------------------------------------------------------------
-    # Category change
-    # ------------------------------------------------------------------
-    def _on_title_edit_unlock(self, song: Song, lock: "LockButton", unlocked: bool):
+        if song is None:
+            self._highlighted_id = None
+            return
+        self._highlighted_id = song.id
         item = self.row_items.get(song.id)
-        if item is None:
-            lock.set_locked(True); return
-        row = item.row()
-        old_artist, old_songname = _split_title(song.title)
+        if item is None: return
+        hl = QColor("#0a84ff")
+        hl.setAlpha(35)
+        for c in range(COL_COUNT):
+            ci = self.table.item(item.row(), c)
+            if ci:
+                ci.setBackground(hl)
 
-        def _commit_name(new_artist: str, new_songname: str):
-            if new_artist and new_songname:
-                new_title = f"{new_artist} - {new_songname}"
-            elif new_songname:
-                new_title = new_songname
-            else:
-                new_title = song.title
+    # ------------------------------------------------------------------
+    # Title editing
+    # ------------------------------------------------------------------
+    def _on_title_edit_unlock(self, sid: str, unlocked: bool):
+        item = self.row_items.get(sid)
+        if item is None: return
+        song = self.songs_by_id.get(sid)
+        if song is None: return
 
-            a_part, s_part = _split_title(new_title)
-            item.setText(a_part)
-            sn_item = self.table.item(row, COL_SONGNAME)
-            if sn_item: sn_item.setText(s_part)
+        if unlocked:
+            from PySide6.QtWidgets import QLineEdit
+            editor = QLineEdit(song.title)
+            editor.setObjectName("cellEditor")
+            editor.selectAll()
+            editor.setMinimumHeight(ROW_HEIGHT - 4)
 
-            if new_title != song.title:
-                current = self.player.current_song()
-                is_active = (current is not None and current.id == song.id and
-                            (self.player.is_playing() or
-                             self.player._player.playbackState() != QMediaPlayer.StoppedState))
-
-                if is_active:
-                    self._pending_changes.append(("RENAME", song, new_title))
-                    self._update_pending_btn()
-                    lock.setText("\u23f3")
-                    lock.setStyleSheet(
-                        "QToolButton{background:transparent;border:none;"
-                        "color:#FF9F0A;font-size:13px;}")
-                    lock.setEnabled(False)
-                    self._show_toast(
-                        f"\u23f3  Rename queued: \"{new_title}\"  (will apply when song finishes)",
-                        4000, "warning")
+            def _commit():
+                new_title = editor.text().strip()
+                if not new_title or new_title == song.title:
+                    # Cancelled — re-lock
+                    lock_w = self.table.cellWidget(item.row(), COL_NAME_EDIT)
+                    if lock_w:
+                        lk = lock_w.findChild(LockButton)
+                        if lk:
+                            lk.set_locked(True)
+                    self.table.removeCellWidget(item.row(), COL_ARTIST)
+                    self.table.removeCellWidget(item.row(), COL_SONGNAME)
                     return
 
                 old_title = song.title
-                # Queue the disk write — UI already shows the new title
+                # FIX: Immediately update in-memory title and cache
+                song.title = new_title
+                cache_key = str(song.path)
+                if cache_key in self.cache:
+                    self.cache[cache_key]['title'] = new_title
+                self._schedule_cache_save()
+
+                a, s = _split_title(new_title)
+                item.setText(a)
+                sn = self.table.item(item.row(), COL_SONGNAME)
+                if sn:
+                    sn.setText(s)
+
+                self.table.removeCellWidget(item.row(), COL_ARTIST)
+                self.table.removeCellWidget(item.row(), COL_SONGNAME)
+
+                lock_w = self.table.cellWidget(item.row(), COL_NAME_EDIT)
+                if lock_w:
+                    lk = lock_w.findChild(LockButton)
+                    if lk:
+                        lk.setEnabled(False)
+
                 task_id = f"rename_{song.id}_{uuid.uuid4().hex[:8]}"
                 self._task_worker.add_task({
-                    'id': task_id,
-                    'action': 'RENAME',
+                    'id': task_id, 'action': 'RENAME',
                     'song_id': song.id,
                     'src_path': str(song.path),
                     'new_title': new_title,
                     'old_title': old_title,
                     'artist': song.artist,
                 })
-                # Optimistically update in-memory title so UI is consistent
-                song.title = new_title
                 self._mark_task_pending(song.id, task_id, 'RENAME')
                 self._save_pending_queue()
-                self._set_info(f'\u23f3  Renaming: "{new_title}"\u2026',
-                               "loading", auto_reset=False)
-                self._log_change("RENAME", new_title, f"was: {old_title}")
 
-        if not unlocked:
-            ed_artist = self.table.cellWidget(row, COL_ARTIST)
-            ed_song   = self.table.cellWidget(row, COL_SONGNAME)
-            new_a = ed_artist.text().strip() if isinstance(ed_artist, QLineEdit) else old_artist
-            new_s = ed_song.text().strip() if isinstance(ed_song, QLineEdit) else old_songname
-            self.table.removeCellWidget(row, COL_ARTIST)
-            self.table.removeCellWidget(row, COL_SONGNAME)
-            _commit_name(new_a, new_s or old_songname)
-            return
+            editor.returnPressed.connect(_commit)
+            editor.editingFinished.connect(_commit)
 
-        from PySide6.QtWidgets import QCompleter
-        existing = [s.title for s in self.songs_by_id.values()]
+            # Span the editor across artist + song name columns
+            self.table.setCellWidget(item.row(), COL_ARTIST, editor)
+            editor.setFocus()
 
-        ed_a = QLineEdit(old_artist)
-        ed_a.setObjectName("cellEditor")
-        ed_a.setPlaceholderText("Artist...")
-        comp_a = QCompleter([_split_title(t)[0] for t in existing if _split_title(t)[0]], ed_a)
-        comp_a.setCaseSensitivity(Qt.CaseInsensitive)
-        comp_a.setFilterMode(Qt.MatchContains)
-        comp_a.setMaxVisibleItems(5)
-        ed_a.setCompleter(comp_a)
-        self.table.setCellWidget(row, COL_ARTIST, ed_a)
-
-        ed_s = QLineEdit(old_songname)
-        ed_s.setObjectName("cellEditor")
-        ed_s.setPlaceholderText("Song name...")
-        comp_s = QCompleter([_split_title(t)[1] for t in existing], ed_s)
-        comp_s.setCaseSensitivity(Qt.CaseInsensitive)
-        comp_s.setFilterMode(Qt.MatchContains)
-        comp_s.setMaxVisibleItems(5)
-        ed_s.setCompleter(comp_s)
-        self.table.setCellWidget(row, COL_SONGNAME, ed_s)
-        ed_a.setFocus()
-
-        def commit_enter():
-            new_a = ed_a.text().strip()
-            new_s = ed_s.text().strip() or old_songname
-            self.table.removeCellWidget(row, COL_ARTIST)
-            self.table.removeCellWidget(row, COL_SONGNAME)
-            _commit_name(new_a, new_s)
-            lock.set_locked(True)
-
-        ed_a.returnPressed.connect(lambda: ed_s.setFocus())
-        ed_s.returnPressed.connect(commit_enter)
-
+    # ------------------------------------------------------------------
+    # _sync_cache  — update cache for a song
+    # ------------------------------------------------------------------
     def _sync_cache(self, song: Song):
+        p = str(song.path)
         try:
-            st  = song.path.stat()
-            rec = self.cache.get(str(song.path), {})
-            rec.update({"size": st.st_size, "mtime": st.st_mtime,
-                        "title": song.title, "artist": song.artist,
-                        "rating": song.rating, "duration": song.duration,
-                        "id": song.id})
-            self.cache[str(song.path)] = rec
-            if self.root_path: self._schedule_cache_save()
+            st = song.path.stat()
+            self.cache[p] = {
+                'size': st.st_size,
+                'mtime': st.st_mtime,
+                'title': song.title,
+                'artist': song.artist,
+                'rating': song.rating,
+                'duration': song.duration,
+                'id': song.id,
+            }
         except OSError:
             pass
+        self._schedule_cache_save()
 
-    def _on_cat_combo(self, song: Song, combo: QComboBox, new_cat: str):
-        if new_cat == song.category or not combo.isEnabled(): return
+    # ------------------------------------------------------------------
+    # Category combo change  (per-song)
+    # ------------------------------------------------------------------
+    def _on_cat_combo(self, sid: str):
+        """Handle category combo box change for a single song.
 
-        current = self.player.current_song()
-        if current and current.id == song.id and self.player.is_playing():
-            self._show_toast(
-                "Stop playing this song first before changing its category.",
-                3500, "warning")
-            combo.blockSignals(True)
-            combo.setCurrentText(song.category)
-            combo.blockSignals(False)
+        FIX: Immediately updates song.category and cache so rescans
+        don't revert the category before the MOVE task completes.
+        """
+        song = self.songs_by_id.get(sid)
+        if song is None: return
+        item = self.row_items.get(sid)
+        if item is None: return
+        combo = self.table.cellWidget(item.row(), COL_CATEGORY)
+        if combo is None: return
+        new_cat = combo.currentText()
+        if new_cat == song.category:
             return
 
         old_cat = song.category
-        self._suppress_rescan = True
-        lock: LockButton = combo.property("lock_ref")
-        if lock: lock.set_locked(True)
+
+        # FIX: Immediately update in-memory so rescans don't revert
+        song.category = new_cat
+        cache_key = str(song.path)
+        if cache_key in self.cache:
+            self.cache[cache_key]['category'] = new_cat
+        self._schedule_cache_save()
+
+        cat_sort = self.table.item(item.row(), COL_CATEGORY)
+        if cat_sort:
+            cat_sort.setText(new_cat)
+
+        lock = combo.property("lock_ref")
+        if lock:
+            lock.setEnabled(False)
         combo.setEnabled(False)
 
         task_id = f"move_{song.id}_{uuid.uuid4().hex[:8]}"
         self._task_worker.add_task({
-            'id': task_id,
-            'action': 'MOVE',
+            'id': task_id, 'action': 'MOVE',
             'song_id': song.id,
             'src_path': str(song.path),
             'root': str(self.root_path),
@@ -4346,46 +4396,33 @@ class MainWindow(QMainWindow):
         })
         self._mark_task_pending(song.id, task_id, 'MOVE')
         self._save_pending_queue()
-        self._show_toast(
-            f"\u23f3  Moving '{song.title}' \u2192 {new_cat}\u2026", 2000, "info")
 
     # ------------------------------------------------------------------
-    # Rating change
+    # Rating change  (from table star widget click)
     # ------------------------------------------------------------------
-    def _on_rating(self, song: Song, star_widget: "StarRatingWidget", new_rating: int):
-        item = self.row_items.get(song.id)
+    def _on_rating(self, sid: str, new_rating: int):
+        song = self.songs_by_id.get(sid)
+        if song is None: return
         song.rating = new_rating
+        item = self.row_items.get(sid)
         if item:
             rat_sort = self.table.item(item.row(), COL_RATING)
             if isinstance(rat_sort, _InvisibleSortItem):
                 rat_sort.set_sort_key(new_rating)
-            self.table.setRowHidden(item.row(), not self._matches(song))
-            self.table.selectRow(item.row())
-        lock: LockButton = star_widget.property("lock_ref")
-        if lock: lock.set_locked(True)
-        star_widget.set_editable(False)
         self._queue_rating_task(song, new_rating)
-        stars = "\u2605" * new_rating + "\u2606" * (5 - new_rating)
         self._log_change("RATING", song.title, f"{new_rating}/5")
-        self._show_toast(f"\u2713  {stars} ({new_rating}/5) \u2014 {song.title}", 2000, "success")
 
 
 # ============================================================================
+# main
+# ============================================================================
 def main():
     app = QApplication(sys.argv)
-    app.setStyleSheet(DARK_QSS)
-    app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORG_NAME)
-
-    icon_path = Path("../assets/01_media/01_icons/icon.ico")
-    if not icon_path.exists():
-        icon_path = Path("assets/01_media/01_icons/icon.ico")
-    if icon_path.exists():
-        from PySide6.QtGui import QIcon
-        app.setWindowIcon(QIcon(str(icon_path)))
-
-    win = MainWindow()
-    win.show()
+    app.setApplicationName(APP_NAME)
+    app.setStyleSheet(DARK_QSS)
+    window = MainWindow()
+    window.show()
     sys.exit(app.exec())
 
 

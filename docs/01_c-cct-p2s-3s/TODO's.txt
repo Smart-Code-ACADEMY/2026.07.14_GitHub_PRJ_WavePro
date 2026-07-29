@@ -1,1 +1,12 @@
+skip to next song when 40% mode of song time expired button next to the song control buttons
+add sound loudnes same for all songs engine but dont edit it in physical files it need to be only player feature
+implement GUI interrupt (in background they are not instant and on focus we have waiting time)
 loading animation
+ensured every hotkey works system-wide even when the application is minimized or another window is focused
+app artist explore status
+add playlist
+add convert to minimalistic file with rating for non interested songs
+indexed loading on begin
+excel update/read/export/backup button
+add new icon
+add animation
